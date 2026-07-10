@@ -1,0 +1,34 @@
+# ── Python ───────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+dist/
+build/
+*.egg-info/
+.coverage
+coverage.xml
+
+# ── Generated conversion output (never commit) ───────────────────────────────
+# The converters write markdown + coverage/records here; it derives from your
+# source documents and stays out of git. Keep only the labeling docs.
+data/*
+!data/README.md
+!data/CLAUDE.md
+
+# ── Vendored LibreOffice (heavy third-party binary tree) ─────────────────────
+# Materialized by scripts/setup_libreoffice.py; rebuildable, never committed.
+vendor/*
+!vendor/README.md
+!vendor/CLAUDE.md
+
+# ── Local ────────────────────────────────────────────────────────────────────
+.env
+.env.local
+*.sqlite
+*.db
+slurm-*.out
+nohup.out

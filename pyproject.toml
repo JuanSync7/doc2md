@@ -1,0 +1,40 @@
+# Python src-layout for doc2md: deterministic, lossless document -> Markdown conversion.
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "doc2md"
+version = "0.1.0"
+description = "Deterministic, lossless Office/PDF -> Markdown conversion with an independent second-pass validator."
+readme = "README.md"
+license = { file = "LICENSE" }
+# The offline pipeline runs under the host's Python 3.6; backend code stays 3.6-safe.
+requires-python = ">=3.6"
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest", "pytest-cov", "ruff", "mypy"]
+# The PDF lane (scripts/docling_convert.py) runs under Python 3.9+ ONLY (it pulls
+# PyTorch); the marker keeps the >=3.6 deterministic Office lane resolvable.
+# Install into a 3.12 venv:  uv venv --python 3.12 && uv sync --extra docling
+docling = ["docling; python_version >= '3.9'"]
+
+# src-layout: packages live under src/ (importable as their top name).
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+  "unit: fast isolated tests (mirror src/)",
+  "integration: 2+ real components",
+  "e2e: full-system journeys",
+  "smoke: liveness checks",
+]
+
+[tool.ruff]
+src = ["src", "tests"]
+
+[tool.mypy]
+files = ["src"]
