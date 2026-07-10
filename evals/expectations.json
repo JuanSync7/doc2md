@@ -1,0 +1,237 @@
+{
+  "office/kestrel-clock-spec.docx": {
+    "kind": "bundle",
+    "lane": "office",
+    "status": "ok",
+    "losslessness_method": "ooxml-ground-truth",
+    "losslessness_gate": "pass",
+    "token_recall_min": 1.0,
+    "coverage_gate": "pass",
+    "has_toc": true,
+    "toc_lines_min": 9,
+    "max_depth": 4,
+    "images_gate": "pass",
+    "images_referenced": 3,
+    "warning_codes_absent": ["libreoffice_preconvert", "image_bytes_missing",
+                             "images_not_in_outline"],
+    "md_contains": [
+      "# 1 Introduction",
+      "#### 2.1.1.1 Timing budget",
+      "ClkGateCtrl\\_enable\\_sync",
+      "ClkGateCtrl block (base 0x4000)",
+      "DmaArbiterUnit block (base 0x5000)",
+      "DmaArbiterUnit owns quality-of-service",
+      "clk\\_ref\\_sel",
+      "\\<rst\\_n>",
+      "\\*not\\* latched during scan | test modes",
+      "  - Chapter 4: clocks and resets",
+      "1. Program the feedback divider."
+    ],
+    "md_min_count": {"| RW |": 3, "![](images/": 3},
+    "md_not_contains": ["Confidential", "ooxml-image", "PAGE"],
+    "outline_titles": ["1 Introduction", "1.1 Scope", "2.1.1.1 Timing budget",
+                       "4 Verification plan"]
+  },
+  "office/kestrel-readme.docx": {
+    "kind": "bundle",
+    "lane": "office",
+    "status": "ok",
+    "losslessness_gate": "pass",
+    "token_recall_min": 1.0,
+    "coverage_gate": "pass",
+    "has_toc": false,
+    "images_gate": "pass",
+    "images_referenced": 0,
+    "md_contains": ["# Kestrel bring-up quick notes",
+                    "Power the board from the bench supply"]
+  },
+  "office/kestrel-registers.xlsx": {
+    "kind": "bundle",
+    "lane": "office",
+    "status": "ok",
+    "losslessness_gate": "pass",
+    "token_recall_min": 1.0,
+    "coverage_gate": "pass",
+    "images_gate": "pass",
+    "images_referenced": 0,
+    "md_contains": [
+      "## RegisterMap",
+      "## PowerBudget",
+      "## Notes",
+      "| ClkGateCtrl\\_enable\\_sync | 0x4000 | 32 | 0 | RW | TRUE | 2026-01-05 | 1.0 |",
+      "Kestrel power budget (mW)",
+      "412.5",
+      "0.125",
+      "FALSE",
+      "Reserved for bring-up notes."
+    ]
+  },
+  "office/kestrel-overview.pptx": {
+    "kind": "bundle",
+    "lane": "office",
+    "status": "ok",
+    "losslessness_gate": "pass",
+    "token_recall_min": 1.0,
+    "coverage_gate": "pass",
+    "images_gate": "pass",
+    "md_contains": [
+      "## Slide 1 — Kestrel Platform Overview",
+      "## Slide 2 — Why a new interconnect",
+      "  - arbitration stalls the display pipe",
+      "| display read | 40 | fabric team |",
+      "### Speaker notes",
+      "week nine",
+      "- sensor front end"
+    ]
+  },
+  "office/kestrel-dataflow.pptx": {
+    "kind": "bundle",
+    "lane": "office",
+    "status": "ok",
+    "losslessness_gate": "pass",
+    "token_recall_min": 1.0,
+    "coverage_gate": "pass",
+    "md_contains": ["## Slide 1", "- sensor front end", "- result mailbox",
+                    "- push", "- pop"]
+  },
+  "legacy/kestrel-clock-spec.doc": {
+    "kind": "bundle",
+    "lane": "office",
+    "status": "ok",
+    "losslessness_gate": "pass",
+    "token_recall_min": 1.0,
+    "coverage_gate": "pass",
+    "has_toc": true,
+    "warning_codes": ["libreoffice_preconvert"],
+    "md_contains": ["# 1 Introduction", "ClkGateCtrl\\_enable\\_sync",
+                    "ClkGateCtrl block (base 0x4000)"]
+  },
+  "legacy/kestrel-clock-spec.rtf": {
+    "kind": "bundle",
+    "lane": "office",
+    "status": "ok",
+    "losslessness_gate": "pass",
+    "token_recall_min": 1.0,
+    "coverage_gate": "pass",
+    "has_toc": true,
+    "warning_codes": ["libreoffice_preconvert"],
+    "md_contains": ["# 1 Introduction", "ClkGateCtrl\\_enable\\_sync"]
+  },
+  "legacy/kestrel-clock-spec.odt": {
+    "kind": "bundle",
+    "lane": "office",
+    "status": "ok",
+    "losslessness_gate": "pass",
+    "token_recall_min": 1.0,
+    "coverage_gate": "pass",
+    "has_toc": true,
+    "warning_codes": ["libreoffice_preconvert"],
+    "md_contains": ["# 1 Introduction", "ClkGateCtrl\\_enable\\_sync",
+                    "#### 2.1.1.1 Timing budget"]
+  },
+  "legacy/kestrel-registers.xls": {
+    "kind": "bundle",
+    "lane": "office",
+    "status": "ok",
+    "losslessness_gate": "pass",
+    "token_recall_min": 1.0,
+    "coverage_gate": "pass",
+    "warning_codes": ["libreoffice_preconvert"],
+    "md_contains": ["## RegisterMap", "## PowerBudget",
+                    "Kestrel power budget (mW)", "412.5"]
+  },
+  "legacy/kestrel-overview.ppt": {
+    "kind": "bundle",
+    "lane": "office",
+    "status": "ok",
+    "losslessness_gate": "pass",
+    "token_recall_min": 1.0,
+    "coverage_gate": "pass",
+    "warning_codes": ["libreoffice_preconvert"],
+    "md_contains": ["## Slide 1", "week nine", "display read"]
+  },
+  "pdf/kestrel-clock-spec.pdf": {
+    "kind": "bundle",
+    "requires": "pdf-lane",
+    "lane": "pdf",
+    "status": "ok",
+    "losslessness_method": "pdf-text-coverage",
+    "losslessness_gate": "best-effort",
+    "token_recall_min": 0.97,
+    "coverage_gate": "pass",
+    "has_toc": true,
+    "toc_lines_min": 9,
+    "images_gate": "pass",
+    "images_referenced": 3,
+    "warning_codes_absent": ["pdf_content_loss", "pdf_text_layer_fallback",
+                             "ocr_transcription", "image_inline_bailed"],
+    "md_contains": [
+      "1 Introduction",
+      "ClkGateCtrl_enable_sync",
+      "DmaArbiterUnit_qos_cfg",
+      "PllLockMon_status_q",
+      "XbarRouteCfg_prio_map",
+      "Timing budget"
+    ],
+    "md_not_contains": ["Confidential"]
+  },
+  "pdf/kestrel-dataflow.pdf": {
+    "_note": "TRUTHFUL CURRENT BEHAVIOR, not the desired one. TODO: this is a DIGITAL diagram-only PDF, but its text layer is under pdf_has_text_layer's min_chars_per_page threshold, so the lane misroutes it to OCR: losslessness reads pdf-ocr-transcription (no recall is measured), most shape labels are dropped by RapidOCR, and the OCR path never extracts figure pixels so the detected picture placeholder bails (images gate degraded). Fix candidates: area-weighted text-layer probe; measure OCR output against the existing text layer when one exists; extract figures on the OCR path too.",
+    "kind": "bundle",
+    "requires": "pdf-lane",
+    "lane": "pdf",
+    "status": "degraded",
+    "losslessness_method": "pdf-ocr-transcription",
+    "losslessness_gate": "best-effort",
+    "images_gate": "degraded",
+    "warning_codes": ["ocr_transcription", "image_inline_bailed",
+                      "image_bytes_missing"],
+    "md_contains": ["result mailbox"]
+  },
+  "pdf/kestrel-clock-spec-scan.pdf": {
+    "_note": "Scanned (rasterized) PDF: honestly reported as OCR transcription, degraded. The degraded images gate is also truthful current behavior — TODO: the OCR path never extracts figure pixels, so every detected picture placeholder bails (image_inline_bailed + image_bytes_missing).",
+    "kind": "bundle",
+    "requires": "pdf-lane",
+    "lane": "pdf",
+    "status": "degraded",
+    "losslessness_method": "pdf-ocr-transcription",
+    "losslessness_gate": "best-effort",
+    "images_gate": "degraded",
+    "warning_codes": ["ocr_transcription"],
+    "md_contains": ["Introduction", "ClkGateCtrl_enable_sync"]
+  },
+  "text/design-notes.md": {
+    "kind": "text",
+    "lane": "passthrough",
+    "md_contains": ["# 1 Toolchain", "```sh", "make synth TOP=kestrel_top"],
+    "outline_probe": {"has_toc": true, "first_title": "1 Toolchain"}
+  },
+  "text/build-log.txt": {
+    "kind": "text",
+    "lane": "passthrough",
+    "md_contains": ["regression: 412 passed, 0 failed, 2 skipped"]
+  },
+  "text/pin-map.csv": {
+    "kind": "text",
+    "lane": "fence",
+    "md_contains": ["```csv", "clk_ref,A4,north,reference clock input"]
+  },
+  "text/timing-report.tsv": {
+    "kind": "text",
+    "lane": "fence",
+    "md_contains": ["```tsv", "cpu fetch miss\t-0.012"]
+  },
+  "text/ip-manifest.json": {
+    "kind": "text",
+    "lane": "fence",
+    "md_contains": ["```json", "\"name\": \"DmaArbiterUnit\""]
+  },
+  "text/ci-pipeline.yaml": {
+    "kind": "text",
+    "lane": "fence",
+    "md_contains": ["```yaml", "script: make regress SUITE=nightly"]
+  },
+  "text/synth-flow.tcl": {
+    "kind": "unsupported"
+  }
+}
