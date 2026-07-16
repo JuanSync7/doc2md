@@ -111,6 +111,28 @@ def find_soffice():
     return ""
 
 
+_SOFFICE_VERSION = {}                     # path -> version string (memo, one probe per run)
+
+
+def soffice_version(soffice, timeout=20):
+    # type: (str, int) -> str
+    """Version string of this ``soffice`` binary (e.g. ``LibreOffice 7.6.4.1``), or
+    ``""`` if it cannot be probed. Memoized per path: soffice is the ONE external
+    binary in the office lane, so its version is provenance every legacy/ODF
+    conversion should carry — probed once per run, never once per document."""
+    if soffice in _SOFFICE_VERSION:
+        return _SOFFICE_VERSION[soffice]
+    ver = ""
+    try:
+        out = subprocess.check_output([soffice, "--version"],
+                                      stderr=subprocess.STDOUT, timeout=timeout)
+        ver = out.decode("utf-8", "replace").strip().split("\n")[0].strip()
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+        pass
+    _SOFFICE_VERSION[soffice] = ver
+    return ver
+
+
 def soffice_to_ooxml(soffice, src_path, target_ext, timeout=180):
     # type: (str, str, str, int) -> str
     """Convert ``src_path`` to ``target_ext`` (docx/pptx/xlsx) via soffice into a
@@ -301,48 +323,60 @@ def bundle_inputs(row, soffice="", emit_images=False):
     them; default off keeps the legacy markdown lane byte-identical (no sentinels, no
     media read).
 
-    Returns a dict ``{error, body, source_text, meta, warnings, eff_ext, media}``. ``error``
-    is ``""`` on success; ``"empty-source-file"`` is a SUCCESS sentinel (a 0-byte
-    upload is vacuously lossless — nothing to lose), while every other non-empty
-    ``error`` is a genuine failure and ``body``/``source_text`` are empty. The guards
-    (unreadable zip, malformed content part, empty conversion) are exactly the
-    invariants that keep the recall==1.0 gate honest. LibreOffice/legacy inputs are
-    soffice-converted to their OOXML sibling first (via ``load_parts``) and noted with
-    a ``libreoffice_preconvert`` warning."""
+    Returns a dict ``{error, body, source_text, meta, warnings, eff_ext, media,
+    source_repr_chars}``. ``error`` is ``""`` on success; ``"empty-source-file"`` is a
+    SUCCESS sentinel (a 0-byte upload is vacuously lossless — nothing to lose), while
+    every other non-empty ``error`` is a genuine failure and ``body``/``source_text``
+    are empty. ``source_repr_chars`` is the decompressed size (chars) of every XML part
+    the converter parsed — the raw-representation side of the report's ``savings``
+    block (0 on any failure path). The guards (unreadable zip, malformed content part,
+    empty conversion) are exactly the invariants that keep the recall==1.0 gate honest.
+    LibreOffice/legacy inputs are soffice-converted to their OOXML sibling first (via
+    ``load_parts``) and noted with a ``libreoffice_preconvert`` warning."""
     warnings = []                                        # type: list
     try:
         if os.path.getsize(row["src"]) == 0:
             return {"error": "empty-source-file", "body": "<!-- empty source file -->\n",
                     "source_text": "", "meta": OrderedDict(), "warnings": warnings,
-                    "eff_ext": row.get("ext", ""), "media": {}}
+                    "eff_ext": row.get("ext", ""), "media": {}, "source_repr_chars": 0}
     except OSError:
         pass
     parts, media, eff_ext, err = load_parts(row, soffice, want_media=emit_images)
     if row.get("lane") == ROUTE_LIBREOFFICE and not err:
+        # Provenance for the one external binary in the lane: name its version.
+        ver = soffice_version(soffice)
+        via = "soffice (%s)" % ver if ver else "soffice"
         warnings.append({"code": "libreoffice_preconvert",
-                         "detail": "%s -> %s via soffice" % (row.get("ext"), eff_ext)})
+                         "detail": "%s -> %s via %s" % (row.get("ext"), eff_ext, via)})
     if err:
         return {"error": err, "body": "", "source_text": "", "meta": OrderedDict(),
-                "warnings": warnings, "eff_ext": eff_ext, "media": {}}
+                "warnings": warnings, "eff_ext": eff_ext, "media": {},
+                "source_repr_chars": 0}
     if not parts:
         return {"error": "unreadable-zip", "body": "", "source_text": "",
-                "meta": OrderedDict(), "warnings": warnings, "eff_ext": eff_ext, "media": {}}
+                "meta": OrderedDict(), "warnings": warnings, "eff_ext": eff_ext,
+                "media": {}, "source_repr_chars": 0}
     # Close the symmetry hole BEFORE measuring: a corrupt content part is lost from both
     # sides and would pass recall==1.0 on the healthy remainder.
     bad_part = malformed_content_part(eff_ext, parts)
     if bad_part:
         return {"error": "malformed-content-part:%s" % bad_part, "body": "",
                 "source_text": "", "meta": OrderedDict(), "warnings": warnings,
-                "eff_ext": eff_ext, "media": {}}
+                "eff_ext": eff_ext, "media": {}, "source_repr_chars": 0}
+    # The raw-representation size the markdown replaces: decompressed chars of every
+    # XML part parsed (report ``savings`` block; measured, never estimated).
+    repr_chars = sum(len(v) for v in parts.values())
     body = ooxml_markdown(eff_ext, parts, emit_images)
     src_text = ooxml_source_text(eff_ext, parts)
     if not body.strip() and src_text.strip():
         return {"error": "empty-conversion", "body": "", "source_text": src_text,
-                "meta": OrderedDict(), "warnings": warnings, "eff_ext": eff_ext, "media": {}}
+                "meta": OrderedDict(), "warnings": warnings, "eff_ext": eff_ext,
+                "media": {}, "source_repr_chars": 0}
     meta = core_properties(parts.get("docProps/core.xml", ""),
                            parts.get("docProps/app.xml", ""))
     return {"error": "", "body": body, "source_text": src_text, "meta": meta,
-            "warnings": warnings, "eff_ext": eff_ext, "media": media}
+            "warnings": warnings, "eff_ext": eff_ext, "media": media,
+            "source_repr_chars": repr_chars}
 
 
 def convert_one(row, soffice=""):

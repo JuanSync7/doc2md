@@ -18,7 +18,7 @@ from collections import OrderedDict
 from backend.ingest import front_matter
 from backend.sections import document_outline, outline_coverage
 from backend.validate import (build_report, image_report, caption_report,
-                              outline_report)
+                              outline_report, savings_report)
 
 __all__ = ["assemble_bundle"]
 
@@ -148,29 +148,66 @@ def assemble_bundle(doc_id, source_relpath, source_format, lane,
     outline = document_outline(body_md, token_count=token_count)
     tmodel = token_model or ("char-estimate/4" if token_count is None else "custom")
 
+    verdict = build_report(source_text, body_md, lane=lane,
+                           losslessness=losslessness, token_count=token_count)
+
+    # Measured image metadata (extras["image_meta"]: {image_id: {width,height,bytes}},
+    # probed by the writer from the actual extracted bytes) annotates the outline's
+    # image nodes so consumers can budget/lay out without re-reading the files.
+    img_meta = (extras or {}).get("image_meta") or {}
+    if img_meta:
+        for nd in _walk(outline["outline"]):
+            for im in nd["images"]:
+                meta = img_meta.get(im.get("image_id", ""))
+                if meta:
+                    # Whitelist merge: only the measured keys. A blind update()
+                    # would let a writer-supplied dict clobber contract fields
+                    # (caption/alt/ref) the enrichment stages own.
+                    for k in ("bytes", "width", "height"):
+                        if k in meta:
+                            im[k] = meta[k]
+
     structure = OrderedDict()
     structure["doc_id"] = doc_id
     structure["source_format"] = source_format
     structure["lane"] = lane
+    # The exact body bytes every line_span below indexes into — lets a consumer verify
+    # structure.json still matches document.md/report.json before trusting a span
+    # (the three files are written sequentially, not transactionally).
+    structure["markdown_sha256"] = verdict["markdown_sha256"]
     structure["token_model"] = tmodel
     structure["total_tokens"] = outline["total_tokens"]
     structure["has_toc"] = outline.get("has_toc", False)
     structure["outline"] = outline["outline"]
-
-    verdict = build_report(source_text, body_md, lane=lane,
-                           losslessness=losslessness, token_count=token_count)
 
     report = OrderedDict()
     report["doc_id"] = doc_id
     report["lane"] = lane
     report["source_format"] = source_format
     report["converter"] = converter or "doc2md/0.1.0"
+    # Run provenance: a FAILED doc publishes report.json only (no document.md), so the
+    # report must carry the run id itself or the failure has no provenance at all.
+    if generated_run:
+        report["generated_run"] = generated_run
     report["source_relpath"] = source_relpath or ""
     report["source_sha256"] = source_sha256 or ""
     report["markdown_sha256"] = verdict["markdown_sha256"]
     report["status"] = verdict["status"]
     report["losslessness"] = verdict["losslessness"]
+    # Names the tokenizer behind content.tokens (mirrors structure.json) so the
+    # number is self-describing without opening the sibling file.
+    report["token_model"] = tmodel
     report["content"] = verdict["content"]
+    # Representation savings: emitted only when the writer MEASURED the source side
+    # (extras["source_repr_chars"] — for the office lane, the decompressed chars of
+    # every XML part parsed). Lane-honest: a writer with no meaningful raw-text
+    # representation (e.g. PDF: binary glyphs) simply omits the key and no block is
+    # emitted — never an invented number. Informational only; no gate, no status.
+    src_repr = int((extras or {}).get("source_repr_chars", 0) or 0)
+    if src_repr:
+        report["savings"] = savings_report(
+            src_repr, len(body_md or ""),
+            source_repr=(extras or {}).get("source_repr", "ooxml-xml"))
     report["structure"] = _structure_summary(outline["outline"],
                                               outline.get("has_toc", False), body_md)
     report["structural_errors"] = verdict["structural_errors"]

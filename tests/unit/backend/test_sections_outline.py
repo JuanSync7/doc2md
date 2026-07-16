@@ -257,3 +257,42 @@ def test_line_span_covers_whole_subtree():
     # Top's span runs from its heading line to the start of "Next" (its sibling).
     assert top["line_span"][0] == lines.index("# Top")
     assert top["line_span"][1] == lines.index("# Next")
+
+
+def test_links_attach_to_their_section_verbatim():
+    text = ("# Refs\nsee [Radar ICD v2](https://x/radar_icd.docx) and "
+            "[RFC 9110](https://rfc.io/9110)\n")
+    links = document_outline(text)["outline"][0]["links"]
+    assert links == [
+        {"text": "Radar ICD v2", "url": "https://x/radar_icd.docx", "line": 1},
+        {"text": "RFC 9110", "url": "https://rfc.io/9110", "line": 1},
+    ]
+
+
+def test_links_exclude_images_and_escaped_brackets():
+    # An image reference is not a link; an escaped literal "\[" (converter-escaped
+    # source bracket, e.g. a signal name) is not a link either.
+    text = ("# S\n![diagram](images/aabb.png)\n"
+            "signal \\[31:0\\](reset) is literal text\n"
+            "but [real](http://y) is a link\n")
+    node = document_outline(text)["outline"][0]
+    assert [im["ref"] for im in node["images"]] == ["images/aabb.png"]
+    assert [(l["text"], l["url"]) for l in node["links"]] == [("real", "http://y")]
+
+
+def test_links_belong_to_self_body_not_duplicated_in_parent():
+    # Same ownership rule as images: a child's links live on the child only.
+    text = "# Top\n[t](http://a)\n## Sub\n[s](http://b)\n"
+    out = document_outline(text)["outline"]
+    top = out[0]
+    assert [l["url"] for l in top["links"]] == ["http://a"]
+    assert [l["url"] for l in top["children"][0]["links"]] == ["http://b"]
+
+
+def test_links_inside_code_fences_are_code_not_connectivity():
+    # Same exclusion content.links applies; a fence opened before the child span
+    # still suppresses (fence state tracked from the top of the body).
+    text = ("# S\n```\nurl = \"[RFC 9110](https://rfc.io/9110)\"\n```\n"
+            "[real](http://y)\n")
+    node = document_outline(text)["outline"][0]
+    assert [l["url"] for l in node["links"]] == ["http://y"]

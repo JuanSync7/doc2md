@@ -98,6 +98,10 @@ the 3.6/stdlib backend so no tokenizer dependency leaks in. `build_bundle.py
   "doc_id": "…",
   "source_format": "docx",
   "lane": "office",
+  "markdown_sha256": "…",              // the exact body bytes every line_span indexes —
+                                       //   verify against document.md/report.json before
+                                       //   trusting a span (files are written sequentially,
+                                       //   not transactionally)
   "token_model": "cl100k_base",        // or "char-estimate/4" when no tokenizer
   "total_tokens": 12345,
   "outline": [
@@ -116,7 +120,17 @@ the 3.6/stdlib backend so no tokenizer dependency leaks in. `build_bundle.py
           "ref": "images/219f951a5046d997.png",
           "line": 42,                    // placement in the markdown BODY (see note below)
           "alt": "",                     // deterministic; empty in the office pass today
-          "caption": null                // VLM enrichment; null until captioning runs
+          "caption": null,               // VLM enrichment; null until captioning runs
+          "bytes": 48123,                // MEASURED from the extracted bytes (writer probe);
+          "width": 640, "height": 480    //   dims omitted for metafiles/unknown headers —
+                                         //   never guessed
+        }
+      ],
+      "links": [                         // hyperlinks in this section's own body (the image
+        {                                //   pattern applied to connectivity — pure harvest)
+          "text": "Radar ICD v2",
+          "url": "https://…/radar_icd.docx",   // verbatim; resolving it to another doc_id
+          "line": 47                     //   (the doc->doc edge) is the CONSUMER's job
         }
       ],
       "children": [ /* nested headings, same node shape */ ]
@@ -134,6 +148,15 @@ markdown **body** — the exact bytes `markdown_sha256` covers — not `document
 whole. The body is frontmatter-independent, so these indices stay stable across runs
 even though the front matter carries a per-run `generated_run`; a consumer that wants
 to index `document.md` directly must first strip its leading front-matter block.
+
+**Links are the fourth output: connectivity.** The founding rule of this contract —
+a consumer never re-parses the markdown to learn a fact — extends to hyperlinks:
+each node's `links[]` harvests the `[text](url)` references from that section's own
+body (children carry their own), exactly as image nodes harvest `![](…)`. Unlike
+images there are no bytes, no integrity gate and no enrichment stage — a link is
+pure text, so this is harvest-only. URLs are verbatim: mapping a URL to another
+corpus document (the knowledge-graph doc→doc edge) is corpus-level inference and
+stays the consumer's job.
 
 **Image captions live here, never in the report.** A caption is a VLM (LLM) output;
 the report is validator-only by contract. The deterministic core always emits the
@@ -154,9 +177,12 @@ enough metrics for a dashboard to triage without opening the markdown.
   "lane": "office",
   "source_format": "docx",
   "converter": "doc2md-ooxml/0.1.0",
+  "generated_run": "20260710T120000Z",   // run provenance (a failed doc's ONLY artifact
+                                         //   is report.json, so it lives here too)
   "source_sha256": "…",
   "markdown_sha256": "…",
   "status": "ok",                        // ok | degraded | failed
+  "token_model": "cl100k_base",          // names the tokenizer behind content.tokens
   "losslessness": {                      // OFFICE (deterministic, gated):
     "method": "ooxml-ground-truth",
     "token_recall": 1.0,                 // hard gate == 1.0
@@ -182,7 +208,16 @@ enough metrics for a dashboard to triage without opening the markdown.
   //                     "gate": "best-effort" }
   "content": {
     "chars": 48210, "tokens": 12345, "headings": 34,
-    "tables": 6, "images": 4, "lists": 12, "code_blocks": 2, "formulas": 0
+    "tables": 6, "images": 4, "links": 9, "lists": 12, "code_blocks": 2, "formulas": 0
+  },
+  "savings": {                           // representation savings (office lane; MEASURED):
+    "source_repr": "ooxml-xml",          // what the markdown replaced
+    "source_chars": 655360,              // decompressed chars of every XML part parsed
+    "markdown_chars": 48210,             // chars only — measured identically both sides;
+    "reduction_ratio": 13.59,            //   token views are derivable, not stored
+    "saved_pct": 92.64
+    // informational only — no gate, never moves status. Omitted when the writer did
+    // not measure the source side (e.g. PDF: binary glyphs, no raw-text repr).
   },
   "structure": {
     "max_depth": 4, "largest_section_tokens": 4200, "has_toc": true,
@@ -196,7 +231,8 @@ enough metrics for a dashboard to triage without opening the markdown.
     }
   },
   "warnings": [
-    { "code": "libreoffice_preconvert", "detail": "odt → docx via soffice" },
+    // the soffice VERSION is named: it is the one external binary in the office lane
+    { "code": "libreoffice_preconvert", "detail": "odt -> docx via soffice (LibreOffice 7.6.4.1)" },
     { "code": "dropped_headers_footers" }
   ],
   "images": {                            // DETERMINISTIC image-extraction integrity gate:
@@ -223,6 +259,19 @@ Fields beyond the raw lossless flag, and why they earn their place:
 - `markdown_sha256` — determinism check + cache key; a re-run that changes it is a
   regression to investigate.
 - `converter` version — provenance/reproducibility.
+- `savings{}` — the measured exchange rate of the conversion: how many chars of raw
+  source representation each markdown char replaced. The source side is the
+  decompressed size of every XML part the converter actually parsed (returned by
+  `bundle_inputs` as `source_repr_chars`), so the number is measured, never estimated
+  from file size. Chars only, measured identically on both sides — token views are
+  derivable by the consumer under its own tokenizer, so they are not stored.
+  Informational only: no gate, never touches `status`; omitted for lanes with no
+  raw-text source representation (PDF).
+- `generated_run` — run provenance in the report itself: a **failed** document
+  publishes `report.json` only (no `document.md`), so without this field a failure
+  would carry no run id at all.
+- `token_model` — names the tokenizer behind `content.tokens` (mirrors
+  `structure.json`), so the number is self-describing without opening the sibling.
 - `status: ok|degraded|failed` — a dashboard triages without parsing internals
   (`degraded` = converted with warnings OR a degraded image gate; `failed` = no valid
   markdown). The **caption gate never touches `status`** — captioning is a re-runnable
