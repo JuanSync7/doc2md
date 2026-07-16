@@ -20,7 +20,8 @@ from collections import Counter, OrderedDict, namedtuple
 from backend.ingest import coverage, markdown_to_text
 
 __all__ = ["validate_markdown", "conversion_report", "build_report",
-           "image_report", "caption_report", "outline_report", "MdIssue"]
+           "image_report", "caption_report", "outline_report", "savings_report",
+           "MdIssue"]
 
 MdIssue = namedtuple("MdIssue", ["line", "code", "severity", "message"])
 
@@ -227,6 +228,8 @@ def conversion_report(source_text, md, content_min=_CONTENT_GATE):
 
 _LIST = re.compile(r"^\s*([-*+]|\d+[.)])\s+\S")
 _IMG_MD = re.compile(r"!\[[^\]]*\]\([^)\s]+")
+# A hyperlink: [text](url) that is neither an image (!) nor escaped literal text (\[).
+_LINK_MD = re.compile(r"(?<![!\\])\[[^\]]*\]\([^)\s]+")
 
 
 def _content_metrics(md, token_count=None):
@@ -241,7 +244,7 @@ def _content_metrics(md, token_count=None):
         tokens = sum((len(ln) + 3) // 4 for ln in lines)
     else:
         tokens = sum(token_count(ln) for ln in lines)
-    headings = tables = lists = fences = images = 0
+    headings = tables = lists = fences = images = links = 0
     in_fence = False
     i = 0
     n = len(lines)
@@ -258,13 +261,14 @@ def _content_metrics(md, token_count=None):
             if _LIST.match(ln):
                 lists += 1
             images += len(_IMG_MD.findall(ln))
+            links += len(_LINK_MD.findall(ln))
             if (i + 1 < n and _PIPE.search(ln) and _is_separator(lines[i + 1])
                     and _PIPE.search(lines[i + 1])):
                 tables += 1
         i += 1
     return {
         "chars": len(md), "tokens": tokens, "headings": headings,
-        "tables": tables, "images": images, "lists": lists,
+        "tables": tables, "images": images, "links": links, "lists": lists,
         "code_blocks": fences // 2, "formulas": md.count("$$") // 2,
     }
 
@@ -398,6 +402,30 @@ def outline_report(content_lines, covered_lines, toc_lines, uncovered_lines,
     if first_uncovered:
         b["first_uncovered"] = list(first_uncovered)
     b["gate"] = "pass" if uncovered_lines == 0 else "degraded"
+    return b
+
+
+def savings_report(source_repr_chars, markdown_chars, source_repr="ooxml-xml"):
+    # type: (int, int, str) -> dict
+    """The representation-savings block for ``report.json`` — how much smaller the
+    markdown is than the raw source representation it replaces.
+
+    ``source_repr_chars`` is the decompressed size (chars) of the source parts the
+    converter actually parsed (for the OOXML lane: every XML part read from the zip)
+    — i.e. what a consumer would otherwise have to feed downstream. ``markdown_chars``
+    is the converted body. Both sides are CHARS, measured identically, so the ratio is
+    tokenizer-independent (token views are derivable — deliberately not stored).
+    Purely informational: no gate, never touches ``status``."""
+    src = int(source_repr_chars)
+    md = int(markdown_chars)
+    b = OrderedDict()
+    b["source_repr"] = source_repr
+    b["source_chars"] = src
+    b["markdown_chars"] = md
+    # A 0-char markdown from a 0-char source saved nothing; a 0-char markdown from a
+    # real source is a conversion problem the GATES catch — here it just reads 1.0.
+    b["reduction_ratio"] = round(src / float(md), 2) if md else (1.0 if not src else 0.0)
+    b["saved_pct"] = round(100.0 * (1.0 - md / float(src)), 2) if src else 0.0
     return b
 
 

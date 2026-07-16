@@ -10,7 +10,8 @@ summary: Output validators — markdown structural checks + the lossless convers
 # It depends on backend.ingest (coverage, markdown_to_text); nothing in ingest
 # imports back, so the dependency is one-way (validate sits above ingest).
 from ._mdcheck import (validate_markdown, conversion_report, build_report,
-                       image_report, caption_report, outline_report, MdIssue)
+                       image_report, caption_report, outline_report,
+                       savings_report, MdIssue)
 
 __all__ = [
     "validate_markdown",
@@ -19,5 +20,6 @@ __all__ = [
     "image_report",
     "caption_report",
     "outline_report",
+    "savings_report",
     "MdIssue",
 ]

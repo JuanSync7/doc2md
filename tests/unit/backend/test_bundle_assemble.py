@@ -218,3 +218,50 @@ def test_warnings_and_timing_passed_through():
     assert b["report"]["converter"] == "doc2md-ooxml/9.9"
     assert b["report"]["source_sha256"] == "abc123"
     assert 'source_sha256: "abc123"' in b["document_md"]
+
+
+def test_savings_block_emitted_when_writer_measured_the_source():
+    b = _office(extras={"source_repr_chars": 40000})
+    sav = b["report"]["savings"]
+    assert sav["source_chars"] == 40000
+    assert sav["markdown_chars"] == len(BODY)
+    assert sav["reduction_ratio"] > 1.0
+    # informational only: a huge or tiny ratio never moves the status
+    assert b["report"]["status"] == "ok"
+
+
+def test_savings_block_omitted_when_unmeasured():
+    # No source_repr_chars (e.g. the PDF writer): no block, never an invented number.
+    assert "savings" not in _office()["report"]
+    b = assemble_bundle(doc_id="p", source_relpath="paper.pdf", source_format="pdf",
+                        lane="pdf", source_text=SRC, body_md=BODY,
+                        losslessness={"method": "pdf-text-coverage", "gate": "best-effort"})
+    assert "savings" not in b["report"]
+
+
+def test_structure_carries_the_body_hash_it_indexes():
+    # structure.json's line spans index the exact body bytes; the hash lets a
+    # consumer verify the trio is in sync before trusting a span.
+    b = _office()
+    assert b["structure"]["markdown_sha256"] == b["report"]["markdown_sha256"]
+    assert b["structure"]["markdown_sha256"] == hashlib.sha256(
+        BODY.encode("utf-8")).hexdigest()
+
+
+def test_report_carries_run_provenance_and_token_model():
+    b = _office(generated_run="20260710T120000Z")
+    assert b["report"]["generated_run"] == "20260710T120000Z"
+    assert b["report"]["token_model"] == "char-estimate/4"
+    assert "generated_run" not in _office()["report"]    # omitted when not stamped
+
+
+def test_image_meta_annotates_outline_nodes():
+    body = "# A\n\n![fig](images/aabbccdd11223344.png)\n\nprose\n"
+    meta = {"aabbccdd11223344": {"bytes": 512, "width": 64, "height": 32}}
+    b = _office(source_text="A prose", body_md=body, extras={"image_meta": meta})
+    im = b["structure"]["outline"][0]["images"][0]
+    assert im["bytes"] == 512 and im["width"] == 64 and im["height"] == 32
+    # an id with no measured meta stays un-annotated, never guessed
+    b2 = _office(source_text="A prose", body_md=body, extras={"image_meta": {}})
+    im2 = b2["structure"]["outline"][0]["images"][0]
+    assert "bytes" not in im2 and "width" not in im2

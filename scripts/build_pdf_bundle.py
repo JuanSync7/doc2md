@@ -261,7 +261,8 @@ def build_one(row, conv, ocr_conv, ocr_mode, out_root, run_id, cfg,
 
     extras = {"images_extracted": sum(1 for r in renders if r),
               "image_files": len(assets), "images_missing": n_missing,
-              "captions_enabled": captions_enabled}
+              "captions_enabled": captions_enabled,
+              "image_meta": bb.image_meta_of(assets.items())}
     t1 = time.time()
     bundle = assemble_bundle(
         doc_id=row["id"], source_relpath=row["rel"], source_format=row["ext"],

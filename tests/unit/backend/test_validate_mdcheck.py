@@ -8,7 +8,8 @@ summary: validate_markdown finds broken tables/fences/leaks; conversion_report g
 # converter lane's output must pass: structure well-formed AND source tokens 100%.
 import pytest
 from backend.validate import (validate_markdown, conversion_report, build_report,
-                              image_report, caption_report, outline_report)
+                              image_report, caption_report, outline_report,
+                              savings_report)
 
 pytestmark = pytest.mark.unit
 
@@ -231,3 +232,24 @@ def test_build_report_non_office_cannot_claim_a_pass_gate():
                            losslessness=supplied)
         assert rep["losslessness"]["gate"] == "best-effort"
         assert rep["status"] in ("ok", "degraded")     # never a hard pass/fail for pdf
+
+
+def test_savings_report_measures_the_exchange_rate():
+    # 40k chars of raw XML -> 4k chars of markdown: 10x reduction, 90% saved.
+    # Chars only — measured on both sides; token views are derivable, not stored.
+    b = savings_report(source_repr_chars=40000, markdown_chars=4000)
+    assert b["source_repr"] == "ooxml-xml"
+    assert b["source_chars"] == 40000 and b["markdown_chars"] == 4000
+    assert b["reduction_ratio"] == 10.0
+    assert b["saved_pct"] == 90.0
+    assert "source_tokens_est" not in b          # deliberately chars-only
+
+
+def test_savings_report_empty_edges_never_divide_by_zero():
+    # 0 -> 0 (empty source): nothing saved, ratio a neutral 1.0.
+    b = savings_report(0, 0)
+    assert b["reduction_ratio"] == 1.0 and b["saved_pct"] == 0.0
+    # real source -> 0-char markdown: the GATES fail such a doc; this block just
+    # reports a 0 ratio rather than raising.
+    b = savings_report(5000, 0)
+    assert b["reduction_ratio"] == 0.0

@@ -27,6 +27,10 @@ from ._chunk import (is_heading, is_toc_line, content_start, normalize_title,
 __all__ = ["document_outline", "outline_coverage"]
 
 _IMG = re.compile(r'!\[([^\]]*)\]\(([^)\s]+)')   # markdown image: ![alt](ref ...
+# A markdown LINK: [text](url ...) that is NOT an image (no leading !) and whose
+# opening bracket is not escaped literal text (the converter escapes source "[" as
+# "\["; silicon docs are full of literal brackets that must not read as links).
+_LINK = re.compile(r'(?<![!\\])\[([^\]]*)\]\(([^)\s]+)')
 # A markdown LIST item: ``- x`` / ``* x`` / ``1. x`` / ``2) x``. It is NOT a heading,
 # even though is_heading's numbered/all-caps heuristics (built for un-marked-up native
 # text) match many list lines. Crucially the ``\d+[.)]\s`` form matches a FLAT numbered
@@ -70,6 +74,23 @@ def _images_in(lines, a, b):
             image_id = os.path.splitext(os.path.basename(ref))[0]
             out.append({"image_id": image_id, "ref": ref, "line": i,
                         "alt": alt, "caption": None})
+    return out
+
+
+def _links_in(lines, a, b):
+    # type: (list, int, int) -> list
+    """Every markdown hyperlink in [a, b), as structure.json link nodes — the image
+    pattern applied to connectivity.
+
+    The converter already renders source hyperlinks as ``[text](url)``, so this is
+    pure harvest (no sentinels, no bytes, no gate). ``url`` is kept verbatim;
+    resolving it to another document (the doc->doc edge) is the consumer's job —
+    only it knows the whole corpus. Image references never appear here (``![``),
+    and escaped literal brackets (``\\[``) are not links."""
+    out = []
+    for i in range(a, b):
+        for m in _LINK.finditer(lines[i]):
+            out.append({"text": m.group(1), "url": m.group(2), "line": i})
     return out
 
 
@@ -133,7 +154,7 @@ def document_outline(text, token_count=None):
 
     Returns ``{"total_tokens": int, "has_toc": bool, "outline": [node, ...]}`` where
     each node is a JSON-serializable dict: ``id, level, title, anchor, line_span,
-    self_tokens, subtree_tokens, tables, images, children``. ``has_toc`` records
+    self_tokens, subtree_tokens, tables, images, links, children``. ``has_toc`` records
     whether a leading table-of-contents block was detected and skipped. The caller
     wraps this with doc-level metadata (doc_id, source_format, lane, token_model).
     """
@@ -172,6 +193,7 @@ def document_outline(text, token_count=None):
             "subtree_tokens": span(a, subtree_end),
             "tables": _count_tables(lines, a, self_end),
             "images": _images_in(lines, a, self_end),
+            "links": _links_in(lines, a, self_end),
             "children": [],
         }
 

@@ -45,7 +45,7 @@ import office_convert as oc                      # noqa: E402  (disk helpers + s
 from backend.bundle import assemble_bundle       # noqa: E402  (pure assembler)
 from backend.ingest import (load_source_root,    # noqa: E402
                             ooxml_image_parts, plan_office_images, inline_ooxml_images,
-                            load_ingest_config)
+                            load_ingest_config, image_dimensions)
 from backend.validate import image_report, caption_report   # noqa: E402  (report policy)
 
 # Our extracted images are content-addressed: <sha16>.<ext>. Used to scope the orphan
@@ -103,6 +103,22 @@ def _write_bytes(dest, data):
     with open(tmp, "wb") as f:
         f.write(data)
     os.replace(tmp, dest)
+
+
+def image_meta_of(asset_pairs):
+    # type: (object) -> dict
+    """Measured per-image metadata for the structure.json image nodes, keyed by
+    image_id (the content-addressed filename stem): byte size always, pixel
+    dimensions when the header is a known raster (metafiles/malformed -> omitted,
+    never guessed). Shared by both bundle writers via ``extras["image_meta"]``."""
+    out = {}
+    for fname, data in asset_pairs:
+        meta = {"bytes": len(data)}
+        dims = image_dimensions(data)
+        if dims:
+            meta["width"], meta["height"] = dims
+        out[fname.split(".", 1)[0]] = meta
+    return out
 
 
 def _verify_images(img_dir, assets):
@@ -218,17 +234,20 @@ def _count_outline_images(structure):
     return total[0]
 
 
-def _failure_report(row, error, warnings):
-    # type: (dict, str, list) -> dict
+def _failure_report(row, error, warnings, run_id=""):
+    # type: (dict, str, list, str) -> dict
     """A report for a document that FAILED conversion — recorded, never silent. It
     must NOT run through the assembler: an empty body would score a vacuous recall of
-    1.0 and falsely 'pass', so failures carry an explicit failed gate instead."""
+    1.0 and falsely 'pass', so failures carry an explicit failed gate instead. The
+    run id is carried here because report.json is a failed doc's ONLY artifact."""
     from collections import OrderedDict
     rep = OrderedDict()
     rep["doc_id"] = row["id"]
     rep["lane"] = "office"
     rep["source_format"] = row["ext"]
     rep["converter"] = CONVERTER
+    if run_id:
+        rep["generated_run"] = run_id
     rep["source_relpath"] = row["rel"]
     rep["status"] = "failed"
     rep["losslessness"] = {"method": "ooxml-ground-truth", "gate": "fail",
@@ -251,7 +270,7 @@ def build_one(row, soffice, out_root, run_id, token_count=None, token_model=None
 
     if info["error"] and info["error"] != "empty-source-file":
         os.makedirs(doc_dir, exist_ok=True)
-        rep = _failure_report(row, info["error"], info["warnings"])
+        rep = _failure_report(row, info["error"], info["warnings"], run_id)
         _write_json(os.path.join(doc_dir, "report.json"), rep)
         return {"doc_id": row["id"], "source_relpath": row["rel"], "lane": "office",
                 "status": "failed", "markdown_sha256": "", "error": info["error"]}
@@ -268,7 +287,10 @@ def build_one(row, soffice, out_root, run_id, token_count=None, token_model=None
                          "detail": "%d referenced image(s) had no bytes in the package"
                                    % plan.n_missing})
     extras = {"images_extracted": plan.n_resolved, "image_files": plan.n_files,
-              "images_missing": plan.n_missing, "captions_enabled": captions_enabled}
+              "images_missing": plan.n_missing, "captions_enabled": captions_enabled,
+              # measured raw-XML size the markdown replaces -> report "savings" block
+              "source_repr_chars": info.get("source_repr_chars", 0),
+              "image_meta": image_meta_of(plan.assets)}
 
     src_sha = sha256_file(row["src"])
     t1 = time.time()
