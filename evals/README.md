@@ -53,12 +53,12 @@ generated), never to silent passes. A pytest wrapper lives at
 
 | Corpus file | Features exercised | Expected gate |
 |-------------|-------------------|---------------|
-| `office/kestrel-clock-spec.docx` | 4-level headings; dot-leader TOC with content on the immediately-next block (the once-regressed first-heading skip); nested bullet + decimal lists; gridSpan + vMerge merged table cells; long `Snake_Case`/CamelCase identifiers; split text runs; 3 embedded PNGs; header/footer + PAGE furniture; markdown-special characters | ok, recall 1.0, coverage pass, images pass, `max_depth` 4 |
+| `office/kestrel-clock-spec.docx` | 4-level headings; dot-leader TOC with content on the immediately-next block (the once-regressed first-heading skip); nested bullet + decimal lists; gridSpan + vMerge merged table cells; long `Snake_Case`/CamelCase identifiers; split text runs; 3 embedded PNGs; an external `w:hyperlink` (structure.json `links[]` + `content.links` + `savings` probes); header/footer + PAGE furniture; markdown-special characters | ok, recall 1.0, coverage pass, images pass, `max_depth` 4, savings ≥ 4x, link node verbatim |
 | `office/kestrel-readme.docx` | trivial happy path | ok, recall 1.0 |
 | `office/kestrel-registers.xlsx` | 3 sheets; shared + inline strings; typed columns (hex strings, ints, floats, bools, ISO dates); merged cells; formulas with cached values; nearly-empty sheet | ok, recall 1.0 |
 | `office/kestrel-overview.pptx` | title/bullets/table/shapes/notes slides; nested bullet levels; speaker notes | ok, recall 1.0 |
 | `office/kestrel-dataflow.pptx` | text-in-shape only (diagram-like) | ok, recall 1.0 |
-| `legacy/*.doc/.rtf/.odt/.xls/.ppt` | LibreOffice pre-convert lane (`libreoffice_preconvert`) | ok, recall 1.0 vs the converted sibling |
+| `legacy/*.doc/.rtf/.odt/.xls/.ppt` | LibreOffice pre-convert lane (`libreoffice_preconvert`); `.doc` additionally probes hyperlink survival through soffice (verbatim link node) | ok, recall 1.0 vs the converted sibling |
 | `pdf/kestrel-clock-spec.pdf` | digital PDF: TOC, tables with identifiers (raw-vocab repair), figures, furniture exclusion | ok, best-effort, recall ≥ 0.97, images pass |
 | `pdf/kestrel-dataflow.pdf` | diagram-only PDF (known edge: misrouted to OCR by the text-layer threshold) | degraded — truthful current behavior, see `_note` |
 | `pdf/kestrel-clock-spec-scan.pdf` | scanned/rasterized PDF → OCR lane | degraded + `ocr_transcription` |

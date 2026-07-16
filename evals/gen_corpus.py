@@ -417,6 +417,13 @@ def spec_docx_body():
                  + w_run(" owns quality-of-service accounting for every "
                          "initiator port.")))
     b.append(w_text_p("1.2 Reference documents", style="Heading2"))
+    # An external hyperlink (w:hyperlink + external rel): the converter must render
+    # [text](url) and the outline must carry it as a structure.json link node — the
+    # knowledge-graph connectivity probe.
+    b.append(w_p(w_run("Device targets follow the ")
+                 + '<w:hyperlink r:id="rId20">%s</w:hyperlink>'
+                 % w_run("Kestrel PDK release notes")
+                 + w_run(" published by the platform team.")))
     b.append(w_text_p("Kestrel platform integration guide", num=(1, 0)))
     b.append(w_text_p("Chapter 4: clocks and resets", num=(1, 1)))
     b.append(w_text_p("Chapter 7: power domains", num=(1, 1)))
@@ -495,6 +502,10 @@ def build_spec_docx(path):
                   '.org/officeDocument/2006/relationships/image" '
                   'Target="media/%s"/>' % (i, name)
                   for i, (name, _w, _h, _fn) in enumerate(PNGS))
+        + '<Relationship Id="rId20" Type="http://schemas.openxmlformats.org/'
+          'officeDocument/2006/relationships/hyperlink" '
+          'Target="https://nimbus-semi.example/kestrel/pdk-release-notes" '
+          'TargetMode="External"/>'
         + '</Relationships>')
     wp = "application/vnd.openxmlformats-officedocument.wordprocessingml"
     ct = content_types(
