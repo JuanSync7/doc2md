@@ -96,6 +96,15 @@ def outline_titles(nodes, out):
         outline_titles(n.get("children", []), out)
 
 
+def outline_links(nodes, out):
+    # type: (list, list) -> None
+    """Flatten every structure.json link node to (text, url)."""
+    for n in nodes:
+        for lk in n.get("links", []):
+            out.append((lk.get("text", ""), lk.get("url", "")))
+        outline_links(n.get("children", []), out)
+
+
 class Checker(object):
     """Collects per-document check failures."""
 
@@ -154,6 +163,19 @@ def check_bundle(rel, exp, bundles_dir):
     if "max_depth" in exp:
         c.eq(rep.get("structure", {}).get("max_depth"), exp["max_depth"],
              "structure.max_depth")
+    if "savings_ratio_min" in exp:
+        # The measured representation savings must exist AND clear the floor —
+        # a missing block or a collapsed ratio is a regression in the exchange rate.
+        sav = rep.get("savings") or {}
+        got = sav.get("reduction_ratio")
+        c.check(isinstance(got, (int, float)) and got >= exp["savings_ratio_min"],
+                "savings.reduction_ratio: got %r, want >= %s"
+                % (got, exp["savings_ratio_min"]))
+    if "content_links_min" in exp:
+        got = rep.get("content", {}).get("links")
+        c.check(isinstance(got, int) and got >= exp["content_links_min"],
+                "content.links: got %r, want >= %d"
+                % (got, exp["content_links_min"]))
     if "images_gate" in exp:
         c.eq(rep.get("images", {}).get("gate"), exp["images_gate"], "images.gate")
     if "images_referenced" in exp:
@@ -169,7 +191,8 @@ def check_bundle(rel, exp, bundles_dir):
     # publishes no document.md — probe only when it exists / status not failed.
     mdp = os.path.join(ddir, "document.md")
     needs_md = (exp.get("md_contains") or exp.get("md_not_contains")
-                or exp.get("md_min_count") or exp.get("outline_titles"))
+                or exp.get("md_min_count") or exp.get("outline_titles")
+                or exp.get("structure_links_contains"))
     if needs_md:
         if not os.path.isfile(mdp):
             c.check(False, "document.md missing (status %r)" % rep.get("status"))
@@ -183,14 +206,34 @@ def check_bundle(rel, exp, bundles_dir):
                 got = body.count(probe)
                 c.check(got >= n, "md_min_count: %r seen %d, want >= %d"
                         % (probe, got, n))
-            if exp.get("outline_titles"):
-                st = load_json(os.path.join(ddir, "structure.json"))
-                titles = []  # type: list
-                outline_titles(st.get("outline", []), titles)
-                for t in exp["outline_titles"]:
-                    c.check(t in titles,
-                            "outline_titles: %r not in outline (got %r)"
-                            % (t, titles))
+            if exp.get("outline_titles") or exp.get("structure_links_contains"):
+                # One guarded load for both structure probes: a missing/corrupt
+                # structure.json is a recorded per-doc failure, never a crash of
+                # the whole eval run.
+                try:
+                    st = load_json(os.path.join(ddir, "structure.json"))
+                except (OSError, ValueError) as exc:
+                    st = None
+                    c.check(False, "structure.json missing/unreadable: %s" % exc)
+                if st is not None:
+                    if exp.get("outline_titles"):
+                        titles = []  # type: list
+                        outline_titles(st.get("outline", []), titles)
+                        for t in exp["outline_titles"]:
+                            c.check(t in titles,
+                                    "outline_titles: %r not in outline (got %r)"
+                                    % (t, titles))
+                    if exp.get("structure_links_contains"):
+                        # The KG connectivity probe: these (text, url) pairs must
+                        # be carried as structure.json link nodes, not just
+                        # markdown text.
+                        got_links = []  # type: list
+                        outline_links(st.get("outline", []), got_links)
+                        for want in exp["structure_links_contains"]:
+                            pair = (want.get("text", ""), want.get("url", ""))
+                            c.check(pair in got_links,
+                                    "structure_links: %r not in outline links "
+                                    "(got %r)" % (pair, got_links))
     return c.fails
 
 
