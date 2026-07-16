@@ -1,0 +1,101 @@
+# doc2md CI — three rings, cheapest first:
+#   1. tests-py36    unit+integration on bare Python 3.6 (the pipeline's real host
+#                    constraint: ingest/validate/bundle/sections must import + pass there)
+#   2. tests-modern  same suite on 3.12 (the PDF lane's interpreter generation)
+#   3. eval-office   the synthetic-corpus eval (office/text/legacy lanes) with a real
+#                    LibreOffice — the regression gate over the fictional Kestrel docs
+# The PDF-lane eval (docling + torch, ~2 GB) runs nightly, not per-push: eval-pdf.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "17 2 * * *"        # nightly full run incl. the PDF lane
+  workflow_dispatch:
+
+permissions:
+  contents: read                # CI only reads the repo + uploads artifacts
+
+jobs:
+  tests-py36:
+    # Guards the hard repo rule: src/backend + scripts run on a bare 3.6 host.
+    # A PEP-604 union or capture_output= slipping in fails HERE, not in production.
+    # Deliberately `docker run`, NOT `container:` — actions (checkout etc.) need a
+    # node20 runtime whose glibc floor old images may miss; this way no action ever
+    # executes inside the 3.6 image, so the base image's age cannot break the job.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # pytest==6.2.5: last pytest generation supporting 3.6.
+      # test_coverage_flow's 2 broken tests reference scripts/coverage_report.py,
+      # which was never committed (pre-existing) — deselect until resolved.
+      - name: Run suite on bare Python 3.6
+        run: >
+          docker run --rm -v "$PWD:/repo" -w /repo python:3.6-slim
+          bash -ec "pip install -q 'pytest==6.2.5'
+          && python -m pytest tests/unit tests/integration -q
+          --deselect tests/integration/test_coverage_flow.py::test_coverage_report_summarize_and_dedup
+          --deselect tests/integration/test_coverage_flow.py::test_report_surfaces_figure_loss"
+
+  tests-modern:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pytest
+      - run: >
+          python -m pytest tests/unit tests/integration -q
+          --deselect tests/integration/test_coverage_flow.py::test_coverage_report_summarize_and_dedup
+          --deselect tests/integration/test_coverage_flow.py::test_report_surfaces_figure_loss
+
+  eval-office:
+    # The regression gate: generate the Kestrel corpus, convert through the office +
+    # text + legacy lanes, check every expectation. Nonzero exit fails the job.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install LibreOffice (legacy/ODF lane)
+        # No pillow/poppler here: the scanned-PDF fixture generates only when
+        # DOC2MD_PDF_PYTHON is set (eval-pdf job) and cleanly SKIPs otherwise.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libreoffice
+      - name: Run eval (office + text lanes)
+        shell: bash        # explicit bash => -o pipefail: tee must not mask a failed eval
+        run: python3 evals/run_eval.py --skip-pdf | tee eval-office.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: eval-office-report
+          path: eval-office.txt
+
+  eval-pdf:
+    # Heavy ring: docling + torch. Nightly + manual only — not per-push.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install LibreOffice + poppler + docling extra
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libreoffice poppler-utils
+          pip install pillow
+          pip install -e '.[docling]'
+      - name: Run full eval (all lanes)
+        shell: bash        # explicit bash => -o pipefail: tee must not mask a failed eval
+        env:
+          DOC2MD_PDF_PYTHON: python3
+        run: python3 evals/run_eval.py | tee eval-full.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: eval-full-report
+          path: eval-full.txt
