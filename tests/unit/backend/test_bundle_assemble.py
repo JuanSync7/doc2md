@@ -255,6 +255,17 @@ def test_report_carries_run_provenance_and_token_model():
     assert "generated_run" not in _office()["report"]    # omitted when not stamped
 
 
+def test_image_meta_merge_never_clobbers_contract_fields():
+    # A writer-supplied meta dict must not overwrite caption/alt/ref — only the
+    # measured whitelist (bytes/width/height) merges in.
+    body = "# A\n\n![orig-alt](images/aabbccdd11223344.png)\n\nprose\n"
+    meta = {"aabbccdd11223344": {"bytes": 512, "caption": "SMUGGLED", "alt": "X"}}
+    im = _office(source_text="A prose", body_md=body,
+                 extras={"image_meta": meta})["structure"]["outline"][0]["images"][0]
+    assert im["bytes"] == 512
+    assert im["caption"] is None and im["alt"] == "orig-alt"
+
+
 def test_image_meta_annotates_outline_nodes():
     body = "# A\n\n![fig](images/aabbccdd11223344.png)\n\nprose\n"
     meta = {"aabbccdd11223344": {"bytes": 512, "width": 64, "height": 32}}

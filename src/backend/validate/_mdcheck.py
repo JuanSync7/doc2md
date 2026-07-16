@@ -422,8 +422,9 @@ def savings_report(source_repr_chars, markdown_chars, source_repr="ooxml-xml"):
     b["source_repr"] = source_repr
     b["source_chars"] = src
     b["markdown_chars"] = md
-    # A 0-char markdown from a 0-char source saved nothing; a 0-char markdown from a
-    # real source is a conversion problem the GATES catch — here it just reads 1.0.
+    # A 0-char markdown from a 0-char source saved nothing (neutral 1.0); a 0-char
+    # markdown from a real source reads 0.0 — the GATES fail such a doc, this block
+    # just avoids the division.
     b["reduction_ratio"] = round(src / float(md), 2) if md else (1.0 if not src else 0.0)
     b["saved_pct"] = round(100.0 * (1.0 - md / float(src)), 2) if src else 0.0
     return b

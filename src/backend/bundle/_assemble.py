@@ -160,7 +160,12 @@ def assemble_bundle(doc_id, source_relpath, source_format, lane,
             for im in nd["images"]:
                 meta = img_meta.get(im.get("image_id", ""))
                 if meta:
-                    im.update(meta)
+                    # Whitelist merge: only the measured keys. A blind update()
+                    # would let a writer-supplied dict clobber contract fields
+                    # (caption/alt/ref) the enrichment stages own.
+                    for k in ("bytes", "width", "height"):
+                        if k in meta:
+                            im[k] = meta[k]
 
     structure = OrderedDict()
     structure["doc_id"] = doc_id

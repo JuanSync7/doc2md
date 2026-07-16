@@ -22,7 +22,7 @@ import re
 from collections import Counter
 
 from ._chunk import (is_heading, is_toc_line, content_start, normalize_title,
-                     _is_table_row, _is_separator_row, _TOC_HEADER)
+                     _is_table_row, _is_separator_row, _TOC_HEADER, _CODE_FENCE)
 
 __all__ = ["document_outline", "outline_coverage"]
 
@@ -86,9 +86,18 @@ def _links_in(lines, a, b):
     pure harvest (no sentinels, no bytes, no gate). ``url`` is kept verbatim;
     resolving it to another document (the doc->doc edge) is the consumer's job —
     only it knows the whole corpus. Image references never appear here (``![``),
-    and escaped literal brackets (``\\[``) are not links."""
+    escaped literal brackets (``\\[``) are not links, and link-shaped text inside
+    fenced code blocks is code, not connectivity (fence state is tracked from the
+    top of the body, so a fence opened before ``a`` still suppresses) — the same
+    exclusion ``content.links`` applies, so the two counts agree."""
     out = []
-    for i in range(a, b):
+    in_fence = False
+    for i in range(0, b):
+        if _CODE_FENCE.match(lines[i]):
+            in_fence = not in_fence
+            continue
+        if in_fence or i < a:
+            continue
         for m in _LINK.finditer(lines[i]):
             out.append({"text": m.group(1), "url": m.group(2), "line": i})
     return out

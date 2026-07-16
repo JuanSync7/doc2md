@@ -287,3 +287,12 @@ def test_links_belong_to_self_body_not_duplicated_in_parent():
     top = out[0]
     assert [l["url"] for l in top["links"]] == ["http://a"]
     assert [l["url"] for l in top["children"][0]["links"]] == ["http://b"]
+
+
+def test_links_inside_code_fences_are_code_not_connectivity():
+    # Same exclusion content.links applies; a fence opened before the child span
+    # still suppresses (fence state tracked from the top of the body).
+    text = ("# S\n```\nurl = \"[RFC 9110](https://rfc.io/9110)\"\n```\n"
+            "[real](http://y)\n")
+    node = document_outline(text)["outline"][0]
+    assert [l["url"] for l in node["links"]] == ["http://y"]

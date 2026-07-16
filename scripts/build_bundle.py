@@ -239,7 +239,8 @@ def _failure_report(row, error, warnings, run_id=""):
     """A report for a document that FAILED conversion — recorded, never silent. It
     must NOT run through the assembler: an empty body would score a vacuous recall of
     1.0 and falsely 'pass', so failures carry an explicit failed gate instead. The
-    run id is carried here because report.json is a failed doc's ONLY artifact."""
+    run id and source hash are carried here because report.json is a failed doc's
+    ONLY artifact (there is no markdown, so no markdown_sha256 — honestly absent)."""
     from collections import OrderedDict
     rep = OrderedDict()
     rep["doc_id"] = row["id"]
@@ -249,6 +250,7 @@ def _failure_report(row, error, warnings, run_id=""):
     if run_id:
         rep["generated_run"] = run_id
     rep["source_relpath"] = row["rel"]
+    rep["source_sha256"] = sha256_file(row["src"])
     rep["status"] = "failed"
     rep["losslessness"] = {"method": "ooxml-ground-truth", "gate": "fail",
                            "error": error}
