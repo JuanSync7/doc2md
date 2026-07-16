@@ -146,7 +146,7 @@
     "url": "https://nimbus-semi.example/kestrel/pdk-release-notes"
    }
   ],
-  "_note_links": "hyperlink survives soffice doc->docx verbatim (also true for odt/rtf; probed on .doc as the binary representative)"
+  "_note_links": "hyperlink measured to survive the soffice doc round-trip verbatim (text+url character-identical; also true for odt/rtf, probed on .doc as the binary representative). Observed on LibreOffice 6.4.7.2 — if a future soffice normalizes URLs (trailing slash, percent-encoding), this probe names the behavior change; adjust deliberately, never silently."
  },
  "legacy/kestrel-clock-spec.rtf": {
   "kind": "bundle",
