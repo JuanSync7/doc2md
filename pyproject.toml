@@ -18,7 +18,17 @@ dev = ["pytest", "pytest-cov", "ruff", "mypy"]
 # The PDF lane (scripts/docling_convert.py) runs under Python 3.9+ ONLY (it pulls
 # PyTorch); the marker keeps the >=3.6 deterministic Office lane resolvable.
 # Install into a 3.12 venv:  uv venv --python 3.12 && uv sync --extra docling
-docling = ["docling; python_version >= '3.9'"]
+# PINNED (roadmap M0): docling/docling-core exactly; rapidocr too — the prefetch
+# script reads its sha256 manifest, so a floating rapidocr could break the pin
+# chain. Residual float, named honestly: docling-ibm-models, docling-parse,
+# torch, transformers still resolve within docling's ranges (a constraints file
+# is a candidate later slice). Model WEIGHTS are pinned separately:
+# scripts/prefetch_docling_models.py + DOCLING_ARTIFACTS_PATH.
+docling = [
+  "docling==2.113.0; python_version >= '3.9'",
+  "docling-core==2.87.1; python_version >= '3.9'",
+  "rapidocr==3.9.1; python_version >= '3.9'",
+]
 
 # src-layout: packages live under src/ (importable as their top name).
 [tool.setuptools.packages.find]

@@ -47,6 +47,7 @@ import argparse
 import hashlib
 import json
 import os
+import subprocess
 import sys
 import time
 from collections import OrderedDict
@@ -71,6 +72,56 @@ from backend.validate import image_report, caption_report   # noqa: E402  (repor
 
 CONVERTER = "doc2md-docling/0.1.0"
 _PLACEHOLDER = "<!-- image -->"
+
+_TOOLCHAIN_VERSIONS = {}  # memoized probes: one process, one answer
+
+
+def _dist_version(name):
+    # type: (str) -> str
+    """Installed version of a distribution, '' when absent (never a crash)."""
+    if name not in _TOOLCHAIN_VERSIONS:
+        ver = ""
+        try:
+            from importlib import metadata  # 3.8+; probe only, import stays 3.6-safe
+            ver = metadata.version(name)
+        except Exception:
+            ver = ""
+        _TOOLCHAIN_VERSIONS[name] = ver
+    return _TOOLCHAIN_VERSIONS[name]
+
+
+def _pdftotext_version():
+    # type: () -> str
+    """poppler's version from ``pdftotext -v`` (prints to stderr), '' if absent."""
+    if "pdftotext" not in _TOOLCHAIN_VERSIONS:
+        ver = ""
+        try:
+            out = subprocess.check_output(["pdftotext", "-v"],
+                                          stderr=subprocess.STDOUT)
+            first = out.decode("utf-8", "replace").strip().splitlines()[0]
+            ver = first.split()[-1] if first else ""
+        except Exception:
+            ver = ""
+        _TOOLCHAIN_VERSIONS["pdftotext"] = ver
+    return _TOOLCHAIN_VERSIONS["pdftotext"]
+
+
+def _toolchain_warning(lane):
+    # type: (str) -> dict
+    """The lane's provenance stamp (the ``libreoffice_preconvert`` version-naming
+    analogue): NAME the external tools that produced/measured this document —
+    docling (+ docling-core) always, poppler's pdftotext for the pdf lane where it
+    supplies the ground-truth text layer. Versions are best-effort: an absent
+    dist/binary keeps its name, drops its number — never a crash, never silent."""
+    def named(tool, ver):
+        return "%s %s" % (tool, ver) if ver else tool
+    detail = "converted via %s + %s" % (
+        named("docling", _dist_version("docling")),
+        named("docling-core", _dist_version("docling-core")))
+    if lane == "pdf":
+        detail += "; text layer via %s" % named("pdftotext (poppler)",
+                                                _pdftotext_version())
+    return {"code": "pdf_toolchain", "detail": detail}
 
 
 def plan(sources, out_root):
@@ -168,7 +219,8 @@ def build_one(row, conv, ocr_conv, ocr_mode, out_root, run_id, cfg,
     """Convert + measure + assemble + write one docling-lane document's bundle."""
     lane = "pdf" if row["ext"] == "pdf" else "html"
     doc_dir = os.path.join(out_root, row["id"])
-    warnings = []
+    # Provenance first: the stamp rides every report, including failure reports.
+    warnings = [_toolchain_warning(lane)]
 
     use_ocr = False
     if row["ext"] == "pdf":
@@ -402,12 +454,13 @@ def main(argv=None):
                               token_count, token_model, captions_enabled)
             except Exception as e:                     # never lose the whole run
                 err = "%s: %s" % (type(e).__name__, e)
+                lane_r = "pdf" if r["ext"] == "pdf" else "html"
                 os.makedirs(os.path.join(args.out, r["id"]), exist_ok=True)
                 bb._write_json(os.path.join(args.out, r["id"], "report.json"),
-                               _failure_report(r, "pdf" if r["ext"] == "pdf" else "html",
-                                               err, []))
+                               _failure_report(r, lane_r, err,
+                                               [_toolchain_warning(lane_r)]))
                 m = {"doc_id": r["id"], "source_relpath": r["rel"],
-                     "lane": "pdf" if r["ext"] == "pdf" else "html",
+                     "lane": lane_r,
                      "status": "failed", "markdown_sha256": "", "error": err}
             mf.write(json.dumps(m) + "\n")
             mf.flush()
