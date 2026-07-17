@@ -57,19 +57,25 @@ isn't done twice.
 
 ## M0 — Ground the loop (make the signals real)
 
-Context: the nightly `eval-pdf` ring ran once (2026-07-16): **19 pass, 2
-fail** — `pdf/kestrel-clock-spec.pdf` `toc_lines 1 < 9` (docling on CI renders
-the TOC without dot leaders) and `pdf/kestrel-dataflow.pdf` expected-degraded
-but converted `ok` (the 100 chars/page probe is knife-edge and CI's LibreOffice
-regenerates the corpus PDF differently). Meanwhile no local docling venv
-exists and `DOC2MD_PDF_PYTHON` is unset — every local PDF-lane claim is
-code-read, not observed. The `docling` extra is **unpinned**: each fresh
-install resolves latest (~2.113.0), so behavior floats.
+Context: the `eval-pdf` CI ring (2026-07-16 dispatch + 2026-07-17 scheduled
+nightly, byte-identical results): **19 pass, 2 fail** —
+`pdf/kestrel-clock-spec.pdf` `toc_lines 1 < 9` (docling emits the whole TOC,
+dot leaders intact, as one merged line, which the line-anchored TOC matcher
+can count only once) and `pdf/kestrel-dataflow.pdf` expected-degraded but
+converted `ok` (OCR-routed, but no picture placeholder is detected so
+nothing degrades). The local ring (stood up 2026-07-17, see the dated
+baseline in `evals/README.md`) reproduces both failures character for
+character. The `docling` extra is **unpinned**: each fresh install resolves
+latest (2.113.0 as of the baseline), so behavior floats.
 
-- [ ] Stand up the local PDF ring: `uv venv --python 3.12` + `pip install -e
+- [x] Stand up the local PDF ring: `uv venv --python 3.12` + `pip install -e
       '.[docling]'`, set `DOC2MD_PDF_PYTHON`, run the full eval locally,
       record the baseline (pass/fail/skip counts + per-doc recalls) as a
       dated table in `evals/README.md` so the next fresh run can diff it.
+      *(2026-07-17: 19 pass / 2 fail / 0 skip — reproduces both CI runs
+      (dispatch + scheduled nightly) character for character; see the dated
+      baseline in `evals/README.md`, including the `TORCHDYNAMO_DISABLE=1`
+      and modelscope-flakiness footguns.)*
 - [ ] Pin the PDF toolchain: exact `docling`/`docling-core` pins in the
       extra; prefetch model artifacts (`artifacts_path` /
       `DOCLING_ARTIFACTS_PATH`, `docling-tools models download`) so CI and
@@ -144,9 +150,10 @@ the single biggest structural win available, and it needs the M0 pin
       can emit the outline from Writer headings — verify) and a
       numbered-headings fixture; then pdf `max_depth` / `outline_titles`
       probes, which today aren't trusted enough to assert at all.
-- [ ] TOC-shape robustness in `is_toc_line`/`content_start` (spaced/absent
-      dot leaders, tab leaders, table-form TOCs) — the *real* fix for nightly
-      failure #1.
+- [ ] TOC-shape robustness in `is_toc_line`/`content_start` (merged
+      single-line TOCs — the observed shape behind nightly failure #1, whose
+      end-anchored leader pattern can match a physical line only once —
+      plus spaced/absent dot leaders, tab leaders, table-form TOCs).
 - [ ] Hybrid overlay fallback: replace today's all-or-nothing text-layer
       fallback (`md = src_stripped`, figures zeroed) with a merge — docling's
       heading lines + image placeholders overlaid on the pdftotext stream.
