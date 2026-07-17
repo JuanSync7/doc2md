@@ -49,6 +49,101 @@ Missing tools degrade to SKIP rows (the derived corpus files simply are not
 generated), never to silent passes. A pytest wrapper lives at
 `tests/e2e/test_eval_corpus.py` and skips cleanly on bare hosts.
 
+## Baselines (local PDF ring)
+
+Dated full-run results on the development host; a fresh run diffs itself
+against the latest entry. CI's nightly `eval-pdf` job is the same harness on
+`ubuntu-latest`.
+
+### 2026-07-17 — first full local run (all three lanes)
+
+One-time setup, from the repo root:
+
+```sh
+uv venv --python 3.12 .venv
+uv pip install -p .venv/bin/python -e '.[docling]'
+```
+
+Run:
+
+```sh
+TORCHDYNAMO_DISABLE=1 \
+DOC2MD_LIBREOFFICE="$(command -v soffice)" \
+DOC2MD_PDF_PYTHON="$PWD/.venv/bin/python" \
+python3 evals/run_eval.py
+```
+
+**Result: 19 pass, 2 fail, 0 skip** (`run_eval.py` exits nonzero while the
+two truthfully-reported shortfalls below remain un-encoded). The FAIL detail
+strings are identical, character for character, to the first nightly
+`eval-pdf` CI run (2026-07-16): the local ring reproduces the nightly
+exactly.
+
+Toolchain (measured; currently **unpinned** — the `docling` extra resolves
+latest at install time; pinning + model prefetch is the next M0 slice):
+
+| Component | Version |
+|---|---|
+| CPython (uv-managed, `.venv/`) | 3.12.13 |
+| docling / docling-core | 2.113.0 / 2.87.1 |
+| docling-ibm-models / docling-parse | 3.13.3 / 7.8.0 |
+| torch / transformers | 2.13.0 / 5.14.1 |
+| rapidocr (torch engine, PP-OCRv4 `ch` set) / pypdfium2 | 3.9.1 / 5.12.1 |
+| LibreOffice / poppler (pdftotext, pdftoppm) | 6.4.7.2 / 20.11.0 |
+
+Per-document, bundle lanes (text lane: all 6 `text/*` docs valid at recall
+1.0; `text/synth-flow.tcl` correctly routed to no lane):
+
+| Document | Eval | Status | Method | token_recall | content_recall |
+|---|---|---|---|---|---|
+| `legacy/kestrel-clock-spec.doc` | PASS | ok | ooxml-ground-truth | 1.0000 | 0.9990 |
+| `legacy/kestrel-clock-spec.odt` | PASS | ok | ooxml-ground-truth | 1.0000 | 0.9990 |
+| `legacy/kestrel-clock-spec.rtf` | PASS | ok | ooxml-ground-truth | 1.0000 | 0.9990 |
+| `legacy/kestrel-overview.ppt` | PASS | ok | ooxml-ground-truth | 1.0000 | 0.9834 |
+| `legacy/kestrel-registers.xls` | PASS | ok | ooxml-ground-truth | 1.0000 | 0.9811 |
+| `office/kestrel-clock-spec.docx` | PASS | ok | ooxml-ground-truth | 1.0000 | 0.9990 |
+| `office/kestrel-dataflow.pptx` | PASS | ok | ooxml-ground-truth | 1.0000 | 1.0000 |
+| `office/kestrel-overview.pptx` | PASS | ok | ooxml-ground-truth | 1.0000 | 0.9834 |
+| `office/kestrel-readme.docx` | PASS | ok | ooxml-ground-truth | 1.0000 | 1.0000 |
+| `office/kestrel-registers.xlsx` | PASS | ok | ooxml-ground-truth | 1.0000 | 0.9820 |
+| `pdf/kestrel-clock-spec-scan.pdf` | PASS | degraded | pdf-ocr-transcription | — | — |
+| `pdf/kestrel-clock-spec.pdf` | FAIL | ok | pdf-text-coverage | 0.9925 | 0.9855 |
+| `pdf/kestrel-dataflow.pdf` | FAIL | ok | pdf-ocr-transcription | — | — |
+
+(`—` = unmeasured: the OCR path has no independent text layer to grade
+against; the report says so via `losslessness.note`.)
+
+The two FAILs are truthful current behavior diverging from expectations that
+were encoded against an older toolchain — the expectation re-encode/xfail is
+a later M0 slice; the real fixes live in M1/M2:
+
+- `pdf/kestrel-clock-spec.pdf` — `coverage.toc_lines: got 1, want >= 9`.
+  docling 2.113 emits this TOC without dot leaders, so `is_toc_line`
+  recognizes only one line. Everything else passes (recall 0.9925, images
+  3/3, `has_toc` true). Real fix: TOC-shape robustness (roadmap M2).
+- `pdf/kestrel-dataflow.pdf` — `status: ok, want degraded`. The diagram-only
+  PDF still routes to OCR (`ocr_transcription` warning, losslessness
+  unmeasured) but no picture placeholder is detected, so the images gate
+  passes and nothing degrades the status. The encoded expectation
+  (placeholder bails → degraded) now matches neither CI nor local. Real fix:
+  area-weighted routing + OCR-path figure extraction (roadmap M1).
+
+Environment notes — what a fresh stand-up hits:
+
+- `TORCHDYNAMO_DISABLE=1` is **required** where the host compiler cannot
+  build TorchInductor kernels (gcc 8.5 on this RHEL 8.10 host): docling
+  2.113's picture classifier `torch.compile`s its model by default, and
+  without the variable the whole `StandardPdfPipeline` fails with
+  `InductorError: CppCompileError`. Dynamo off means eager execution; on
+  this corpus the results match CI (which compiles) exactly.
+- The first run downloads models at runtime: docling's layout/TableFormer/
+  classifier weights from Hugging Face, and RapidOCR's PP-OCRv4 det/cls/rec
+  models + rec dictionary from `modelscope.cn` (sha256-verified into the
+  venv's `rapidocr/models/`). The modelscope fetch proved flaky from this
+  network — a failed attempt surfaces as `DownloadFileException` and the
+  OCR-dependent docs FAIL; rerunning retries it. Prefetching/pinning model
+  artifacts lands in the next M0 slice.
+
 ## Feature matrix (what each document exercises)
 
 | Corpus file | Features exercised | Expected gate |

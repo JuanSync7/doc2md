@@ -66,10 +66,13 @@ exists and `DOC2MD_PDF_PYTHON` is unset — every local PDF-lane claim is
 code-read, not observed. The `docling` extra is **unpinned**: each fresh
 install resolves latest (~2.113.0), so behavior floats.
 
-- [ ] Stand up the local PDF ring: `uv venv --python 3.12` + `pip install -e
+- [x] Stand up the local PDF ring: `uv venv --python 3.12` + `pip install -e
       '.[docling]'`, set `DOC2MD_PDF_PYTHON`, run the full eval locally,
       record the baseline (pass/fail/skip counts + per-doc recalls) as a
       dated table in `evals/README.md` so the next fresh run can diff it.
+      *(2026-07-17: 19 pass / 2 fail / 0 skip — reproduces the nightly
+      exactly; see the dated baseline in `evals/README.md`, including the
+      `TORCHDYNAMO_DISABLE=1` and modelscope-flakiness footguns.)*
 - [ ] Pin the PDF toolchain: exact `docling`/`docling-core` pins in the
       extra; prefetch model artifacts (`artifacts_path` /
       `DOCLING_ARTIFACTS_PATH`, `docling-tools models download`) so CI and
