@@ -91,13 +91,25 @@ jobs:
           pip install -e '.[docling]'
       # Pinned model weights (roadmap M0): the cache key is the prefetch script
       # itself — the pin table lives there, so bumping a pin rebuilds the cache.
-      # On a miss the prefetch downloads (~600 MB); on a hit it just verifies.
-      - uses: actions/cache@v4
+      # On a miss the prefetch downloads (~600 MB); on a hit the RapidOCR files
+      # are sha256-re-verified and the HF snapshots trusted via their .pin.
+      # Split restore/save (NOT the plain cache action): its post-job save only
+      # runs on job SUCCESS, and this job exits 1 while known eval failures
+      # remain un-encoded (the xfail slice) — so it would never save. Saving
+      # right after a successful prefetch (before the eval can fail the job)
+      # writes the cache exactly when the artifacts are complete.
+      - uses: actions/cache/restore@v4
+        id: artifacts-cache
         with:
           path: vendor/docling-artifacts
           key: docling-artifacts-${{ hashFiles('scripts/prefetch_docling_models.py') }}
       - name: Prefetch pinned model artifacts
         run: python3 scripts/prefetch_docling_models.py
+      - uses: actions/cache/save@v4
+        if: steps.artifacts-cache.outputs.cache-hit != 'true'
+        with:
+          path: vendor/docling-artifacts
+          key: docling-artifacts-${{ hashFiles('scripts/prefetch_docling_models.py') }}
       - name: Run full eval (all lanes)
         shell: bash        # explicit bash => -o pipefail: tee must not mask a failed eval
         env:

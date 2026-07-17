@@ -19,8 +19,9 @@ data/*
 !data/README.md
 !data/CLAUDE.md
 
-# ── Vendored LibreOffice (heavy third-party binary tree) ─────────────────────
-# Materialized by scripts/setup_libreoffice.py; rebuildable, never committed.
+# ── Vendored third-party trees (LibreOffice binaries, docling model weights) ─
+# Materialized by scripts/setup_libreoffice.py / scripts/prefetch_docling_models.py;
+# rebuildable, never committed.
 vendor/*
 !vendor/README.md
 !vendor/CLAUDE.md

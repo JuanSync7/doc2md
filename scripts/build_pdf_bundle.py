@@ -454,12 +454,13 @@ def main(argv=None):
                               token_count, token_model, captions_enabled)
             except Exception as e:                     # never lose the whole run
                 err = "%s: %s" % (type(e).__name__, e)
+                lane_r = "pdf" if r["ext"] == "pdf" else "html"
                 os.makedirs(os.path.join(args.out, r["id"]), exist_ok=True)
                 bb._write_json(os.path.join(args.out, r["id"], "report.json"),
-                               _failure_report(r, "pdf" if r["ext"] == "pdf" else "html",
-                                               err, []))
+                               _failure_report(r, lane_r, err,
+                                               [_toolchain_warning(lane_r)]))
                 m = {"doc_id": r["id"], "source_relpath": r["rel"],
-                     "lane": "pdf" if r["ext"] == "pdf" else "html",
+                     "lane": lane_r,
                      "status": "failed", "markdown_sha256": "", "error": err}
             mf.write(json.dumps(m) + "\n")
             mf.flush()

@@ -66,8 +66,11 @@ converted `ok` (OCR-routed, but no picture placeholder is detected so
 nothing degrades). The local ring (stood up 2026-07-17, see the dated
 baseline in `evals/README.md`) reproduces both failures character for
 character. The `docling` extra and the model weights are pinned as of
-2026-07-17 (docling 2.113.0 / docling-core 2.87.1; HF commits + RapidOCR
-sha256s via `scripts/prefetch_docling_models.py` + `DOCLING_ARTIFACTS_PATH`).
+2026-07-17 (docling 2.113.0 / docling-core 2.87.1 / rapidocr 3.9.1; HF
+commits + RapidOCR sha256s via `scripts/prefetch_docling_models.py` +
+`DOCLING_ARTIFACTS_PATH`). Residual float, named: docling-ibm-models,
+docling-parse, torch and transformers still resolve within docling's ranges —
+a constraints file is a candidate follow-up if variance recurs.
 
 - [x] Stand up the local PDF ring: `uv venv --python 3.12` + `pip install -e
       '.[docling]'`, set `DOC2MD_PDF_PYTHON`, run the full eval locally,

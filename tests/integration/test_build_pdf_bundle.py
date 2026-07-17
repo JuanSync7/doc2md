@@ -118,5 +118,6 @@ def test_toolchain_warning_names_the_external_tools(bpb):
     w2 = bpb._toolchain_warning("html")
     assert w2["code"] == "pdf_toolchain"
     assert "docling" in w2["detail"] and "pdftotext" not in w2["detail"]
-    # memoized probes: identical dict on repeat calls
+    # stable across calls (the probes memoize; equality alone doesn't prove the
+    # cache, but a changing stamp within one process would be a bug either way)
     assert bpb._toolchain_warning("pdf") == w

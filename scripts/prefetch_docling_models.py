@@ -89,17 +89,35 @@ def rapidocr_manifest_sha(key_path):
 
 
 def fetch_hf(dest_root, repo_id, commit):
-    """Snapshot one HF repo at an exact commit; skip when the .pin matches."""
+    """Snapshot one HF repo at an exact commit; skip when the .pin matches.
+
+    The .pin marker is written only AFTER a successful snapshot, so a run that
+    died mid-download resumes on rerun. A matching .pin is additionally sanity-
+    checked to guard non-empty content (a wiped folder with a surviving marker
+    must refetch, not report ok)."""
     folder = os.path.join(dest_root, repo_id.replace("/", "--"))
     pin_file = os.path.join(folder, ".pin")
     if os.path.isfile(pin_file):
         with open(pin_file, encoding="utf-8") as f:
-            if f.read().strip() == commit:
-                print("  [ok] %s @ %s (pinned, present)" % (repo_id, commit[:12]))
-                return
+            pinned = f.read().strip() == commit
+        has_content = any(n != ".pin" and not n.startswith(".")
+                          for n in os.listdir(folder))
+        if pinned and has_content:
+            print("  [ok] %s @ %s (pinned, present)" % (repo_id, commit[:12]))
+            return
+        os.unlink(pin_file)
     from huggingface_hub import snapshot_download
     print("  [fetch] %s @ %s" % (repo_id, commit[:12]))
-    snapshot_download(repo_id=repo_id, revision=commit, local_dir=folder)
+    last_err = None
+    for attempt in range(2):     # one retry for transient hub errors
+        try:
+            snapshot_download(repo_id=repo_id, revision=commit, local_dir=folder)
+            last_err = None
+            break
+        except Exception as e:
+            last_err = e
+    if last_err is not None:
+        raise last_err
     with open(pin_file, "w", encoding="utf-8") as f:
         f.write(commit + "\n")
 
@@ -109,7 +127,15 @@ def fetch_rapidocr(dest_root):
     import requests
     failures = []
     for rel, sha_key, required in RAPIDOCR_FILES:
-        want_sha = rapidocr_manifest_sha(sha_key)
+        try:
+            # Inside the loop's accounting on purpose: a future rapidocr whose
+            # manifest moved/renamed keys must surface as a recorded FAIL for
+            # this file, not a raw traceback that hides the rest of the run.
+            want_sha = rapidocr_manifest_sha(sha_key)
+        except Exception as e:
+            failures.append((rel, "manifest sha lookup failed: %s: %s"
+                             % (type(e).__name__, e), required))
+            continue
         dest = os.path.join(dest_root, "RapidOcr", rel)
         if os.path.isfile(dest) and (want_sha is None
                                      or sha256_file(dest) == want_sha):
@@ -138,6 +164,11 @@ def fetch_rapidocr(dest_root):
                 os.replace(tmp, dest)
                 last_err = None
                 break
+            except requests.HTTPError as e:
+                last_err = "%s: %s" % (type(e).__name__, e)
+                status = getattr(getattr(e, "response", None), "status_code", 0)
+                if 400 <= status < 500:
+                    break            # a 404 is not transient — do not re-fetch
             except Exception as e:
                 last_err = "%s: %s" % (type(e).__name__, e)
         if last_err is not None:

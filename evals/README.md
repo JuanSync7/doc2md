@@ -90,8 +90,8 @@ emitted `document.md` bytes are identical to the network-path run.
 
 CI (`eval-pdf`) prefetches the same artifacts behind `actions/cache`, keyed
 on the prefetch script's hash — bumping a pin rebuilds the cache. modelscope
-fetches retry 3× in the script (connection resets observed on 2 of 2
-first-attempt runs from this network).
+fetches get 3 attempts each in the script (connection resets observed on 2 of
+2 first-attempt runs from this network).
 
 ### 2026-07-17 (a) — first full local run (all three lanes)
 
@@ -112,6 +112,9 @@ DOC2MD_PDF_PYTHON="$PWD/.venv/bin/python" \
 DOCLING_ARTIFACTS_PATH="$PWD/vendor/docling-artifacts" \
 python3 evals/run_eval.py
 ```
+
+(The prefetch line in the setup block and the `DOCLING_ARTIFACTS_PATH` line
+above postdate this baseline — both arrived with entry (b).)
 
 If `data/eval_corpus` predates this setup (e.g. from an earlier office-only
 run), add `--regen` once: the scanned-PDF fixture is derived at corpus
