@@ -73,10 +73,17 @@ DOC2MD_PDF_PYTHON="$PWD/.venv/bin/python" \
 python3 evals/run_eval.py
 ```
 
+If `data/eval_corpus` predates this setup (e.g. from an earlier office-only
+run), add `--regen` once: the scanned-PDF fixture is derived at corpus
+*generation* time and only when `DOC2MD_PDF_PYTHON` + `pdftoppm` are
+available, so a stale corpus yields a misleading `scan-tools-unavailable`
+SKIP even though the tools now exist.
+
 **Result: 19 pass, 2 fail, 0 skip** (`run_eval.py` exits nonzero while the
 two truthfully-reported shortfalls below remain un-encoded). The FAIL detail
-strings are identical, character for character, to the first nightly
-`eval-pdf` CI run (2026-07-16): the local ring reproduces the nightly
+strings are identical, character for character, to both `eval-pdf` CI runs
+to date — the 2026-07-16 `workflow_dispatch` run (29517729454) and the
+2026-07-17 scheduled nightly (29557199704): the local ring reproduces CI
 exactly.
 
 Toolchain (measured; currently **unpinned** — the `docling` extra resolves
@@ -118,20 +125,26 @@ were encoded against an older toolchain — the expectation re-encode/xfail is
 a later M0 slice; the real fixes live in M1/M2:
 
 - `pdf/kestrel-clock-spec.pdf` — `coverage.toc_lines: got 1, want >= 9`.
-  docling 2.113 emits this TOC without dot leaders, so `is_toc_line`
-  recognizes only one line. Everything else passes (recall 0.9925, images
-  3/3, `has_toc` true). Real fix: TOC-shape robustness (roadmap M2).
-- `pdf/kestrel-dataflow.pdf` — `status: ok, want degraded`. The diagram-only
-  PDF still routes to OCR (`ocr_transcription` warning, losslessness
-  unmeasured) but no picture placeholder is detected, so the images gate
-  passes and nothing degrades the status. The encoded expectation
-  (placeholder bails → degraded) now matches neither CI nor local. Real fix:
-  area-weighted routing + OCR-path figure extraction (roadmap M1).
+  docling 2.113 emits the entire TOC — dot leaders intact — as **one merged
+  line**, and `is_toc_line`'s end-of-line-anchored leader pattern can match
+  a physical line only once, so `toc_lines` counts 1. Everything else passes
+  (recall 0.9925, images 3/3, `has_toc` true). Real fix: TOC-shape
+  robustness incl. splitting merged single-line TOCs (roadmap M2).
+- `pdf/kestrel-dataflow.pdf` — full detail, recorded for future diffing:
+  `status: got 'ok', want one of ['degraded']; images.gate: got 'pass',
+  want 'degraded'; warnings: 'image_inline_bailed' not present (got
+  ['ocr_transcription']); warnings: 'image_bytes_missing' not present (got
+  ['ocr_transcription'])`. The diagram-only PDF still routes to OCR
+  (`ocr_transcription` warning, losslessness unmeasured) but no picture
+  placeholder is detected, so the images gate passes and nothing degrades
+  the status. The encoded expectation (placeholder bails → degraded) now
+  matches neither CI nor local. Real fix: area-weighted routing + OCR-path
+  figure extraction (roadmap M1).
 
 Environment notes — what a fresh stand-up hits:
 
 - `TORCHDYNAMO_DISABLE=1` is **required** where the host compiler cannot
-  build TorchInductor kernels (gcc 8.5 on this RHEL 8.10 host): docling
+  build TorchInductor kernels (gcc 8.5 on this Rocky Linux 8.10 host): docling
   2.113's picture classifier `torch.compile`s its model by default, and
   without the variable the whole `StandardPdfPipeline` fails with
   `InductorError: CppCompileError`. Dynamo off means eager execution; on
