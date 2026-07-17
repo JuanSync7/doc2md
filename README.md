@@ -53,8 +53,10 @@ reports token/content recall, figure-region text debt, and OCR use with a
 # Office + text lanes (stdlib, runs on bare Python 3.6):
 python3 scripts/build_bundle.py --src /path/to/documents --out /path/to/bundles
 
-# PDF lane (needs the docling extra in a modern venv):
+# PDF lane (needs the docling extra in a modern venv; pinned model weights):
 uv venv --python 3.12 && uv pip install -e '.[docling]'
+.venv/bin/python scripts/prefetch_docling_models.py
+export DOCLING_ARTIFACTS_PATH="$PWD/vendor/docling-artifacts"
 .venv/bin/python scripts/build_pdf_bundle.py --src /path/to/documents --out /path/to/bundles --accept pdf
 
 # Legacy-format support (doc/xls/ppt/rtf, emf/wmf rendering), one-time:

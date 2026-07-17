@@ -65,8 +65,9 @@ can count only once) and `pdf/kestrel-dataflow.pdf` expected-degraded but
 converted `ok` (OCR-routed, but no picture placeholder is detected so
 nothing degrades). The local ring (stood up 2026-07-17, see the dated
 baseline in `evals/README.md`) reproduces both failures character for
-character. The `docling` extra is **unpinned**: each fresh install resolves
-latest (2.113.0 as of the baseline), so behavior floats.
+character. The `docling` extra and the model weights are pinned as of
+2026-07-17 (docling 2.113.0 / docling-core 2.87.1; HF commits + RapidOCR
+sha256s via `scripts/prefetch_docling_models.py` + `DOCLING_ARTIFACTS_PATH`).
 
 - [x] Stand up the local PDF ring: `uv venv --python 3.12` + `pip install -e
       '.[docling]'`, set `DOC2MD_PDF_PYTHON`, run the full eval locally,
@@ -76,11 +77,17 @@ latest (2.113.0 as of the baseline), so behavior floats.
       (dispatch + scheduled nightly) character for character; see the dated
       baseline in `evals/README.md`, including the `TORCHDYNAMO_DISABLE=1`
       and modelscope-flakiness footguns.)*
-- [ ] Pin the PDF toolchain: exact `docling`/`docling-core` pins in the
+- [x] Pin the PDF toolchain: exact `docling`/`docling-core` pins in the
       extra; prefetch model artifacts (`artifacts_path` /
       `DOCLING_ARTIFACTS_PATH`, `docling-tools models download`) so CI and
       local run the same models; stamp docling + poppler versions into
       report warnings (the soffice version already is).
+      *(2026-07-17: pins in pyproject; `scripts/prefetch_docling_models.py`
+      pins the model WEIGHTS at exact HF commits + sha256-verified RapidOCR
+      files — `docling-tools models download` was rejected: it refetches
+      floating `main` revisions, the very drift to kill. Hermeticity proven
+      offline; `pdf_toolchain` warning stamped + eval-asserted; CI caches
+      the artifacts. Eval unchanged at 19/2/0.)*
 - [ ] Give the eval harness an expected-fail mechanism: an `xfail: true` +
       `_note` marker in `expectations.json` that `run_eval.py` reports as
       XFAIL (and XPASS as a failure to re-encode), so truthful-but-undesired

@@ -303,7 +303,10 @@ Fields beyond the raw lossless flag, and why they earn their place:
 - `warnings[]` — every deliberate drop (headers/footers, tracked deletions,
   `mc:Fallback`), every fallback (LibreOffice pre-convert, OCR pages), and every image
   hygiene event (`image_bytes_missing`, `orphan_images_removed`, `images_not_in_outline`)
-  is named, never silent. PDF-lane additions: `ocr_transcription` (scanned source),
+  is named, never silent. PDF-lane additions: `pdf_toolchain` (the provenance stamp —
+  the pdf-lane analogue of the soffice version naming above: docling + docling-core
+  always, poppler's `pdftotext` when it supplies the ground-truth layer; on every
+  pdf/html report, including failure reports), `ocr_transcription` (scanned source),
   `pdf_text_layer_fallback` (docling markdown provably dropped body content the text
   layer holds — the layer is used instead), `pdf_content_loss` (measured real loss
   under the explained-gap model; degrades status), `image_inline_bailed`

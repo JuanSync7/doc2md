@@ -55,13 +55,52 @@ Dated full-run results on the development host; a fresh run diffs itself
 against the latest entry. CI's nightly `eval-pdf` job is the same harness on
 `ubuntu-latest`.
 
-### 2026-07-17 — first full local run (all three lanes)
+### 2026-07-17 (b) — toolchain pinned, artifacts hermetic
+
+Delta entry over (a) below — same corpus, same host. What changed:
+
+- The `docling` extra now pins `docling==2.113.0` + `docling-core==2.87.1`
+  (`pyproject.toml`), the exact versions entry (a) measured.
+- Model weights are pinned too: `scripts/prefetch_docling_models.py`
+  materializes every model the lane loads — the three HF repos at exact
+  commits (layout-heron `8f39ad3c`, docling-models `fc0f2d45` = tag v2.3.0,
+  DocumentFigureClassifier-v2.5 `f859dfbf`) plus the RapidOCR torch/`ch` set
+  (sha256-verified v3.9.1 files) — into `vendor/docling-artifacts/`
+  (git-ignored). Without this, docling loads layout + picture-classifier at
+  floating HF revision `main`, and RapidOCR fetches from flaky modelscope.cn
+  at convert time.
+- The run recipe gains two lines (prefetch + `DOCLING_ARTIFACTS_PATH`, see
+  the updated block in (a)). With the artifacts path set, docling is
+  **local-or-fail**: nothing downloads at convert time.
+- Every pdf/html report now carries a `pdf_toolchain` provenance warning
+  (e.g. `converted via docling 2.113.0 + docling-core 2.87.1; text layer via
+  pdftotext (poppler) 20.11.0`) — the soffice-version analogue; asserted by
+  the eval on all three pdf docs.
+
+**Result: 19 pass, 2 fail, 0 skip — unchanged from (a).**
+`pdf/kestrel-clock-spec.pdf`'s FAIL detail is unchanged;
+`pdf/kestrel-dataflow.pdf`'s differs from (a) in exactly one particular —
+its got-warnings lists now include the stamp:
+`warnings: 'image_inline_bailed' not present (got ['pdf_toolchain',
+'ocr_transcription'])` (and the same for `image_bytes_missing`).
+Hermeticity was verified directly: with
+`HF_HUB_OFFLINE=1`, `TRANSFORMERS_OFFLINE=1` and rapidocr's in-venv model
+cache removed, all three PDFs convert from the artifacts dir alone, and the
+emitted `document.md` bytes are identical to the network-path run.
+
+CI (`eval-pdf`) prefetches the same artifacts behind `actions/cache`, keyed
+on the prefetch script's hash — bumping a pin rebuilds the cache. modelscope
+fetches retry 3× in the script (connection resets observed on 2 of 2
+first-attempt runs from this network).
+
+### 2026-07-17 (a) — first full local run (all three lanes)
 
 One-time setup, from the repo root:
 
 ```sh
 uv venv --python 3.12 .venv
 uv pip install -p .venv/bin/python -e '.[docling]'
+.venv/bin/python scripts/prefetch_docling_models.py   # pinned model weights (b)
 ```
 
 Run:
@@ -70,6 +109,7 @@ Run:
 TORCHDYNAMO_DISABLE=1 \
 DOC2MD_LIBREOFFICE="$(command -v soffice)" \
 DOC2MD_PDF_PYTHON="$PWD/.venv/bin/python" \
+DOCLING_ARTIFACTS_PATH="$PWD/vendor/docling-artifacts" \
 python3 evals/run_eval.py
 ```
 
@@ -86,8 +126,8 @@ to date — the 2026-07-16 `workflow_dispatch` run (29517729454) and the
 2026-07-17 scheduled nightly (29557199704): the local ring reproduces CI
 exactly.
 
-Toolchain (measured; currently **unpinned** — the `docling` extra resolves
-latest at install time; pinning + model prefetch is the next M0 slice):
+Toolchain (measured; unpinned at the time of this entry — entry (b) above
+pinned docling/docling-core and the model weights later the same day):
 
 | Component | Version |
 |---|---|

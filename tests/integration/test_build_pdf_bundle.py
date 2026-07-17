@@ -102,3 +102,21 @@ def test_failure_report_is_lane_honest_and_failed(bpb):
     assert rep["losslessness"]["gate"] == "best-effort"    # never claims a pass
     assert rep["losslessness"]["error"] == "boom"
     assert rep["warnings"] == [{"code": "x"}]
+
+
+def test_toolchain_warning_names_the_external_tools(bpb):
+    # The PDF lane's provenance stamp (the soffice-version analogue): the warning
+    # must NAME docling (+ docling-core) always, and poppler's pdftotext for the
+    # pdf lane, versions best-effort — on a host where a tool/dist is absent the
+    # name still appears, the version is simply omitted (never a crash, never a
+    # silent skip).
+    w = bpb._toolchain_warning("pdf")
+    assert w["code"] == "pdf_toolchain"
+    assert "docling" in w["detail"] and "docling-core" in w["detail"]
+    assert "pdftotext" in w["detail"]
+    # html lane: docling converts, but no poppler text layer is involved
+    w2 = bpb._toolchain_warning("html")
+    assert w2["code"] == "pdf_toolchain"
+    assert "docling" in w2["detail"] and "pdftotext" not in w2["detail"]
+    # memoized probes: identical dict on repeat calls
+    assert bpb._toolchain_warning("pdf") == w

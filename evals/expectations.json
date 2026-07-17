@@ -227,6 +227,9 @@
   "toc_lines_min": 9,
   "images_gate": "pass",
   "images_referenced": 3,
+  "warning_codes": [
+   "pdf_toolchain"
+  ],
   "warning_codes_absent": [
    "pdf_content_loss",
    "pdf_text_layer_fallback",
@@ -255,6 +258,7 @@
   "losslessness_gate": "best-effort",
   "images_gate": "degraded",
   "warning_codes": [
+   "pdf_toolchain",
    "ocr_transcription",
    "image_inline_bailed",
    "image_bytes_missing"
@@ -273,6 +277,7 @@
   "losslessness_gate": "best-effort",
   "images_gate": "degraded",
   "warning_codes": [
+   "pdf_toolchain",
    "ocr_transcription"
   ],
   "md_contains": [
