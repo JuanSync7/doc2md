@@ -70,6 +70,11 @@ python3 scripts/caption_bundles.py --bundles /path/to/bundles --vlm-url http://1
 python3 scripts/enrich_metadata.py --bundles /path/to/bundles
 # Lint per document AND corpus-wide (identity, synonymy, entities, graph, skew):
 python3 scripts/kb_lint.py --bundles /path/to/bundles --strict
+
+# Grade the OUTPUT itself against the rubric: builds a deliberately adversarial
+# document, converts it, enriches it with no model, and prints a letter per
+# dimension with the evidence behind every row.
+python3 scripts/grade_output.py
 ```
 
 Both writers share the same output root and `manifest.jsonl`; re-runs skip

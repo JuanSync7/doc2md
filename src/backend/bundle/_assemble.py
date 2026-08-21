@@ -37,22 +37,41 @@ def _walk(nodes):
             yield c
 
 
+def _tree_depth(nodes):
+    # type: (list) -> int
+    """How deep the node TREE actually nests — not ``max(level)``.
+
+    They are different numbers and only one of them answers "did the hierarchy get
+    built?". Nine flat siblings titled ``1``, ``1.1``, ``1.1.1`` carry levels up to 2
+    and nest not at all: ``max(level)`` says 2, the tree is 1 deep (quality-plan C4).
+    """
+    best = 0
+    for nd in nodes:
+        best = max(best, 1 + _tree_depth(nd["children"]))
+    return best
+
+
 def _structure_summary(outline_nodes, has_toc, body_md):
     # type: (list, bool, str) -> dict
-    """Report-side rollup of the outline: deepest heading level, the largest section
-    by tokens (the fast 'does any section blow the budget?' triage), and the
-    outline-COVERAGE gate — measured from the built nodes back against the body, so
-    any outline-builder bug that drops a region degrades the report instead of
-    passing silently (see ``validate.outline_report``)."""
-    max_depth = 0
+    """Report-side rollup of the outline: how deep the tree nests, the largest section
+    and the largest LEAF by tokens (the fast 'does any section blow the budget?'
+    triage), and the outline-COVERAGE gate — measured from the built nodes back
+    against the body, so any outline-builder bug that drops a region degrades the
+    report instead of passing silently (see ``validate.outline_report``)."""
     largest = 0
+    largest_leaf = 0
     for nd in _walk(outline_nodes):
-        if nd["level"] > max_depth:
-            max_depth = nd["level"]
         if nd["subtree_tokens"] > largest:
             largest = nd["subtree_tokens"]
+        # A LEAF is the unit a consumer actually retrieves or embeds. Every ancestor
+        # subtree contains it, so on a single-H1 document `largest_section_tokens` is
+        # just `total_tokens` restated — true, and useless as a budget signal.
+        if not nd["children"] and nd["subtree_tokens"] > largest_leaf:
+            largest_leaf = nd["subtree_tokens"]
     cov = outline_coverage(body_md, outline_nodes)
-    return {"max_depth": max_depth, "largest_section_tokens": largest,
+    return {"max_depth": _tree_depth(outline_nodes),
+            "largest_section_tokens": largest,
+            "largest_leaf_tokens": largest_leaf,
             "has_toc": bool(has_toc),
             "coverage": outline_report(cov["content_lines"], cov["covered_lines"],
                                        cov["toc_lines"], cov["uncovered_lines"],
@@ -121,6 +140,7 @@ def _frontmatter(doc_id, source_format, lane, source_relpath, source_sha256,
 
 def assemble_bundle(doc_id, source_relpath, source_format, lane,
                     source_text, body_md, source_meta=None, token_count=None,
+                    source_structure=None,
                     token_model=None, converter=None, source_sha256=None,
                     warnings=None, extras=None, timing_ms=None,
                     losslessness=None, generated_run=None):
@@ -149,6 +169,7 @@ def assemble_bundle(doc_id, source_relpath, source_format, lane,
     tmodel = token_model or ("char-estimate/4" if token_count is None else "custom")
 
     verdict = build_report(source_text, body_md, lane=lane,
+                           source_structure=source_structure,
                            losslessness=losslessness, token_count=token_count)
 
     # Measured image metadata (extras["image_meta"]: {image_id: {width,height,bytes}},
@@ -178,6 +199,10 @@ def assemble_bundle(doc_id, source_relpath, source_format, lane,
     structure["token_model"] = tmodel
     structure["total_tokens"] = outline["total_tokens"]
     structure["has_toc"] = outline.get("has_toc", False)
+    # Whether the nesting came from the titles' section numbering instead of from the
+    # extractor's own levels. Published because a reshaped tree must never be a silent
+    # one — a consumer comparing two lanes' outlines needs to know which one inferred.
+    structure["levels_inferred"] = outline.get("levels_inferred", False)
     structure["outline"] = outline["outline"]
 
     report = OrderedDict()
@@ -210,6 +235,9 @@ def assemble_bundle(doc_id, source_relpath, source_format, lane,
             source_repr=(extras or {}).get("source_repr", "ooxml-xml"))
     report["structure"] = _structure_summary(outline["outline"],
                                               outline.get("has_toc", False), body_md)
+    # Beside `losslessness`, not inside it: they answer different questions. Recall
+    # asks "is every word here?"; fidelity asks "does it still mean the same thing?"
+    report["structure_fidelity"] = verdict["structure_fidelity"]
     report["structural_errors"] = verdict["structural_errors"]
     report["structural_warnings"] = verdict["structural_warnings"]
     report["warnings"] = list(warnings or [])

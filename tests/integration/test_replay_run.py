@@ -105,6 +105,178 @@ def test_pointing_at_a_different_source_tree_is_caught(tmp_path, capsys):
     assert "different directory" in text
 
 
+def test_a_default_src_is_not_silently_replayed_from_the_environment(tmp_path,
+                                                                     monkeypatch):
+    """The recorded run took the default `--src`, so `argv` names no source root.
+
+    Filling placeholders then had nothing to fill and the printed command carried
+    no `--src` at all — so the replay read whatever `$DOC2MD_SRC` resolved to at
+    replay time. Handing the tool a source root and having it replay a different
+    corpus is worse than refusing, because the output looks like an answer.
+    """
+    src = tmp_path / "s"
+    src.mkdir()
+    _docx(str(src / "spec.docx"))
+    out = tmp_path / "o"
+    monkeypatch.setenv("DOC2MD_SRC", str(src))
+    bb = _mod("build_bundle")
+    assert bb.main(["--out", str(out), "--run-id", "R1"]) == 0
+    report_path = os.path.join(
+        str(out), [n for n in os.listdir(str(out))
+                   if os.path.isdir(os.path.join(str(out), n))][0], "report.json")
+    with open(report_path, encoding="utf-8") as fh:
+        run = json.load(fh)["run"]
+    assert "--src" not in run["argv"]                  # the run really did default
+
+    rr = _mod("replay_run")
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    cmd = rr.command_for(run, str(elsewhere), str(tmp_path / "r"))
+    assert "--src" in cmd and cmd[cmd.index("--src") + 1] == str(elsewhere)
+    assert "--out" in cmd and cmd[cmd.index("--out") + 1] == str(tmp_path / "r")
+    # and pointing somewhere else is still called out, not just quietly obeyed
+    assert any(k == "source" and "different directory" in t
+               for k, t in rr.divergences(run, {}, str(elsewhere)))
+
+
+def test_an_edited_source_is_caught_although_the_directory_is_unchanged(tmp_path):
+    """`source_root_id` only ever answered "same directory?".
+
+    Both `source_sha256` and `corpus_sha256` were recorded and neither was ever
+    read, so a replay over an edited tree reported "no divergences" and then
+    produced different markdown.
+    """
+    src, out, report_path = _build(tmp_path)
+    rr = _mod("replay_run")
+    with open(report_path, encoding="utf-8") as fh:
+        report = json.load(fh)
+    run = report["run"]
+    full = rr._find_run_row(report, report_path, run)
+    assert full.get("corpus_sha256")
+
+    clean = rr.divergences(run, full, src, report, report_path)
+    assert not [k for k, _t in clean if k in ("source", "corpus")]
+
+    _docx(str(os.path.join(src, "spec.docx")), text="A completely different claim.")
+    dirty = rr.divergences(run, full, src, report, report_path)
+    kinds = dict((k, t) for k, t in dirty)
+    assert "source" in kinds and "source_sha256" in kinds["source"]
+    assert "corpus" in kinds and "no longer hash" in kinds["corpus"]
+
+
+def test_a_missing_source_file_is_named_rather_than_read_as_unchanged(tmp_path):
+    src, out, report_path = _build(tmp_path)
+    rr = _mod("replay_run")
+    with open(report_path, encoding="utf-8") as fh:
+        report = json.load(fh)
+    os.remove(os.path.join(src, "spec.docx"))
+    diffs = rr.divergences(report["run"],
+                           rr._find_run_row(report, report_path), src, report,
+                           report_path)
+    assert any(k == "source" and "not in the tree" in t for k, t in diffs)
+
+
+def test_a_different_external_tool_version_is_a_divergence(tmp_path, monkeypatch):
+    """`run.tools` names the binaries that produced the document, and nothing read it.
+
+    A legacy `.odt` is pre-converted by soffice; a different soffice produces
+    different markdown from the same bytes, and the replay used to call that no
+    divergence at all.
+    """
+    rr = _mod("replay_run")
+    monkeypatch.setitem(rr._TOOL_PROBES, "soffice", lambda: "24.2.0.3")
+    run = {"code": {}, "host": {}, "tools": {"soffice": "7.6.4.1"}}
+    diffs = rr.divergences(run, {}, "")
+    assert any(k == "tools" and "7.6.4.1 -> 24.2.0.3" in t for k, t in diffs)
+
+    monkeypatch.setitem(rr._TOOL_PROBES, "soffice", lambda: "")
+    diffs = rr.divergences(run, {}, "")
+    assert any(k == "tools" and "not installed here" in t for k, t in diffs)
+
+
+def test_a_tool_this_machine_cannot_probe_is_unverified_not_unchanged(tmp_path):
+    # "I could not check the toolchain" and "the toolchain is the same" are
+    # different answers, and only one of them is evidence.
+    rr = _mod("replay_run")
+    run = {"code": {}, "host": {}, "tools": {"docling": "docling 2.55.1"}}
+    diffs = rr.divergences(run, {}, "")
+    assert any(k == "tools" and "UNVERIFIED" in t for k, t in diffs)
+
+
+def test_an_environment_variable_that_was_merely_present_is_compared(tmp_path,
+                                                                     monkeypatch):
+    """`_env_present` exists precisely because the resolution diff cannot see it.
+
+    A variable whose value equals the default moves no config value and still
+    changes what a person re-establishing the run has to set up — and the
+    comparison loop `continue`d straight past it.
+    """
+    monkeypatch.setenv("DOC2MD_MIN_RECALL", "0.80")     # equal to the default
+    src, out, report_path = _build(tmp_path)
+    with open(report_path, encoding="utf-8") as fh:
+        report = json.load(fh)
+    rr = _mod("replay_run")
+    full = rr._find_run_row(report, report_path)
+    assert "DOC2MD_MIN_RECALL" in full["config"]["_env_present"]["value"]
+    # It moved no value, so the config comparison stays silent about it...
+    assert not [t for k, t in rr.divergences(report["run"], full, "")
+                if k == "config" and "min_recall" in t]
+
+    monkeypatch.delenv("DOC2MD_MIN_RECALL")
+    diffs = rr.divergences(report["run"], full, "")
+    assert any(k == "env" and "unset here" in t and "DOC2MD_MIN_RECALL" in t
+               for k, t in diffs)
+
+
+def test_a_metadata_run_is_replayable_too(tmp_path):
+    """Half the pipeline was unreplayable because it was in no ENTRYPOINTS table.
+
+    `enrich_metadata` reads and writes the SAME root, so it takes no `--out` and
+    the tool must not demand one; and its root flag is `--bundles`, which the
+    replay has to fill back in the same way `--src` is filled for a writer.
+    """
+    src, out, report_path = _build(tmp_path)
+    em = _mod("enrich_metadata")
+    assert em.main(["--bundles", out, "--run-id", "E1",
+                    "--namespace", "acme.internal",
+                    "--source-base-url", "https://wiki.example.com/docs/"]) in (0, 3)
+
+    rr = _mod("replay_run")
+    with open(report_path, encoding="utf-8") as fh:
+        report = json.load(fh)
+    staged = [r for r in report["runs"] if r["entrypoint"] == "enrich_metadata"][-1]
+    cmd = rr.command_for(staged, out, "")
+    assert cmd[1].endswith("enrich_metadata.py")
+    assert cmd[cmd.index("--bundles") + 1] == out
+    # the switches that decided meta.id and meta.source.url are IN the command
+    assert cmd[cmd.index("--namespace") + 1] == "acme.internal"
+    assert cmd[cmd.index("--source-base-url") + 1] == "https://wiki.example.com/docs/"
+    # ...and no --out was invented for a stage that rewrites in place
+    assert "--out" not in cmd
+
+    # the run row it joins to is the ENRICHMENT's, not the writer's
+    full = rr._find_run_row(report, report_path, staged)
+    assert full["entrypoint"] == "enrich_metadata"
+    assert full["config"]["cli.namespace"]["value"] == "acme.internal"
+
+
+def test_the_same_run_id_on_two_stages_does_not_cross_the_run_rows(tmp_path):
+    # Pinning both stages to one --run-id is how two runs are made comparable, and
+    # `runs.jsonl` rows were looked up by run_id alone: an enrichment report got
+    # handed the WRITER's resolved configuration and reported no divergence about
+    # settings it never used.
+    src, out, report_path = _build(tmp_path)          # --run-id R1
+    em = _mod("enrich_metadata")
+    assert em.main(["--bundles", out, "--run-id", "R1"]) in (0, 3)
+    rr = _mod("replay_run")
+    with open(report_path, encoding="utf-8") as fh:
+        report = json.load(fh)
+    by_stage = dict((r["entrypoint"], r) for r in report["runs"])
+    assert set(by_stage) == {"build_bundle", "enrich_metadata"}
+    for name, run in by_stage.items():
+        assert rr._find_run_row(report, report_path, run)["entrypoint"] == name
+
+
 def test_a_report_without_run_provenance_says_so_rather_than_guessing(tmp_path):
     src, out, report_path = _build(tmp_path)
     with open(report_path, encoding="utf-8") as fh:
@@ -129,10 +301,8 @@ def test_the_run_log_joins_documents_to_runs(tmp_path):
     assert runs[0]["corpus_sha256"]
 
 
-def test_no_artifact_ever_contains_an_absolute_host_path(tmp_path):
-    # The root CLAUDE.md forbids it and a bundle is published output. This is the
-    # test that keeps the run block from quietly becoming the exception.
-    src, out, _report = _build(tmp_path)
+def _scan_for_paths(out, needles):
+    """Every artifact under ``out`` that contains one of ``needles`` verbatim."""
     leaked = []
     for root, _dirs, files in os.walk(out):
         for fn in files:
@@ -140,7 +310,53 @@ def test_no_artifact_ever_contains_an_absolute_host_path(tmp_path):
                 continue
             with open(os.path.join(root, fn), encoding="utf-8") as fh:
                 text = fh.read()
-            for needle in (str(tmp_path), os.path.expanduser("~"), REPO):
+            for needle in needles:
                 if needle and len(needle) > 4 and needle in text:
                     leaked.append("%s -> %s" % (os.path.join(root, fn), needle))
+    return leaked
+
+
+def test_no_artifact_ever_contains_an_absolute_host_path(tmp_path):
+    # The root CLAUDE.md forbids it and a bundle is published output. This is the
+    # test that keeps the run block from quietly becoming the exception.
+    #
+    # IT PASSED WHILE THE GUARD WAS BROKEN, because it spelled every flag out in
+    # full and only ever passed paths to the two flags that were on the redaction
+    # list. So it now runs the shapes that actually got through: argparse PREFIX
+    # abbreviations (`--sr`, `--ou` — unambiguous, and accepted), and path values
+    # on flags nobody thought to list (`--only`, `--tokenizer`).
+    src = tmp_path / "s"
+    out = tmp_path / "o"
+    src.mkdir()
+    _docx(str(src / "spec.docx"))
+    bb = _mod("build_bundle")
+    tok_dir = tmp_path / "models" / "tok"
+    os.makedirs(str(tok_dir))
+    rc = bb.main(["--sr", str(src), "--ou", str(out),
+                  "--only", str(src / "spec.docx"),
+                  "--tokenizer", "char:%s" % tok_dir,
+                  "--run-id", "R1"])
+    assert rc == 0
+    assert os.path.isfile(os.path.join(str(out), "runs.jsonl"))
+
+    leaked = _scan_for_paths(str(out),
+                             (str(tmp_path), os.path.expanduser("~"), REPO))
     assert not leaked, "absolute host paths leaked into artifacts: %s" % leaked
+
+    # ...and the switches themselves are still there, redacted rather than dropped:
+    # a record that forgot which flags were passed is not a record of the run.
+    with open(os.path.join(str(out), "runs.jsonl"), encoding="utf-8") as fh:
+        argv = json.loads(fh.readline())["argv"]
+    assert argv[:4] == ["--sr", "<src>", "--ou", "<out>"]
+    assert "--only" in argv and "--tokenizer" in argv
+    assert argv[argv.index("--tokenizer") + 1].startswith("char:<path:")
+
+
+def test_the_full_spelling_and_the_abbreviation_redact_the_same_way(tmp_path):
+    # The property, stated directly: how the operator spelled the flag cannot
+    # change what reaches the artifact.
+    from backend.provenance import redact_argv
+    paths = {"--src": "<src>", "--out": "<out>"}
+    full = redact_argv(["--src", "/vols/x", "--out", "/vols/y"], paths)
+    abbrev = redact_argv(["--sr", "/vols/x", "--ou", "/vols/y"], paths)
+    assert full[1::2] == abbrev[1::2] == ["<src>", "<out>"]

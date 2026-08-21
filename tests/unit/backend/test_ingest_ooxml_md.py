@@ -10,7 +10,8 @@ summary: docx/pptx/xlsx parts convert to structured markdown that passes the los
 # exhaustive ground truth, exactly as office_convert.py will grade it.
 from backend.ingest import (docx_markdown, pptx_markdown, xlsx_markdown,
                             docx_source_text, pptx_source_text, xlsx_source_text,
-                            ooxml_markdown, ooxml_source_text, furniture_drops)
+                            ooxml_markdown, ooxml_source_text, furniture_drops,
+                            markdown_to_text)
 from backend.validate import conversion_report
 
 W = 'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"'
@@ -77,6 +78,17 @@ NUMBERING_DEC = ('<w:numbering %s>'
                  '<w:num w:numId="4"><w:abstractNumId w:val="40"/></w:num>'
                  '</w:numbering>' % W)
 
+# The decimal procedure of NUMBERING_DEC plus a SEPARATE bullet instance -- what
+# Word actually writes for "notes bulleted under step 2".
+NUMBERING_SUBBULLET = NUMBERING_DEC.replace(
+    '</w:numbering>',
+    '<w:abstractNum w:abstractNumId="50">'
+    '<w:lvl w:ilvl="0"><w:numFmt w:val="bullet"/></w:lvl>'
+    '<w:lvl w:ilvl="1"><w:numFmt w:val="bullet"/></w:lvl>'
+    '</w:abstractNum>'
+    '<w:num w:numId="5"><w:abstractNumId w:val="50"/></w:num>'
+    '</w:numbering>')
+
 
 def _wcell(*paras):
     return "<w:tc>%s" % "".join("<w:p><w:r><w:t>%s</w:t></w:r></w:p>" % t
@@ -122,9 +134,10 @@ def test_nested_ordered_list_indents_to_the_parents_content_column():
                 + _wp("inspect the gateway log", num="3", ilvl=1)
                 + _wp("drain the unhealthy pod", num="3"))
     md = docx_markdown({"word/document.xml": doc, "word/numbering.xml": NUMBERING_DEC})
-    assert ("1. check pod health\n"
+    assert ("1. acknowledge the page\n"
+            "2. check pod health\n"
             "   1. inspect the gateway log\n"
-            "1. drain the unhealthy pod") in md
+            "3. drain the unhealthy pod") in md
 
 
 def test_nested_ordered_list_indents_compound_at_depth_two():
@@ -143,20 +156,249 @@ def test_ordered_child_of_a_bullet_parent_uses_the_bullet_content_column():
     assert "- prerequisite\n  1. sub step" in md
 
 
+def test_a_bullet_sublist_with_its_own_numid_still_nests_under_the_step():
+    # Word gives a bullet sub-list inside a numbered procedure its OWN w:numId, so
+    # "different numId" cannot mean "different list": keying the ancestor columns on
+    # the numbering instance unparented the notes, and the two PEER bullets came out
+    # as one bullet with a child. w:ilvl is the nesting, whatever instance carries it.
+    doc = _wdoc(_wp("drain the tier", num="3")
+                + _wp("the drain is idempotent", num="5", ilvl=1)
+                + _wp("a stalled drain is read only", num="5", ilvl=1)
+                + _wp("run the migration", num="3"))
+    md = docx_markdown({"word/document.xml": doc,
+                        "word/numbering.xml": NUMBERING_SUBBULLET})
+    assert ("1. drain the tier\n"
+            "   - the drain is idempotent\n"
+            "   - a stalled drain is read only\n"
+            "2. run the migration") in md
+
+
 def test_a_paragraph_closes_the_list_so_the_next_item_restarts_at_column_zero():
     # A column-0 paragraph ends the list in the rendered markdown; carrying the old
     # ancestor columns across it would indent the next item into a code block.
+    # The COLUMNS reset and the NUMBER does not: Word does not restart a procedure
+    # because a paragraph got in the way, so the item after the interlude is 2.
     doc = _wdoc(_wp("one", num="3") + _wp("two", num="3", ilvl=1)
                 + _wp("Interlude prose.") + _wp("three", num="3", ilvl=1))
     md = docx_markdown({"word/document.xml": doc, "word/numbering.xml": NUMBERING_DEC})
-    assert "\n1. three" in md
-    assert "    1. three" not in md
+    assert "\n2. three" in md
+    assert "    2. three" not in md
 
 
 def test_docx_numid_zero_is_not_a_list():
     doc = _wdoc(_wp("plain again", num="0"))
     md = docx_markdown({"word/document.xml": doc})
     assert "- plain" not in md and "plain again" in md
+
+
+# ------------------------------------- a renumbered procedure (quality-plan P0.1)
+#
+# CommonMark takes a list's start from its FIRST marker and then counts on its own.
+# So every one of the constructs below used to reset a procedure to step 1 halfway
+# down, at token_recall 1.0 with zero structural errors, because the number a
+# reader acts on is not a token and the depth histogram does not move either.
+
+# A decimal list whose level 0 is declared to start at 5, plus a bullet level for
+# notes under it. `w:start` was read nowhere.
+NUMBERING_START5 = ('<w:numbering %s>'
+                    '<w:abstractNum w:abstractNumId="60">'
+                    '<w:lvl w:ilvl="0"><w:start w:val="5"/>'
+                    '<w:numFmt w:val="decimal"/></w:lvl>'
+                    '<w:lvl w:ilvl="1"><w:start w:val="3"/>'
+                    '<w:numFmt w:val="decimal"/></w:lvl>'
+                    '</w:abstractNum>'
+                    '<w:num w:numId="6"><w:abstractNumId w:val="60"/></w:num>'
+                    # The same abstract numbering, restarted by this instance.
+                    '<w:num w:numId="7"><w:abstractNumId w:val="60"/>'
+                    '<w:lvlOverride w:ilvl="0"><w:startOverride w:val="1"/>'
+                    '</w:lvlOverride></w:num>'
+                    '</w:numbering>' % W)
+
+# Word's built-in "List Number": the numbering lives in the STYLE, and NimbusStep
+# only inherits it through w:basedOn.
+NUMBERING_STYLES = ('<w:styles %s>'
+                    '<w:style w:type="paragraph" w:styleId="ListNumber">'
+                    '<w:name w:val="List Number"/>'
+                    '<w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="3"/>'
+                    '</w:numPr></w:pPr></w:style>'
+                    '<w:style w:type="paragraph" w:styleId="NimbusStep">'
+                    '<w:name w:val="Nimbus Step"/>'
+                    '<w:basedOn w:val="ListNumber"/></w:style>'
+                    '</w:styles>' % W)
+
+
+def test_a_picture_inside_a_step_does_not_restart_the_procedure():
+    # THE realistic one: a screenshot in a runbook step. The sentinel used to be
+    # emitted at column 0, which closes the list, so steps 3 and 4 came out as 1
+    # and 2 — LibreOffice reads the same file as <ol start="3">.
+    drawing = ('<w:r><w:drawing><wp:inline %s><a:graphic><a:graphicData>'
+               '<pic:pic><pic:blipFill><a:blip r:embed="rId9"/></pic:blipFill>'
+               '</pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing>'
+               '</w:r>'
+               % ('xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/'
+                  'wordprocessingDrawing" ' + A + " " + R +
+                  ' xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/'
+                  'picture"'))
+    step2 = ('<w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="3"/>'
+             '</w:numPr></w:pPr><w:r><w:t>open the console</w:t></w:r>%s</w:p>'
+             % drawing)
+    doc = _wdoc(_wp("acknowledge the page", num="3") + step2
+                + _wp("drain the pod", num="3") + _wp("restart the tier", num="3"))
+    rels = ('<Relationships %s><Relationship Id="rId9" Type="http://schemas.'
+            'openxmlformats.org/officeDocument/2006/relationships/image" '
+            'Target="media/shot.png"/></Relationships>' % RELS)
+    md = docx_markdown({"word/document.xml": doc,
+                        "word/numbering.xml": NUMBERING_DEC,
+                        "word/_rels/document.xml.rels": rels}, emit_images=True)
+    # The picture is a list-item CONTINUATION at step 2's content column...
+    assert "\n   <!-- ooxml-image:word/media/shot.png -->\n" in md
+    # ...so the steps after it are still 3 and 4, not 1 and 2.
+    assert "\n3. drain the pod" in md
+    assert "\n4. restart the tier" in md
+
+
+def test_a_text_box_anchored_in_a_step_does_not_restart_the_procedure():
+    box = ('<w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="3"/></w:numPr>'
+           '</w:pPr><w:r><w:t>drain the tier</w:t></w:r>'
+           '<w:r><w:pict><v:shape %s><v:textbox><w:txbxContent>'
+           '<w:p><w:r><w:t>The drain is idempotent.</w:t></w:r></w:p>'
+           '</w:txbxContent></v:textbox></v:shape></w:pict></w:r></w:p>'
+           % 'xmlns:v="urn:schemas-microsoft-com:vml"')
+    doc = _wdoc(_wp("announce the freeze", num="3") + box
+                + _wp("run the migration", num="3"))
+    md = docx_markdown({"word/document.xml": doc, "word/numbering.xml": NUMBERING_DEC})
+    assert "\n   The drain is idempotent.\n" in md   # lifted INTO step 2
+    assert "\n3. run the migration" in md
+
+
+def test_a_declared_start_is_the_first_marker():
+    # `1. ` for a list Word numbers from 5 makes prose saying "see step 6" point at
+    # step 2. CommonMark reads the start off the first marker, so "5." is the fix.
+    doc = _wdoc(_wp("verify the backup", num="6") + _wp("cut over", num="6"))
+    md = docx_markdown({"word/document.xml": doc,
+                        "word/numbering.xml": NUMBERING_START5})
+    assert "5. verify the backup\n6. cut over" in md
+
+
+def test_a_nested_list_that_does_not_start_at_one_gets_its_own_paragraph_break():
+    # CommonMark lets a list interrupt a paragraph only when an ordered marker reads
+    # 1, so "3." written directly under its parent's text is swallowed as that
+    # parent's prose and the sub-list VANISHES. One blank line closes the paragraph.
+    doc = _wdoc(_wp("verify the backup", num="6")
+                + _wp("check the checksum", num="6", ilvl=1))
+    md = docx_markdown({"word/document.xml": doc,
+                        "word/numbering.xml": NUMBERING_START5})
+    assert "5. verify the backup\n\n   3. check the checksum" in md
+
+
+def test_a_start_override_restarts_the_second_procedure():
+    # Two instances of the same abstract numbering: the second overrides the start
+    # back to 1. Adjacent items cannot be separated by a block, so the delimiter
+    # changes instead — CommonMark's own way of beginning a new list.
+    doc = _wdoc(_wp("verify the backup", num="6") + _wp("cut over", num="6")
+                + _wp("announce the window", num="7"))
+    md = docx_markdown({"word/document.xml": doc,
+                        "word/numbering.xml": NUMBERING_START5})
+    assert "5. verify the backup\n6. cut over\n1) announce the window" in md
+
+
+def test_numbering_carried_by_a_paragraph_style_is_still_a_list():
+    # The list VANISHED: three plain paragraphs, no markers, and the structural
+    # ground truth was blind in exactly the same place, so nothing could object.
+    doc = _wdoc(_wp("stop the writer", style="ListNumber")
+                + _wp("flush the queue", style="NimbusStep")
+                + _wp("start the writer", style="NimbusStep"))
+    md = docx_markdown({"word/document.xml": doc, "word/styles.xml": NUMBERING_STYLES,
+                        "word/numbering.xml": NUMBERING_DEC})
+    assert "1. stop the writer\n2. flush the queue\n3. start the writer" in md
+
+
+def test_a_paragraphs_own_numbering_beats_the_styles():
+    doc = _wdoc(_wp("a bullet, not a step", style="ListNumber", num="4"))
+    md = docx_markdown({"word/document.xml": doc, "word/styles.xml": NUMBERING_STYLES,
+                        "word/numbering.xml": NUMBERING_DEC})
+    assert "- a bullet, not a step" in md
+
+
+def test_an_explicit_numid_zero_refuses_the_styles_numbering():
+    # w:numId 0 means "this paragraph is NOT numbered" — it must not then inherit
+    # numbering from the very style it is overriding.
+    doc = _wdoc(_wp("plain prose", style="ListNumber", num="0"))
+    md = docx_markdown({"word/document.xml": doc, "word/styles.xml": NUMBERING_STYLES,
+                        "word/numbering.xml": NUMBERING_DEC})
+    assert "1. plain prose" not in md and "plain prose" in md
+
+
+def test_a_basedon_cycle_terminates():
+    styles = ('<w:styles %s>'
+              '<w:style w:type="paragraph" w:styleId="A">'
+              '<w:name w:val="A"/><w:basedOn w:val="B"/></w:style>'
+              '<w:style w:type="paragraph" w:styleId="B">'
+              '<w:name w:val="B"/><w:basedOn w:val="A"/></w:style>'
+              '</w:styles>' % W)
+    md = docx_markdown({"word/document.xml": _wdoc(_wp("body", style="A")),
+                        "word/styles.xml": styles})
+    assert "body" in md
+
+
+def test_a_heading_style_derived_from_heading1_is_still_a_heading():
+    # `NimbusH1 basedOn="Heading1"` is an <h1> to LibreOffice. Reading only the
+    # style's OWN w:name turned a two-section document into one structureless blob.
+    styles = ('<w:styles %s>'
+              '<w:style w:type="paragraph" w:styleId="Heading1">'
+              '<w:name w:val="heading 1"/></w:style>'
+              '<w:style w:type="paragraph" w:styleId="NimbusH1">'
+              '<w:name w:val="Nimbus Section"/>'
+              '<w:basedOn w:val="Heading1"/></w:style>'
+              '<w:style w:type="paragraph" w:styleId="NimbusSub">'
+              '<w:name w:val="Nimbus Subsection"/>'
+              '<w:basedOn w:val="NimbusH1"/>'
+              '<w:pPr><w:outlineLvl w:val="1"/></w:pPr></w:style>'
+              '</w:styles>' % W)
+    doc = _wdoc(_wp("Bring-up", style="NimbusH1") + _wp("Body prose.")
+                + _wp("Straps", style="NimbusSub"))
+    md = docx_markdown({"word/document.xml": doc, "word/styles.xml": styles})
+    assert "# Bring-up" in md
+    # The style's OWN outlineLvl wins over the level it would inherit.
+    assert "## Straps" in md
+
+
+def test_a_code_style_derived_from_a_code_style_is_still_code():
+    styles = ('<w:styles %s>'
+              '<w:style w:type="paragraph" w:styleId="Src">'
+              '<w:name w:val="Source Code"/></w:style>'
+              '<w:style w:type="paragraph" w:styleId="KestrelShell">'
+              '<w:name w:val="Kestrel Shell"/><w:basedOn w:val="Src"/></w:style>'
+              '</w:styles>' % W)
+    doc = _wdoc(_wp("kestrelctl drain", style="KestrelShell"))
+    md = docx_markdown({"word/document.xml": doc, "word/styles.xml": styles})
+    assert "```\nkestrelctl drain\n```" in md
+
+
+# ------------------------------------ a row that does not start at grid column 0
+
+def test_grid_before_keeps_every_value_in_its_own_column():
+    # <w:gridBefore w:val="1"/> means the row begins at grid column 1. Counting only
+    # the w:tc elements shifts every value one column LEFT, so a register NAMED
+    # "0x04" publishes "RO" as its offset — a plausible table, wrong in every row.
+    header = "<w:tr>%s%s%s</w:tr>" % (_wcell("Register"), _wcell("Offset"),
+                                      _wcell("Access"))
+    indented = ('<w:tr><w:trPr><w:gridBefore w:val="1"/></w:trPr>%s%s</w:tr>'
+                % (_wcell("0x04"), _wcell("RO")))
+    md = docx_markdown({"word/document.xml":
+                        _wdoc("<w:tbl>%s%s</w:tbl>" % (header, indented))})
+    assert "| Register | Offset | Access |" in md
+    assert "|  | 0x04 | RO |" in md
+
+
+def test_grid_after_pads_the_right_hand_end():
+    header = "<w:tr>%s%s%s</w:tr>" % (_wcell("Register"), _wcell("Offset"),
+                                      _wcell("Access"))
+    short = ('<w:tr><w:trPr><w:gridAfter w:val="1"/></w:trPr>%s%s</w:tr>'
+             % (_wcell("PllLockMon"), _wcell("0x08")))
+    md = docx_markdown({"word/document.xml":
+                        _wdoc("<w:tbl>%s%s</w:tbl>" % (header, short))})
+    assert "| PllLockMon | 0x08 |  |" in md
 
 
 def test_docx_table_renders_gfm_with_separator_and_escaped_pipes():
@@ -806,8 +1048,27 @@ def test_angle_bracket_signals_survive_in_cells():
     parts = {"xl/workbook.xml": WB, "xl/_rels/workbook.xml.rels": WB_RELS,
              "xl/worksheets/sheet1.xml": sheet}
     md = xlsx_markdown(parts)
-    assert "\\<prdata\\[31:0\\]>" in md
+    # `<` is escaped because `<prdata...` could open a raw HTML tag. The BUS SLICE
+    # is not: a bracket is only syntax next to `](` or `][`, and this converter
+    # never emits a link reference definition for a bare `[31:0]` to resolve
+    # against. The signal name stays greppable in the stored bytes, which is the
+    # whole point of not escaping what was never dangerous.
+    assert "\\<prdata[31:0]> toggles" in md
+    assert "\\[31:0\\]" not in md
     rep = conversion_report(xlsx_source_text(parts), md)
+    assert rep["valid"] is True, rep
+
+
+def test_a_bracket_that_could_form_a_link_is_still_escaped():
+    # The other half of the rule: `](` is exactly the sequence that makes a
+    # bracket dangerous, so prose containing one keeps its backslashes and the
+    # link target survives into the text layer instead of being swallowed.
+    doc = _wdoc(_wp("see [note](below) for the strap table"))
+    parts = {"word/document.xml": doc}
+    md = docx_markdown(parts)
+    assert "\\[note\\](below)" in md
+    assert markdown_to_text(md).strip().endswith("see [note](below) for the strap table")
+    rep = conversion_report(docx_source_text(parts), md)
     assert rep["valid"] is True, rep
 
 

@@ -46,6 +46,28 @@ is exactly why they survive per-file linting indefinitely.
 - **tier 2 — model.** A model *proposes*, a human *corrects*: classification,
   summarisation, entity and relation extraction.
 
+## One identity
+
+At schema v3 a document has **one** identity: `id`, derived from the source path and
+so unique by construction, with `uid` kept as a deprecated alias that always equals
+it. v2 had two — `id` from the title, `uid` from the path — and `kb_lint` resolved
+references against both, so a corpus could grow two disjoint link graphs that each
+linted clean. The title keeps its own slug in `slug`, where a collision is harmless
+because nothing resolves against it. An **authored** `id` outranks the derivation, so
+a document that must keep its name across a move can.
+
+## The floor
+
+`title`, `abstract` and `links` are tier-2 fields that a **no-model run still
+fills** (`title_floor`, `abstract_floor`, `harvested_links`), from evidence the
+pipeline already measured: the source's title property, the lede paragraph, and the
+outbound URLs harvested into `structure.json` at recall 1.0. A model is the ceiling,
+not the floor — and what it may do to a floor value depends on where that value came
+from. `extracted` is evidence and `is_protected` refuses to let a proposal replace
+it; `derived` is a guess and stays overwritable. For `links` the unit is the record,
+not the field: the model's links join the harvested ones (`merge_group_evidence`)
+and can never delete one.
+
 ## Two files, one view
 
 At schema v2 the **descriptors** (id, title, type, tags, status, owner) stay in
@@ -93,6 +115,11 @@ records which is which so the distinction survives in the file.
   its self-containment keys.
 - `slugify`, `derive_uid`, `word_count`, `reading_time_minutes`,
   `keyword_candidates`, `heading_anchor`, `body_anchors` — tier-1 derivations.
+- `unique_id(relpath, namespace)` — the canonical identity; `title_floor`,
+  `abstract_floor`, `harvested_links`, `link_category`, `source_url`,
+  `next_review_due` — the deterministic floor; `merge_group_evidence`,
+  `record_source`, `value_source` — the per-record evidence rules;
+  `is_protected(entry, value)` — may a model replace this?
 - `request_spec(vocab, wanted=None)` — the enum-constrained field spec a model is
   asked to fill; `accept_model_meta(...)` decides what its answer may contribute;
   `revalidate_generated(...)` re-checks prior answers after a vocabulary bump;

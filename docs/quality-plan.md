@@ -78,9 +78,9 @@ eventually run all of them; until then each slice names its own check.
 
 | # | Condition | Verified by |
 |---|---|---|
-| A1 | A second hard gate, `structure_fidelity`, grades list nesting depth, emphasis runs, code runs, link count and table dimensions against an OOXML-derived ground truth; office lane fails on any mismatch | `report.json.structure_fidelity.gate == "pass"`, corpus-wide |
+| A1 | A second hard gate, `structure_fidelity`, grades twelve facts against a converter-blind OOXML ground truth — headings by level, list items by nesting depth, ordered/bullet totals, emphasis and strike runs, code spans and fenced blocks, links, table geometry **and every cell's content**, and every list item's text **in order**. The office lane fails on any mismatch; a format with no second implementation reports `unmeasured`, never `pass` | `report.json.structure_fidelity.gate == "pass"`, corpus-wide |
 | A2 | Body text round-trips: markdown → text equals source text **as a sequence**, not only as a multiset | new `tests/unit/backend/test_validate_roundtrip.py` |
-| A3 | No unconditional escaping — `DB_MAX_CONN_LIMIT`, `--dry_run=true`, `[payments]`, `<stderr>` survive verbatim in the stored bytes | fixture assertions |
+| A3 | No unconditional escaping: a character is escaped only when it could actually be syntax. `DB_MAX_CONN_LIMIT`, `--dry_run=true`, `[payments]`, `snake_case_helper` survive verbatim in the stored bytes | `backend.validate._rubric.ADVERSARIAL_PROBES`, asserted against the adversarial fixture |
 | A4 | Every deliberate drop emits a named warning code carrying a **count** | `test_warning_vocabulary.py` — every code in the contract has an emitter, every emitter is in the contract |
 | A5 | Adversarial fixtures exist for each of the above and are pinned in the eval corpus | `evals/run_eval.py` green |
 
@@ -172,14 +172,15 @@ lands with a fixture that fails first.
       (`_ooxml_md.py:263`) escapes ``* _ ` < [ ] ~`` unconditionally. CommonMark
       does not treat intra-word `_` as emphasis, and `<`/`[` only matter in
       specific positions. Escape by **position**, not by character class.
-      **Done:** `DB_MAX_CONN_LIMIT`, `--dry_run=true`, `[payments]`, `<stderr>`
-      appear verbatim in `document.md`; the round-trip test (A2) passes.
-
-## P1 — The references (and the drift tests that keep them true)
-
-The owner's first ask. New directory `docs/reference/` (needs `README.md` +
-`CLAUDE.md` with frontmatter per `CONVENTIONS.md`).
-
+      **Done:** `DB_MAX_CONN_LIMIT`, `--dry_run=true`, `[payments]` and
+      `snake_case_helper` are stored verbatim: a single intraword `_` can never
+      open emphasis under CommonMark's flanking rule, and a bracket is only syntax
+      next to `](` or `][`. **`<stderr>` is NOT** — and an earlier draft of this
+      row claimed it was. `<stderr>` matches CommonMark's raw-HTML tag-name
+      production, so unescaped a renderer swallows it; escaping it is the only way
+      it renders as itself. The rule is "escape what could be syntax", not "escape
+      nothing", and the two are different claims. Recorded as a deviation rather
+      than quietly dropped from the probe list.
 - [x] **P1.1 — `docs/guide.md`.** What doc2md is, the four artifacts, the four
       stages, a real worked example (`IT_runbook.docx` in, bundle out), the
       no-model vs model story, and how verification works. The document this plan
@@ -274,137 +275,412 @@ The owner's stated goal. Everything here lands in `report.json` and the run log.
 
 The keystone. P0 fixes three bugs; P3 is what stops the next three.
 
-- [ ] **P3.1 — `backend.validate.md_structure`.** A stdlib, 3.6-safe reader of the
+- [x] **P3.1 — `backend.validate.md_structure`.** A stdlib, 3.6-safe reader of the
       *emitted markdown* that reports structural facts under CommonMark's rules:
       list nesting depth per item, emphasis runs, inline-code runs, fenced blocks,
-      link count, table dimensions. It must implement the content-column
-      continuation rule, because that is the rule P0.1 violated.
-- [ ] **P3.2 — The OOXML structural ground truth.** Extend the existing
-      converter-blind walk to yield the same fact vector from the source XML:
-      list items per level (`w:numPr/w:ilvl`), bold/italic runs (`w:rPr`),
-      hyperlinks, table grid dimensions. Shares no traversal code with the
-      converter — same rule as the token gate.
-- [ ] **P3.3 — The `structure_fidelity{}` gate.** Compare the two vectors; a
-      mismatch is a **hard fail on the office lane** and `best-effort` on PDF, by
-      the same structural coercion that protects the losslessness gate
-      (`_mdcheck.py:317-318`). Ratchet, not replacement: `token_recall == 1.0`
-      is untouched.
-- [ ] **P3.4 — Emphasis.** `w:b` / `w:i` / `w:strike` → `**` / `*` / `~~` in the
-      docx path (`_docx_p_text`, `_ooxml_md.py:516`), and the pptx equivalent.
-      Today `w:rPr` is never inspected.
-- [ ] **P3.5 — Code and monospace.** A run in a code character style, or a
-      paragraph in a code paragraph style, becomes inline backticks or a fenced
-      block. `kubectl get pods -n payments` must stop being indistinguishable from
-      narration.
-- [ ] **P3.6 — Table spans.** Resolve the open decision in `roadmap.md`: HTML
-      island vs flattened-and-recorded. Whichever wins, a flattened span emits a
-      named warning with a count.
-- [ ] **P3.7 — Audit the remaining docx features** — footnotes, endnotes,
-      comments, tracked changes, text boxes, equations, charts, embedded objects —
-      and force each into exactly one of *converted*, *converted lossily +
-      warning*, *dropped + warning*. No silent third state.
-- [ ] **P3.8 — Adversarial fixtures in `gen_corpus.py`** for every item above,
-      with pinned expectations.
+      link count, table dimensions. It implements the content-column continuation
+      rule, because that is the rule P0.1 violated. **Done:** and its correctness
+      is not asserted, it is *differentially tested* against `marko` over a
+      70-sample corpus (`tests/unit/backend/test_validate_mdstructure.py`, 111 tests on the
+      modern ring, 40 on the bare 3.6 ring). That pass found and fixed eight real
+      bugs in the first draft — setext headings never counted, `***a***` losing its
+      em, a link containing a code span vanishing, per-line instead of per-block
+      counting, and CommonMark's rule of three. Adversarial fuzz disagreement with
+      marko: 2.74% → 0.089%.
+- [x] **P3.2 — The OOXML structural ground truth.** `backend.ingest.
+      docx_source_structure`, in its own module so a helper cannot be shared by
+      accident. **Its mechanism is deliberately different**, not a retyped copy:
+      the converter dispatches recursively child by child, this walks a flat
+      `iter()` stream and answers "where am I?" with an ancestor predicate over a
+      parent map. That is what would catch a converter that forgot to recurse
+      through a `w:sdt` content control. A test asserts it names none of the
+      converter's twelve walkers.
+- [x] **P3.3 — The `structure_fidelity{}` gate.** Compares the two vectors over a
+      **closed** list of eleven facts; a mismatch is a hard fail on the office lane
+      and `best-effort` on PDF, and an unmeasured lane reports `unmeasured` rather
+      than a free pass. **The proof it works:** reintroduce the P0.1 defect and
+      `conversion_report` still returns `recall 1.0, valid True, errors 0` while
+      the new gate fails and names the delta — `list_items` source `{0:3, 1:1}`,
+      markdown `{0:4}`, one nested step promoted to a sibling. Both halves are
+      pinned in `tests/unit/backend/test_structure_fidelity.py`.
+- [x] **P3.4 — Emphasis.** `w:b` / `w:i` / `w:strike` → `**` / `*` / `~~`, plus
+      `w:rStyle` → backticks. Toggles are tri-state (a run inside a bold style can
+      turn bold *off*), `w:rPrChange` is never read, and **adjacent identically
+      formatted runs are coalesced** — Word splits one word across runs at every
+      property boundary, so wrapping each run alone emits `**Dma****Arbiter**`,
+      which `markdown_to_text` mis-pairs into a stray literal `**`.
+- [x] **P3.5 — Code and monospace.** A run in a code character style becomes an
+      inline span with a fence widened past any backticks it contains; consecutive
+      code-styled *paragraphs* fuse into one fenced block, because one `w:p` is one
+      line and five separate fences would be five separate programs. Fenced content
+      is emitted **unescaped** — `markdown_to_text` keeps fenced lines verbatim and
+      never unescapes them, so an escaped `\_` inside a fence would survive into the
+      text layer and break recall.
+- [x] **P3.6 — Table spans: flatten and record.** Decision below. Found and fixed a
+      real bug on the way: `_gfm_table`'s trailing-empty-column trim could not tell
+      span padding from a styled-but-valueless spreadsheet column, so a one-row
+      table whose only cell spanned two columns silently lost its grid width — and
+      under P3.3 that would have hard-failed a table the converter handled
+      correctly. Callers that know their grid now pass it as a floor.
+- [~] **P3.7 — Audit the remaining docx features.** A 33-row audit now exists
+      (feature × current handling × does the ground truth see it × verdict), and it
+      found that **20 of the 33 losses are silent for one structural reason**:
+      converter and ground truth share `_collect_text`, so a drop implemented
+      inside it is *symmetric* and recall reads a vacuous 1.0. Closed in this
+      phase, highest harm first:
+      * `word/charts/chartEx*.xml` — every modern chart type (waterfall, treemap,
+        funnel, sunburst, box-and-whisker) matched **no** part pattern, so its
+        labels and cached values were dropped from both sides. Real text loss,
+        reporting recall 1.0. Now read.
+      * `flattened_table_spans`, `tracked_changes_resolved`,
+        `dropped_embedded_objects` — three drops that were correct and silent, now
+        named with their counts, and the vocabulary is closed in both directions by
+        `tests/unit/backend/test_warning_vocabulary.py` (the test that would have
+        caught `dropped_headers_footers` having zero emitters).
+      Still open, and deliberately not attempted here: footnote back-references,
+      comment author/date/anchor, equation structure (needs a symmetric change to
+      the ground truth or recall breaks), image alt text, list start numbers,
+      `mailto:`/internal hyperlink targets, pptx and xlsx merged cells. Each is
+      named in the audit with its harm and its cost.
+- [x] **P3.8 — Adversarial fixtures in `gen_corpus.py`** for every item above,
+      with pinned expectations. The eval also grew an **unknown-key guard**: an
+      expectation key no checker reads now fails loudly, because a typo that looks
+      like a check and proves nothing is the same vacuous pass `n_source_tokens`
+      exists to prevent.
 
 ## P4 — Structure: make the tree a tree
 
-- [ ] **P4.1 — Heading-level inference for flat extractors.** `is_heading`
-      (`_chunk.py:54`) returns the ATX hash count first, so the numbering branch is
-      dead the moment docling emits `##` — which it always does. A real eval
-      bundle has **9 flat siblings** carrying `1`, `1.1`, `1.1.1`, `1.1.1.1` in
-      their titles. Infer levels from numbering when the document is
-      single-level. Guarded so office bundles are unaffected.
-- [ ] **P4.2 — Stable section identity.** `_chunk.py:29` already defines
-      `Section(section_id, parent, fingerprint, …)` with sha1-derived ids — and
-      `chunk_sections` has **zero production callers**. Ship `section_id`,
-      `parent` and `fingerprint` into `structure.json` nodes. Positional
-      `sec-0001` cannot back a permalink or an incremental re-index.
-- [ ] **P4.3 — One anchor scheme.** `structure.json` publishes
-      `"payments gateway it runbook"` (spaces); `kb._derive.body_anchors` — which
-      is what `_lint._check_refs` grades `#fragment` refs against — publishes
-      `payments-gateway-it-runbook`. Adopt the renderer-correct one everywhere and
-      add a parity test. Also fix `normalize_title`'s `_NUM` requiring trailing
-      whitespace (`1.2reference documents` keeps its number, `1.2 Scope` doesn't).
-- [ ] **P4.4 — Honest summary numbers.** `max_depth` is `max(level)`, not tree
-      depth (a 9-flat-sibling outline reports 2). `largest_section_tokens`
-      includes the root, so any single-H1 document reports the whole document.
-      Publish tree depth and a largest-**leaf** count.
-- [ ] **P4.5 — Table nodes.** `"tables": 1` is an integer; the escalation matrix
-      cannot be retrieved, cited or linked. Give tables the image treatment:
-      `{table_id, line, rows, cols, has_header}`.
-- [ ] **P4.6 — Bound the ALL-CAPS heuristic** (`_chunk.py:67`). A runbook callout
-      — `DO NOT REBOOT THE PRIMARY` — currently becomes a root heading and
-      reparents everything after it, with both gates still green.
+- [x] **P4.1 — Heading-level inference for flat extractors.** Fires only on the
+      signature of an extractor with no levels to give: three or more headings,
+      **all one level**, at least 60% carrying a section number, and at least one
+      number actually nested. Any variation in level and the extractor's own
+      levels are trusted verbatim, so office bundles are untouched. A reshaped
+      tree must never be a silent one, so `structure.json` now publishes
+      `levels_inferred`.
+- [x] **P4.2 — Stable section identity.** Nodes carry `section_id`
+      (`sha1(anchor)[:16]` — the same input `chunk_sections` hashes, so a future
+      chunk store and the outline name the same section the same way), `parent`,
+      and a `fingerprint` over the node's **own** body, so a child's edit does not
+      invalidate its ancestors. Positional `sec-0001` is kept: a grep proved it has
+      no code consumer, but published bundles and the worked example index by it,
+      and removing it buys nothing.
+- [x] **P4.3 — One anchor scheme.** Decision: **the section number stays** —
+      `1.2 Scope` → `12-scope`. An anchor's only job is to be the fragment a
+      renderer emits, and every common renderer drops the dot and keeps the
+      digits; `kb._lint._check_refs` grades `#fragment` refs against
+      `kb.body_anchors`, which is derived from rendered heading text, so stripping
+      the number would report every ref into a numbered section as a dead link. It
+      also keeps `2.1 Overview` and `3.1 Overview` distinct with no suffix.
+      `sections.gfm_anchor` is a deliberate **re-implementation** of
+      `validate.gfm_anchor`, not an import — the layer that grades anchors must not
+      share code with the layer that produces them, the same converter-blind rule
+      as the token gate — and `test_anchor_parity.py` is what keeps the three
+      implementations honest. `normalize_title`'s `_NUM` is fixed so a *dotted*
+      number may be glued to its title (`1.2reference documents`) while a bare
+      integer may not, because `3D layout` must not become `d layout`.
+- [x] **P4.4 — Honest summary numbers.** `max_depth` is tree depth;
+      `largest_leaf_tokens` is published beside the unchanged
+      `largest_section_tokens`, because leaves are what a consumer retrieves and
+      embeds.
+- [x] **P4.5 — Table nodes.** `{table_id, line, rows, cols, has_header}`, with
+      `table_id = tbl-sha1(section anchor + normalised header row + ordinal)[:10]`
+      — content-derived, so inserting an earlier section moves `line` and not the
+      id. `rows` and `cols` use the same conventions as `md_structure`, so the
+      outline and the fidelity gate state the same number about the same table.
+- [x] **P4.6 — Bound the ALL-CAPS heuristic.** The separating idea is
+      grammatical: a heading is a noun-phrase **label**, a callout is a **clause**.
+      Bounded by length, word count, terminal punctuation, and the presence of a
+      determiner / pronoun / auxiliary / modal / negation — with `OF`, `AND`,
+      `FOR`, `IN`, `TO`, `ON` deliberately absent so `THEORY OF OPERATION` and
+      `TERMS AND ABBREVIATIONS` survive. Stated honestly: a callout with no clause
+      word and six or fewer words (`POWER DOWN ALL NODES FIRST`) is still promoted.
+      Perfect separation is not available from shape alone; the bound removes the
+      common class.
 
 ## P5 — Metadata: fill the fields from evidence already on disk
 
 The schema is good. The extractor ignores what the pipeline already proved.
 
-- [ ] **P5.1 — Deterministic `title`.** `source_title` is read at
-      `enrich_metadata.py:199` and used **only** to compute the slug; `title`
-      stays PENDING. Fill it: `source_title` → first H1 → filename. Tier 0/1, so a
-      no-model import stops producing pages titled by filename.
-- [ ] **P5.2 — Deterministic `abstract` floor.** `structure.json` hands over the
-      lede paragraph's exact span for free. Derive a bounded abstract at tier 1;
-      a model may improve it, and authored-wins already protects a human edit.
-- [ ] **P5.3 — Verified links.** The live run put a real outbound URL into
-      `structure.json` `sec-0003.links[0]` at recall 1.0 and zero cost;
-      `enrich_metadata.py` never opens `structure.json`. Feed harvested links into
-      `knowledge.json` `links` at tier 0, distinguished in `_provenance` from
-      model-proposed ones. **The pipeline currently discards its verified edges
-      and keeps the hallucinated ones.**
-- [ ] **P5.4 — A permalink.** `source.uri` is a relpath, so a wiki page cannot
-      link home. Add `source.url` + `--source-base-url`.
-- [ ] **P5.5 — `id` uniqueness by construction.** `slugify(title)` with no
-      uniqueness check (`enrich_metadata.py:205`) collides on "Overview" and
-      "Release Notes" across any real corpus, and a collision is a `kb_lint`
-      ERROR a human must hand-fix. Disambiguate deterministically.
-- [ ] **P5.6 — One canonical identity.** `uid: "it-runbook"` and
-      `id: "payments-gateway-it-runbook"` are two namespaces for one document, and
-      `kb_lint.py:223` resolves refs against **both**, so a corpus can grow two
-      disjoint link graphs that both lint clean. Decide, record in the contract.
-- [ ] **P5.7 — Section-anchored knowledge.** `request_spec` never tells the model
-      that `relations` need `s`/`o`, that entities need `name`, or that `ref`
-      exists — so `{"p": "runs_on"}` is a schema-valid relation and "which section
-      says this" is unanswerable. Require a `ref` to a section anchor on every
-      record.
-- [ ] **P5.8 — `next_review_due`** derived from `last_reviewed + review_cadence`
-      (tier 1). Four review-lifecycle fields exist and nothing computes the one
-      that would make them actionable.
-- [ ] **P5.9 — Prune what nothing reads.** `requirement_level` is declared
-      RESERVED with no binding field; `classification` and `confidentiality` are
-      two fields for one concept; `aliases` / `prerequisites` / `out_of_scope` have
-      no consumer anywhere. Bind or delete. `_provenance` stores `tier`, which is a
-      pure function of the field name — dropping it removes ~40% of the metadata
-      bytes.
-- [ ] **P5.10 — Entity group governance.** `vocab.group_type("gadgets")` is `""`,
-      so an invented entity group with untyped members passes acceptance
-      unchallenged and is written stamped `generated`.
-- [ ] **P5.11 — Corpus soundness at scale.** `_PAIRWISE_CAP = 4000`
-      (`_corpus.py:66`) falls back to first-two-character bucketing, which is
-      explicitly unsound, exactly when the corpus is big enough to need it — and
-      `keywords` is seeded from every SCREAMING_SNAKE token in every body. Replace
-      with sound blocking, and `log()` every truncation.
-- [ ] **P5.12 — One unreadable bundle must not silently disable corpus
-      integrity.** `kb_lint.py:216` sets `partial` on any unreadable document,
-      which sets `known_ids = None` and skips `see_also` resolution, graph, skew
-      and coverage — reported as a single INFO line. At 1000 bundles that is a
-      clean-looking all-clear.
-- [ ] **P5.13 — Registry promotion should not invalidate the whole answer
-      cache.** `prompt_sha` includes `vocab.version`, so every promotion round
-      forces a full-corpus re-ask — and promotion is manual (`kb_lint` prints
-      candidates; nothing writes `vocab.yaml`). Scope the cache key to the fields
-      whose spec actually changed, and add a `--promote` writer.
+- [x] **P5.1 — Deterministic `title`.** `title` **stays tier 2** — naming a
+      document is judgement, and a model that read the body can beat any rule.
+      What changed is that it is never PENDING, because a floor and a ceiling are
+      different things. *Which floor a model may replace is decided by where the
+      floor came from*: `source_title` is `extracted` (the author typed it into
+      the document's own properties — evidence, protected, refused with
+      `kept-extracted`), while a first heading or a filename stem is `derived`,
+      because both are inferences that can be junk (`1. Introduction`, `Copy of
+      report FINAL v3`). Authored-wins is untouched and still checked first.
+- [x] **P5.2 — Deterministic `abstract` floor.** Scans from the outline's first
+      `line_span` so detected TOC furniture is behind it, and falls back to the
+      top of the body when there is no `structure.json` — a floor must not be
+      conditional on a file that may be absent.
+- [x] **P5.3 — Verified links.** The grep the plan asked for, run on HEAD:
+      `enrich_metadata.py` had **no** match for `structure` or `outline` and one
+      for `links` — a docstring. It never opened the file holding the evidence.
+      Now every outline `{text, url, line}` becomes a `links` record carrying
+      `ref: "#<section anchor>"` at `source: extracted`. The origin is recorded
+      **per record, not per field**: a single `extracted` stamp on the block would
+      vouch for the model's guesses too, so the field-level provenance reports the
+      *weakest* origin present. A document with no links still gets a provenance
+      record — "looked, found none" must never read as "never looked".
+- [x] **P5.4 — A permalink.** `--source-base-url` / `DOC2MD_SOURCE_BASE_URL` →
+      `meta.source.url`. With no base the url is still written, percent-encoded
+      and relative: `uri` is a filesystem path (spaces, `#`, `?`) and cannot be
+      pasted into a link, `url` always can. A base is never invented.
+- [x] **P5.5 + P5.6 — one decision, not two.** Uniqueness and canonical identity
+      are the same problem, and solving them separately is what produced two
+      namespaces in the first place.
+- [x] **P5.7 — Section-anchored knowledge.** `relations` now require `s/p/o/ref`,
+      records and group members require a `ref`, and `request_spec` publishes the
+      required keys plus a **SECTION ANCHORS** block — so the constraint shapes
+      generation instead of only costing an answer. Rejections are named
+      (`missing-required-<keys>`, `ref-not-a-fragment`, `ref-not-an-anchor`). With
+      no anchors supplied the check is **skipped, never passed**: this package
+      never sees the body and must not pretend to have resolved a pointer.
+- [x] **P5.8 — `next_review_due`** derived from `last_reviewed + review_cadence`.
+      The `authored_only` question answered rather than dodged: the flag means *no
+      tier-2 machinery may write it* — a model must not guess a review date. This
+      is not a guess. Both inputs are authored, the rule is arithmetic, and the
+      output restates a commitment the person already made. Nothing is written
+      when either input is missing, and a model's value is still refused outright.
+- [x] **P5.9 — Prune what nothing reads.** Deleted with the reason recorded:
+      `classification` (a second spelling of `confidentiality`), `aliases`,
+      `prerequisites`, `out_of_scope`, and — found by the new inventory test —
+      `short_title`. `requirement_level` deleted from `vocab.yaml`, which had said
+      to delete it if body-level extraction never landed; it did not.
+      `_provenance.tier` dropped (a pure function of the field name), and in
+      exchange `value_sha` is now written for **every** machine source rather than
+      only `generated` — which is what makes a hand-edited harvested link
+      detectable. `SCHEMA_VERSION` 2 → 3, because an inventory move is exactly
+      what that number versions. Existing values of removed fields are *carried*,
+      not deleted; they simply stop being requested or graded.
+- [x] **P5.10 — Entity group governance.** An invented group with untyped members
+      no longer passes acceptance unchallenged.
+- [x] **P5.11 — Corpus soundness at scale.** Measured before deciding, over 1000
+      synthetic specs: **24,630** distinct `keywords` terms, **44.5%** used by a
+      single document, 6,526 promotion candidates printed on one ~100 KB line —
+      and `keywords.singleton_rate` reported **`0.000 → ok`** throughout, because
+      it counts only *promoted* terms. The registry was drowning and the health
+      line said fine.
+      `_PAIRWISE_CAP`'s unsound first-two-character bucketing is replaced by an
+      inverted index over multiset **bigrams** with a per-pair overlap floor —
+      **complete**, zero false negatives, not an approximation. The width is
+      derived, not chosen: a shingle width `q` gives a guarantee only when
+      `t > 2(q-1)/(2q-1)`, so at the shipped threshold 0.78 trigrams are *unsound*
+      — the trigram version was built and measured, and it **dropped 616 of
+      101,044 true pairs while reporting itself complete**. Verified against the
+      exhaustive sweep: 101,044 pairs both ways, 0 missed, 0 extra, 59.6 s → 15.3 s.
+      Orientation is preserved because `difflib.ratio()` is **not symmetric**
+      (0.786 one way, 0.429 the other on a measured pair). Two new findings —
+      `synonym-sweep-scoped` and `registry-flood` — carry the excluded counts, so
+      a narrowed sweep can never read as a complete one.
+- [x] **P5.12 — One unreadable bundle no longer buys the corpus an amnesty.** The
+      enumerated list of what a single unparseable file used to switch off *for
+      every other document*: `see_also` resolution, the whole graph report
+      (dangling refs, incomplete relations, endpoint coverage, orphans), both
+      schema-skew gates, all three coverage gates, and vocabulary usage — reported
+      as one INFO line. `partial` now means only "the operator asked for a subset",
+      which is the legitimate reason it exists; an unreadable document is an ERROR
+      **about that document**, plus a warning naming each affected check with its
+      `N of M` denominator. Whatever is still skipped is named individually.
+- [x] **P5.13 — Promotion no longer invalidates the whole answer cache**, and
+      `kb_lint --promote` writes `config/vocab.yaml` through the same restricted
+      YAML reader that parses it, so the round-trip is closed.
 
 ## P6 — Regrade
 
-- [ ] **P6.1** Re-run the four-lens adversarial review against a fresh live run
-      after each of P0/P2/P3/P4/P5. Findings become new slices here; a lens may
-      not award A without naming the evidence.
-- [ ] **P6.2** Both rings green (host 3.6.8 and 3.6.8 with PyYAML blocked), evals
-      green, drift tests green.
-- [ ] **P6.3** Stop only when all four dimensions are A or better **and** every
-      rubric row above has a passing check.
+- [x] **P6.1** Re-run the four-lens adversarial review against a fresh live run.
+      Run 2026-08-21 with **six** lenses rather than four — the four output
+      dimensions, plus one whose only job was to make the pipeline ship a
+      corrupted document with every gate green, and one attacking **the grader
+      itself**, on the principle that a rubric which can be talked into an A is
+      worth less than no rubric. Findings become new slices here.
+- [x] **P6.2** Every ring green, measured rather than assumed:
+
+      | Ring | What it reproduces | Result |
+      |---|---|---|
+      | host `python3` (3.6.8) | the interpreter the office lane must run on | 984 passed, 0 failed |
+      | 3.6.8 with PyYAML blocked via `sys.meta_path` | CI's `python:3.6-slim`, which installs only pytest | 984 passed, 0 failed |
+      | `python3.11`, pytest only, no Pillow | CI's `tests-modern` | 984 passed, 0 failed |
+      | `evals/run_eval.py --skip-pdf` | the pinned corpus | 19 pass, 0 fail, 3 skip |
+      | `scripts/grade_output.py` | this rubric | 32 pass, 0 fail, 0 skip |
+
+      Note the repo's own `.venv` reports ~20 failures in the caption and figure
+      tests. Those are the **known Pillow artifact** — the venv carries Pillow as
+      a docling dependency, which changes the synthetic-PNG path; neither the host
+      nor CI's `tests-modern` has it, and the failures are confined to
+      `image_caption` / `caption_bundles` / `validate_figures`, none of which this
+      work touches. Reproducing CI honestly meant finding an interpreter with
+      pytest and no Pillow, not shrugging at the venv.
+- [x] **P6.4 — A defect the regrade itself surfaced.** The eval went 19/0, then
+      18/2, then 17/3 on consecutive runs while other work used LibreOffice.
+      Chasing "flaky" rather than shrugging at it found the cause: the office
+      lane's `soffice --convert-to` carried **no `-env:UserInstallation`**, so
+      every invocation shared `~/.config/libreoffice` — and LibreOffice
+      single-instances on that profile, so a second concurrent conversion attaches
+      to the first process and silently converts nothing. `evals/gen_corpus.py`
+      had isolated its profile all along; the lane had not. Any sharded corpus,
+      CI matrix, or second user on the host was racing. Fixed with a throwaway
+      profile per conversion; six consecutive eval runs under the same load are
+      now clean, and `test_each_soffice_conversion_gets_its_own_user_profile`
+      keeps it that way. *A flaky test is a defect report you have not read yet.*
+- [x] **P6.5 — The regrade broke its own gate, and the gate got wider.** Before
+      trusting the six lenses, I attacked `structure_fidelity` myself, and it
+      fell. Swapping two values between rows of an escalation table — SEV1 now
+      paging the platform rota instead of the payments rota — passed **every**
+      gate: `token_recall: 1.0`, `structure_fidelity: pass`, zero deltas, zero
+      structural errors. So did swapping two steps of a numbered procedure. The
+      compared facts were counts and *dimensions*; a value that moves without
+      changing either is invisible to all of them, and the token gate is a
+      multiset, so order was never in scope there either.
+      Closed by comparing **content in place**: `tables` now carries the tokens of
+      every cell, and `list_item_words` the text of every item in order. Content
+      is compared as tokens, so escaping and emphasis markers are not differences,
+      and a vertical merge is forward-filled on *both* sides because repeating the
+      value is declared policy. Both attacks are pinned as regression tests that
+      assert the old gate is blind and the new one is not. No false failures: the
+      whole eval corpus and the adversarial fixture still pass.
+- [ ] **P6.3 — NOT YET. The A was claimed, attacked, and taken away.**
+      `grade_output.py` printed `OVERALL A (32 pass, 0 fail, 0 skip)` and all three
+      rings were green. Six adversarial lenses then reproduced, end to end through
+      `build_bundle.py` and cross-checked against LibreOffice reading the same
+      bytes, enough to refute it:
+
+      | dimension | the grader said | the review found |
+      |---|---|---|
+      | A `document.md` | A | **D** |
+      | B `report.json` | A | **C** |
+      | C `structure.json` | A | **D** |
+      | D metadata | A | **C** |
+      | E documentation | A | **B+** |
+
+      The decisive piece of evidence: a Word document whose headings use a
+      corporate template style (`NimbusH1 basedOn="Heading1"` — the most ordinary
+      thing a real `.docx` does) converts with **every heading deleted**.
+      LibreOffice renders two `<h1>`; doc2md emits four undifferentiated
+      paragraphs, `structure.json` publishes a single `(preamble)` node, and the
+      report says `status: ok`, `token_recall: 1.0`,
+      `structure_fidelity.gate: "pass"`, `deltas: []`, `warnings: []`. That is
+      verbatim `end-goal.md` §1's own definition of a document that "is not
+      lossless in any useful sense", shipping with the pipeline's unanimous green
+      light — one phase after the phase meant to make it impossible.
+
+      **The lesson is about the rubric, not only the code.** Thirty-two rows all
+      passed over a document that had been silently destroyed, because every row
+      graded a property the corpus under grade happened to exhibit. A rubric is a
+      set of questions, and a question nobody thought to ask is indistinguishable
+      from a question that passes.
+
+      What the review could *not* take away is worth recording too: the P0.1 bug is
+      dead; `token_recall` never moved off 1.0 under any drop that could be
+      constructed; the new content facts caught every permutation, transposition
+      and cell-rotation attempted; the `empty_source` / `unmeasured` /
+      `_nothing_to_grade` discipline held. The gate that exists is well built — it
+      is simply not yet a gate on everything still broken.
+
+## P7 — Close what the regrade opened
+
+Every item was reproduced end to end and cross-checked against an independent
+Office implementation reading the same file. None is theoretical.
+
+- [x] **P7.1 — A renumbered or dissolved procedure, five ways.** The literal
+      marker `1.` is emitted for every ordered item and no list start is ever
+      written; `w:start`, `w:lvlOverride` and `w:startOverride` are read nowhere.
+      A picture inside step 2 closes the list, so steps 3 and 4 render as 1 and 2
+      (LibreOffice emits `<ol start="3">`). Numbering carried by a paragraph
+      *style* — Word's built-in *List Number* — dissolves the list entirely, and
+      **both sides are blind for the same reason**: the `_collect_text` symmetry
+      hole of P3.7, reappearing inside the structure gate.
+- [x] **P7.2 — `w:gridBefore` shifts a row one column left.** A register map
+      publishes a register *named* `0x04` at *offset* `RO`, `status: ok`.
+- [x] **P7.3 — `w:basedOn` is never followed**, so a template heading style
+      deletes every heading (above).
+- [x] **P7.4 — Four heuristics fabricate or reparent outline nodes.** The keyword
+      branch is unbounded: `^(chapter|section|appendix|part)\s+[0-9IVXLA-Z]` under
+      `re.I` makes `[A-Z]` match *any* letter, so `"Section prose."` is a level-1
+      heading. `is_heading` returns `s.count("#")` — the count anywhere in the line
+      — so a heading reading `Issue #42 metastability` is published at level 2.
+      There is no fence tracking, so a shell comment in a transcript becomes a
+      section. `_infer_levels` fires on office bundles despite a comment claiming
+      it cannot.
+- [x] **P7.5 — The anchor schemes disagree and C3's cross-check is dead code.**
+      `# Overview - part 2` → `overview-part-2` from `sections`,
+      `overview---part-2` from `kb`. `_rubric._c3_anchors` reads
+      `knowledge["body_anchors"]`, which is never written, so half that row has
+      never run.
+- [x] **P7.6 — Enrichment records no provenance at all**, while deciding
+      `meta.id`, `meta.uid` and `meta.source.url` — the fields rows D2/D3/D4 grade.
+      Against the owner's goal ("the switches that were used… recorded per run"),
+      this is the central B failure.
+- [x] **P7.7 — Absolute host paths reach published artifacts.** `redact_argv`
+      matches flag names by exact string while argparse accepts prefixes, so
+      `--sr /tmp/x` sails through; `--only` and `--tokenizer` are not redacted at
+      all. Two `CLAUDE.md` files forbid this, and the guard test passed only
+      because it spelled its flags out in full.
+- [x] **P7.8 — `replay_run.py` discards the `--src` it was handed** when the
+      recorded run used the default, and prints a command with no `--src` — which
+      reads whatever `$DOC2MD_SRC` resolves to at replay time. `divergences()`
+      also names three classes it never reads: `run.tools`, `_env_present`, and
+      the `corpus_sha256` it prints.
+- [x] **P7.9 — `unique_id` was not unique by construction.** `spec.docx`,
+      `spec.pptx` and `spec.xlsx` — an ordinary trio in a real corpus — all became
+      `specs/spec`, and both writing scripts exited 0. The extension was stripped
+      *before* the faithfulness test, so it was excluded from the comparison and
+      from the id. Fixed by keeping the extension with its dot and comparing
+      **character for character** rather than after lowercasing: on a
+      case-sensitive filesystem `spec.docx` and `Spec.docx` are two files, and
+      both rendered to one id. 80 paths → 80 distinct ids, verified.
+- [x] **P7.10 — D5 and `kb_lint` disagreed about a lede hyperlink.** A URL in the
+      prose above the first heading sits in a region a renderer emits no fragment
+      for, so `harvested_links` correctly omits `ref` — and the rubric called that
+      a failure while the linter called the same bundle clean. The record does
+      carry the exact body line it came from, which answers "which part of the
+      document says this?" better than a fragment that resolves nowhere. A
+      *model-proposed* record gets no such latitude.
+- [x] **P7.11 — Two documentation claims were false.** `quality-plan.md` said
+      `<stderr>` survives verbatim; it does not, and cannot — `<stderr>` matches
+      CommonMark's raw-HTML tag-name production, so unescaped a renderer swallows
+      it. The claim was corrected and recorded as a deviation rather than the
+      probe list quietly trimmed to fit. `provenance/CLAUDE.md` asserted that "the
+      parity test enforces" decision-code documentation; no such test existed, so
+      one was written rather than the claim softened.
+
+**How P7.1–P7.8 were closed, and how that was checked.** Each fix was verified in
+**both** directions, which is the discipline the phase is really about: the
+corruption must now fail the gate, *and* ordinary documents must still pass it. A
+gate that refuses more correct documents than it catches wrong ones is not a gate.
+Reintroducing each defect in the converter alone now produces
+`token_recall: 1.0, gate: pass` from the token gate and `structure_fidelity:
+fail` with a named delta — `ordered_numbers [1,2,3,4,5…] vs [1,2,3,1,2…]`,
+`tables` with the row's cells one column out, `headings {1: 2} vs {}` — exit 1,
+and no `document.md` written.
+
+Two of the fixes came with **named drops** rather than silence, because CommonMark
+cannot express what Word meant: `decimalised_list_numbering` (an `A.`/`iii.` list
+keeps its position and loses its label) and `lifted_text_boxes`. A visible loss
+beats a silent one.
+
+The compared fact vector is now **thirteen** facts: `ordered_numbers` joined it,
+because a per-depth *count* and a *total* both stay constant when a list splits or
+restarts — which is precisely why five separate constructs could renumber a
+procedure with every gate green.
+
+- [ ] **P7.12 — The regrade's remaining findings, not yet triaged.** The six
+      lenses produced far more than the blockers above; the full report is in the
+      session transcript. Carried forward rather than dropped, roughly in order of
+      harm: a `--force` rebuild can publish a `knowledge.json` describing the
+      previous document; `replay --compare` can print `REPRODUCED` for a bundle it
+      did not reproduce, and its exit codes cannot distinguish the two; a second
+      run over a changed corpus keeps the stale bundle and logs a clean skip;
+      `section_id` can collide and produce a self-parent cycle; `fingerprint` is
+      byte-identical across the exact P0.1 renumbering bug; nothing verifies
+      `markdown_sha256` in the metadata lane, so a stale one propagates into
+      `knowledge.json`; the `ref` rule does not bind for a mapping-shaped
+      `entities` group; every table's first row is forced into the header, so a
+      headerless table silently relabels a data row; foot/endnote and comment
+      ANCHORS are still deleted from the body while the notes survive as
+      unattributable bullets. **None of these is speculative** — each was
+      reproduced end to end.
 
 ---
 
@@ -419,3 +695,6 @@ Kept here so they are decisions, not drift.
 | argv recorded with `<src>`/`<out>` placeholders + a source-root hash | Record real paths | `CLAUDE.md` forbids absolute host paths; the hash still proves tree identity |
 | Docs land in P1, before the features that will change them | Document last | The drift test makes every later phase update its own reference for free |
 | `structure_fidelity` hard-fails office, `best-effort` on PDF | Uniform gate | Same asymmetry, same reason, as losslessness: PDF has no ground-truth semantic tree |
+| Table spans **flatten into real GFM rows**, and every flattened span is counted in a `flattened_table_spans` warning | Emit a raw-HTML `<table>` island per spanned table | Four table detectors in this repo are pipe-shaped — `content.tables`, `structure.json`'s node tables, `_chunk._table_headers`, and P3.1's `md_structure` — so an island is invisible to all of them and reads as a *missing* table to the fidelity gate landing in the same phase. Worse, it would **lie** to that gate: `md_structure` counts `**bold**` inside an island that CommonMark renders as literal asterisks, which is exactly the "trust the emitter's intent" failure P3 exists to stop. Flattening keeps rows × cols equal to the OOXML grid and keeps each row self-contained for row-wise chunking — the reason `vMerge` is already forward-filled — and costs only the visual span, which the warning makes measurable instead of silent |
+| `<stderr>` is escaped (`\<stderr>`) while `[payments]` is not | Store every identifier verbatim | A bracket alone can never be a link — this converter emits no link reference definition for a shortcut reference to resolve against — so escaping it bought nothing and cost grep-ability. `<stderr>` matches CommonMark's raw-HTML tag-name production, so unescaped a renderer **swallows it**: the choice is a visible backslash or an invisible identifier, and a rubric row that claimed otherwise was corrected rather than the probe list quietly trimmed to fit |
+| Emphasis is emitted faithfully even when a run boundary falls **mid-word** (`Dma**ArbiterUnit**`) | Suppress markers that would sit inside a word, to keep the identifier greppable | The `\_` decision (P0.3) removed pure noise: a single intraword underscore can never be emphasis, so escaping it bought nothing. `**` is not noise — it carries the fact that the document bolded that text. `markdown_to_text` strips the markers before tokenizing, so the identifier is intact in the text layer the index and the KB actually consume; what is lost is a raw grep of `document.md` for the unsplit identifier. Recorded in `evals/expectations.json` so the tradeoff is visible where it bites |

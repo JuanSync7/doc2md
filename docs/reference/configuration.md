@@ -91,11 +91,23 @@ Never touches `document.md`, `status`, or the losslessness verdict.
 Writes the `meta:` block into `document.md` front matter, the graph payload into
 `knowledge.json`, and the `doc_meta` gate into `report.json`.
 
+**This stage is a writer, and it records itself like one.** Every run appends a
+`runs.jsonl` row (`entrypoint: enrich_metadata`, the resolved configuration with
+the source of each value), one `manifest.jsonl` row per document per run
+(`stage: enrich_metadata`, `action` one of `enriched` / `unchanged` / `failed` /
+`deferred`), an entry in each report's `runs[]`, and `decisions[]` records carrying
+`stage: enrich_metadata`. Before that it recorded nothing at all: a run with
+`--namespace` and `--source-base-url` rewrote `meta.id`, `meta.uid` and
+`meta.source.url` while `report.json`, `runs.jsonl` and `manifest.jsonl` stayed
+byte-identical, so the switches that produced the corpus you are reading were
+recoverable from no artifact. `replay_run.py --stage enrich_metadata` replays it.
+
 | Flag | Default | What changes in the output |
 |---|---|---|
-| `--bundles` | `data/bundles` | Bundle root to walk. |
-| `--vocab` | `$DOC2MD_VOCAB` / `config/vocab.local.yaml` / `config/vocab.yaml` | Which term list values are checked against. Changes `vocab_version` in every written block **and** `prompt_sha`, so it re-asks the model. |
-| `--namespace` | `""` | Prefix for the derived `uid` — e.g. an org or corpus name, so ids from two corpora cannot collide. |
+| `--bundles` | `data/bundles` | Bundle root to walk. Also where this stage's `manifest.jsonl` and `runs.jsonl` rows land — the same files the writers append to, since it is the same root. Recorded as `<src>` in `run.argv`, because it is the root a replay must be handed back. |
+| `--vocab` | `$DOC2MD_VOCAB` / `config/vocab.local.yaml` / `config/vocab.yaml` | Which term list values are checked against. Changes `vocab_version` in every written block **and** `prompt_sha`, so it re-asks the model. Recorded as a `vocabulary_selected` decision. Note a path here is redacted to `<path>` in `argv`, so `replay_run.py` refuses to reconstruct that run rather than guessing a vocabulary file — supply it by hand. |
+| `--namespace` | `""` | Prefix for the derived `id` (and its `uid` alias) — e.g. an org or corpus name, so ids from two corpora cannot collide. Changing it **rewrites every id in the corpus**, which orphans every `see_also` that used the old one. Recorded verbatim in `run.argv`, as `cli.namespace` in the run row, and as an `identity_namespace` decision in every report — so the corpus can say which namespace produced the ids in it. |
+| `--source-base-url` | `$DOC2MD_SOURCE_BASE_URL` / `""` | Where the source documents are served. Sets `meta.source.url`, the page's link home. With a base it is absolute (`https://intranet/docs/specs/a%20b.docx`); **without one it is still written**, as a relative URI reference — the same information as `source.uri` but percent-encoded and forward-slashed, so it can be pasted into a link instead of only read. Trailing slashes on the base are ignored. Recorded as `cli.source_base_url` in the run row **with the source of the value**, which matters here more than anywhere: taken from the environment it appears in no `argv`, so a run reproduced without it would silently publish a corpus of different links. Also a `permalink_base` decision (`absolute` or `relative`) in every report. |
 | `--only` / `--limit` | (none) / `0` | Narrow the pass. Skipped documents keep whatever they had. |
 | `--force` | off | Re-ask the model for **every** field, not only the empty ones. Authored values are still never overwritten. |
 | `--no-cache` | off | Ignore stored answers; **still writes the fresh ones**. |
@@ -103,8 +115,8 @@ Writes the `meta:` block into `document.md` front matter, the graph payload into
 | `--excerpt-chars` | `12000` | How much body the model sees. Truncation is announced in the prompt header. Raising it changes `prompt_sha` and re-asks the corpus. |
 | `--keyword-limit` | `120` | How many tier-1 identifier candidates are offered as `keywords` seeds. |
 | `--run-id` | UTC timestamp | Stamped into `meta.extraction.run_at`. A run that changes nothing does **not** re-stamp it — that is what keeps re-runs byte-identical. |
-| `--fail-on-pending` | off | Exit `3` when any model-writable field is still empty. Off by default: a deterministic run leaves 20 fields pending *by design*, and that is a complete success, not a failure. |
-| `--vlm-url` | `""` | **A model is used iff this is non-empty.** Omit it and the run is deterministic-only: tiers 0 and 1 fill, all 20 model-writable fields stay `pending`, and `doc_meta.gate` is `disabled`. |
+| `--fail-on-pending` | off | Exit `3` when any model-writable field is still empty. Off by default: a deterministic run leaves 13 fields pending *by design*, and that is a complete success, not a failure. |
+| `--vlm-url` | `""` | **A model is used iff this is non-empty.** Which way it went is a `metadata_tier` decision (`model` or `deterministic`) in every report. Omit it and the run is deterministic-only — but not empty: `title`, `abstract` and `links` are still filled from the source's own title property, its lede paragraph and the URLs harvested into `structure.json`, and only the 13 fields that need judgement stay `pending`. `doc_meta.gate` is `disabled`. |
 | `--vlm-model` | `$DOC2MD_VLM_MODEL` / `qwen2.5-vl-7b` | Model name requested and recorded in `doc_meta.model`. Part of `prompt_sha`, so swapping models re-asks. |
 
 ### `replay_run.py` — repeat a recorded run
@@ -115,14 +127,45 @@ compare the result.
 
 | Flag | Default | What it does |
 |---|---|---|
-| `--report` | (required) | The `report.json` whose run to replay. Follows its `config_ref` into `runs.jsonl` for the resolved settings. |
-| `--src` / `--out` | `""` | You supply these: the recorded `argv` carries `<src>` / `<out>` placeholders, because publishing an absolute host path is forbidden. `source_root_id` confirms you pointed at the same tree. |
+| `--report` | (required) | The `report.json` whose run to replay. Follows its `config_ref` into `runs.jsonl` for the resolved settings, matching on `(run_id, entrypoint)` — pinning a build and an enrichment to the same `--run-id` is normal, so an id alone does not name a row. |
+| `--stage` | `""` (the writer) | Which recorded run to replay: an `entrypoint` from the report's `runs[]`, e.g. `enrich_metadata`. A bundle is written by more than one stage, and which one you are repeating has to be sayable. An unknown name lists what the report has and exits `1`. |
+| `--src` | `""` | The root the replay READS: source documents for the writers, the bundle root for `enrich_metadata`. **Always applied, whether or not the recorded run named one.** A run that took the default recorded no `--src` switch at all, so a replay that only filled placeholders printed a command with no `--src` — which reads from whatever `$DOC2MD_SRC` resolves to *now*, silently replaying a different corpus while the divergence list said "different directory". |
+| `--out` | `""` | The root the replay WRITES. Same forcing rule. Stages that rewrite in place (`enrich_metadata`) take none, and the tool does not ask you for one. |
 | `--execute` | off | Actually run it. Without this, nothing is changed — the command and the divergences are printed. |
 | `--compare` | off | After executing, compare `markdown_sha256` with the original and say `REPRODUCED` or `DIFFERENT`. |
+
+**What counts as a divergence** — six classes, each a way the replay could produce
+a different answer:
+
+| Kind | Compared against | Why it matters |
+|---|---|---|
+| `code` | `pyproject.toml` + `.git` here | A different commit, or either checkout dirty. |
+| `host` | this interpreter | `python` and `implementation`. |
+| `tools` | a probe per external binary | `run.tools` re-asked here — today `soffice`. A tool with **no probe** on this interpreter is reported as UNVERIFIED, not passed over: "I could not check the toolchain" is not "the toolchain is the same". |
+| `config` | the ingest loader, re-resolved | Any resolved setting whose value moved, or that no longer exists. |
+| `env` | `os.environ` | The `DOC2MD_*` names that were merely **present** (`_env_present`), added or removed — a variable equal to the default moves no value and still changes what a person must set up. Plus any `cli.*` setting whose value came from a variable that now reads differently. |
+| `source` / `corpus` | the tree you passed as `--src` | This document's `source_sha256`, re-hashed; and `corpus_sha256` recomputed over exactly the documents the recorded run read (from its manifest rows, so `--only` and `--limit` runs stay checkable). `source_root_id` only ever answered "same *directory*?"; an edited file in the same directory used to replay clean and then produce different markdown. Skipped for a bundles root, where `source_relpath` does not resolve. |
 
 Exit codes: `0` all clear, `3` divergences found (or the replay produced a
 different hash), `1` a usage or I/O error. Divergences are **reported, never
 auto-corrected** — a silent "close enough" is how a replay comes to mean nothing.
+
+### `grade_output.py` — the rubric, as a command
+
+Builds a small corpus (including a deliberately adversarial document), converts it,
+enriches it with **no model**, and evaluates every row of the rubric in
+[`../quality-plan.md`](../quality-plan.md). Prints a letter per output dimension.
+
+| Flag | Default | What changes in the output |
+|---|---|---|
+| `--workdir` | a temp dir | Where the graded corpus is built. Supplying it also **keeps** it — the artifacts are the evidence behind each verdict, so a named workdir is never deleted. |
+| `--keep` | off | Keep a temp workdir too, and print its path. Use when a row fails and you want to read the bundle that failed it. |
+| `--no-suites` | off | Grade artifacts only. The rows backed by a pytest target report `skip` — and **a skip is never an A**, so this is for a fast inner loop, never for claiming a grade. |
+| `--json` | off | Emit `{summary, rows}` instead of the table, for CI. |
+
+Exit codes: `0` every dimension is A, `1` not yet, `2` the graded run itself broke.
+A row whose named test file does not exist yet reports `skip`, not `fail`: an
+absent check is a missing measurement, and the rubric refuses to score it either way.
 
 ### `kb_lint.py` — the metadata linter
 
@@ -133,11 +176,12 @@ the questions a single document structurally cannot answer.
 |---|---|---|
 | `--bundles` | `data/bundles` | Corpus to walk. |
 | `--vocab` | resolved as above | The term list findings are graded against. |
-| `--only` / `--limit` | (none) / `0` | Narrow the walk — and this **sets `partial`**, which deliberately skips the four corpus gates a truncated walk would invert (graph, skew, coverage, vocabulary usage). They are named in the output rather than silently dropped. |
-| `--json` | `""` | Also write the full machine-readable report to this path. |
-| `--strict` | off | Warnings fail the run too. Default: only errors do. |
+| `--only` / `--limit` | (none) / `0` | Narrow the walk — and this **sets `partial`**, which deliberately skips the four corpus gates a truncated walk would invert (graph, skew, coverage, vocabulary usage). Each skipped gate gets its own `corpus-check-skipped` INFO naming the question it stopped answering, not one joined list. `partial` also refuses `--promote`. |
+| `--json` | `""` | Also write the full machine-readable report to this path. Adds `corpus_metrics.synonyms.<field>.swept` / `.not_swept` — how many terms the similarity sweep covered, and how many it did not. |
+| `--strict` | off | Warnings fail the run too. Default: only errors do. Note `synonym-sweep-scoped` and `registry-flood` are warnings, so a flooded registry fails a `--strict` run. |
 | `--quiet` | off | Suppress per-document detail. Never hides a finding that decides the exit code. |
 | `--suggest-aliases` | off | Print paste-ready `aliases:` entries for the spelling collisions found. Proposals only — nothing is written to `config/vocab.yaml`. |
+| `--promote` | off | **Writes `config/vocab.yaml`** (or `--vocab`): every registry term on `>= promote_at` documents is spliced into that vocabulary's `values:` and the file's `version:` is bumped by one. Only the `values:` entry is rewritten, so comments, `rationale` and `rules` survive. Idempotent — a second run finds the terms already governed, writes nothing, and leaves the file byte-identical. Refused outright on an `--only`/`--limit` walk (a document-frequency count over a chosen subset promotes terms the corpus never voted for) and refused if the rewritten file does not load back through `load_vocab`. After it runs, the promoted terms stop being reported in `<field>_proposed` only once `enrich_metadata.py` re-runs over each document. |
 
 ---
 
@@ -151,6 +195,7 @@ the questions a single document structurally cannot answer.
 | `heal_supervisor.py` | Elastic self-healing supervisor for the PDF lane | `--max-workers`, `--ramp-secs`, `--tick`, `--stall-secs`, `--busy-ticks`, `--drain-secs`, `--max-respawns`, `--worker-cmd`, `--status-file`, `--status-only` |
 | `image_enrich.py` | Corpus-global figure captioning, flat layout | `--assets` |
 | `validate_markdown.py` | Second-pass markdown tree validator | `--md-dir`, `--json`, `--strict` |
+| `coverage_report.py` | Corpus-wide coverage summary: worst documents first, with the tokens and the figures actually lost | `--dir`, `--worst`, `--min-tokens` (below this a recall ratio is noise, and the count excluded is reported), `--fail-under` (makes it a CI step), `--json` |
 | `validate_figures.py` | Second-pass figure auditor | `--assets`, `--explain` |
 | `prefetch_docling_models.py` | Pin and materialise the model weights | `--dest` |
 | `setup_libreoffice.py` | Vendor a relocatable LibreOffice | `--rpms`, `--force`, `--uninstall` |
@@ -175,6 +220,7 @@ the questions a single document structurally cannot answer.
 | `DOC2MD_LIBREOFFICE` | (search) | Explicit `soffice` path. Precedence: this > `vendor/libreoffice` > `PATH`. |
 | `DOC2MD_PDF_PYTHON` | unset | The 3.12+docling interpreter. Unset means the PDF lane is **SKIPPED** in evals, never silently passed. |
 | `DOC2MD_VOCAB` | `config/vocab.yaml` | Vocabulary file; `config/vocab.local.yaml` is tried in between. |
+| `DOC2MD_SOURCE_BASE_URL` | `""` | Where the sources are served, for `meta.source.url`. `--source-base-url` overrides it. Empty leaves the url **relative**, not absent — see the flag. |
 
 ### Measurement thresholds (these move gates)
 
@@ -266,16 +312,38 @@ Recorded because they cost time, not because they are elegant.
    could never exit `0` and broke every `set -e` chain — while `report.json` called
    the same state `doc_meta.gate: "disabled"`. Now: `0` success, `1` a document
    failed, and `3` only with `--fail-on-pending`.
-4. **Five fields can never reach `filled` today.** `subtype`, `tags`, `keywords`,
-   `topics` and `audience` are registries that ship empty, so even a fully
-   classified document reports `pending: 5` until terms are promoted — and
-   promotion is manual (`kb_lint` prints candidates; nothing writes the file).
+4. **Five fields ship as empty registries.** `subtype`, `tags`, `keywords`,
+   `topics` and `audience` start with `values: []`, so a fully classified document
+   reports `pending: 5` until terms are promoted. `kb_lint --promote` is what
+   writes them; without it the candidates are printed and nothing changes.
 5. **Promoting a term re-asks the whole corpus.** `prompt_sha` includes
-   `vocab.version`, so bumping it invalidates every cached answer.
-6. **`--force` blanks the caption attribution.** The captions themselves are
+   `vocab.version`, so bumping it — which `--promote` does — invalidates every
+   cached answer, including for documents whose field specs did not change.
+6. **A flooded registry reads as healthy.** `singleton_rate` is computed over
+   *promoted* terms, so a registry holding 24,000 un-promoted proposals reports
+   `rate=0.00 ok`. The `registry-flood` warning is the check that sees it: it
+   fires when a registry field holds more distinct terms than the corpus has
+   documents and at least a quarter of them are used once.
+7. **The similarity sweep is complete, but its SCOPE can narrow.** Blocking is
+   sound at every corpus size — nothing is skipped for being big. Past
+   `lint.similarity_max_terms` (default 4000) distinct terms in one registry
+   field, the sweep is scoped to terms on `>= promote_at` documents and says so
+   in a `synonym-sweep-scoped` warning carrying both counts. The exact-collision
+   check still covers every term.
+8. **`--force` blanks the caption attribution.** The captions themselves are
    carried forward by `image_id`, but `captions.model` and `captions.prompt_sha`
    are reset to `""`, leaving captions with no attributable model.
-7. **A malformed env value is silently the default.** Only
+9. **A malformed env value is silently the default.** Only
    `DOC2MD_INGEST_BACKEND` complains.
-8. **`--limit` and `--only` produce a partial corpus.** `kb_lint` says so
-   (`partial`, with the skipped gates named); the bundle writers do not.
+10. **`--limit` and `--only` produce a partial corpus.** `kb_lint` says so
+    (`partial`, with each skipped gate named individually); the bundle writers do
+    not.
+11. **An unreadable document is a finding about that document, not about the
+    corpus.** It used to set `partial`, which switched off `see_also` resolution
+    and the four whole-corpus gates for every *other* document — at 1000 bundles,
+    a clean-looking all-clear over a corpus nobody checked. Now every gate still
+    runs, the unreadable file gets its own `corpus-unreadable` error, and one
+    `corpus-denominator` warning names each check whose denominator excludes it. A
+    `see_also` that would have resolved into the unreadable document is still
+    reported unresolved — with the count of unreadable documents named in the
+    finding, so it cannot be mistaken for a confirmed dead link.

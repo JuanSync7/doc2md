@@ -48,12 +48,17 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 _REPO = os.path.dirname(_HERE)
 sys.path.insert(0, os.path.join(_REPO, "src"))
 
+# How many promotion candidates one field prints before the rest are counted. A list
+# long enough to scroll is not a work queue; the count and --json carry the rest.
+_PROMOTE_SHOWN = 12
+
 from backend.ingest import (render_block, split_front_matter,   # noqa: E402
                             YamlSubsetError)
-from backend.kb import (body_anchors, check_schema_bindings,   # noqa: E402
+from backend.kb import (apply_promotions, body_anchors,       # noqa: E402
+                        check_schema_bindings,
                         corpus_findings, corpus_report, in_knowledge,
                         knowledge_payload, lint_document, load_vocab, merge_meta,
-                        meta_collisions, Finding,
+                        meta_collisions, vocab_path, Finding, VocabularyError,
                         DOCUMENT_FILE, KNOWLEDGE_FILE, META_KEY, PROVENANCE_KEY,
                         ERROR, VERDICT_SPARSE)
 
@@ -174,10 +179,16 @@ def main(argv=None):
     ap.add_argument("--suggest-aliases", action="store_true",
                     help="print paste-ready `aliases:` entries for the spelling "
                          "collisions found (does not edit the vocabulary)")
+    ap.add_argument("--promote", action="store_true",
+                    help="WRITE the promotion candidates into the vocabulary file: "
+                         "every registry term on >= promote_at documents becomes a "
+                         "governed value and `version` is bumped. Safe to run twice; "
+                         "refused on a --only/--limit walk")
     args = ap.parse_args(argv)
 
     if not os.path.isdir(args.bundles):
         ap.error("bundle root not found: %s" % args.bundles)
+    vocab_file = args.vocab or vocab_path()
     vocab = load_vocab(args.vocab or None)
     missing_bindings = check_schema_bindings(vocab)
     if missing_bindings:
@@ -213,12 +224,17 @@ def main(argv=None):
             continue
         docs.append({"path": path, "fm": fm, "meta": meta, "anchors": anchors,
                      "duplicated": dup})
-    # A document that could not be READ truncates the corpus exactly as --only does,
-    # and the corpus gates cannot tell the difference: a see_also pointing at the
-    # unreadable document reads as a dead link, and the newest schema version may be
-    # sitting inside it. Treating only the flags as narrowing let a single tab-indented
-    # front matter manufacture corpus findings the corpus does not have.
-    partial = narrowed or bool(deferred) or bool(unreadable)
+    # PARTIAL MEANS THE OPERATOR ASKED FOR A SUBSET — nothing else. `--only` and
+    # `--limit` choose which documents exist for this run, so every corpus rate would
+    # be a rate over a deliberate selection and the whole-corpus gates are skipped.
+    #
+    # An unreadable document is NOT that. It is a defect in one file, and letting it
+    # set `partial` handed the entire corpus an amnesty: at 1000 bundles, one
+    # tab-indented front matter turned see_also resolution, the graph, skew, coverage
+    # and vocabulary-usage gates off for the other 999 and reported the result as a
+    # single INFO line. It is reported per document instead, and the checks keep
+    # running with their denominator named.
+    partial = narrowed or bool(deferred)
     known_ids = set()
     for d in docs:
         for key in ("id", "uid"):
@@ -270,7 +286,7 @@ def main(argv=None):
                 print("%s  no metadata block (run enrich_metadata.py)" % rel)
             continue
         res = lint_document(d["meta"], vocab, anchors=d["anchors"],
-                            known_ids=known_ids)
+                            known_ids=known_ids, unreadable=len(unreadable))
         for name in d.get("duplicated") or []:
             # Two live copies of one field. `merge_meta` picks a winner so readers
             # see one view, and the next enrichment run rewrites the loser away — so
@@ -323,10 +339,18 @@ def main(argv=None):
     corpus = corpus_report([d["meta"] for d in graded], vocab)
     report["corpus"] = corpus
     report["partial"] = partial
-    print("\nREGISTRY HEALTH (corpus-wide)%s"
-          % ("  [PARTIAL: --only/--limit is in effect, so see_also resolution is "
-             "skipped and promotion counts are incomplete]" if partial else ""))
+    banner = ""
+    if partial:
+        banner = ("  [PARTIAL: --only/--limit is in effect, so see_also resolution "
+                  "is skipped and promotion counts are incomplete]")
+    elif unreadable:
+        # Not the same sentence, because it is not the same state: the counts below
+        # are real, they are simply over the documents that parsed.
+        banner = ("  [%d document(s) unreadable — the counts below exclude them; "
+                  "each is reported by name in the corpus gates]" % len(unreadable))
+    print("\nREGISTRY HEALTH (corpus-wide)%s" % banner)
     failing = 0
+    promote_at = int(vocab.threshold("promote_at", 3))
     for name, row in corpus.items():
         flag = "FAIL" if row["failing"] else "ok"
         failing += 1 if row["failing"] else 0
@@ -335,8 +359,19 @@ def main(argv=None):
                  row["singleton_rate"], row["singleton_rate_max"],
                  len(row["proposed"]), flag))
         if row["promote"]:
-            print("      promote (>= %d docs): %s"
-                  % (int(vocab.threshold("promote_at", 3)), ", ".join(row["promote"])))
+            # CAPPED, and the cap says what it dropped. A silicon corpus of 1000
+            # documents put 6,526 keyword candidates on this line — ~100KB of
+            # comma-separated text that no operator reads and that hides every other
+            # field's candidates above and below it.
+            shown = row["promote"][:_PROMOTE_SHOWN]
+            extra = len(row["promote"]) - len(shown)
+            print("      promote (>= %d docs): %d candidate(s)%s: %s%s"
+                  % (promote_at, len(row["promote"]),
+                     "" if not extra else " (%d shown)" % len(shown),
+                     ", ".join(shown),
+                     "" if not extra else ", ... and %d more (--json for the "
+                                          "full list, --promote to write them)"
+                                          % extra))
 
     # The gates no single document can run. `partial` is passed through rather than
     # worked around: on a truncated walk the whole-corpus checks are SKIPPED and say
@@ -344,7 +379,9 @@ def main(argv=None):
     # links, a wrong "current" schema version and dead vocabulary terms.
     cres = corpus_findings([{"path": os.path.relpath(d["path"], args.bundles),
                              "meta": d["meta"]} for d in graded],
-                           vocab, partial=partial)
+                           vocab, partial=partial,
+                           unreadable=["%s: %s" % (os.path.relpath(p, args.bundles), e)
+                                       for p, e in unreadable])
     report["corpus_findings"] = [list(f[:4]) + [list(f.detail)]
                                  for f in cres["findings"]]
     report["corpus_metrics"] = cres["metrics"]
@@ -423,6 +460,92 @@ def main(argv=None):
             print("# NOT aliasable (not a valid vocabulary key) — fix at the "
                   "source: %s" % line)
 
+    promote_failed = False
+    if args.promote:
+        # THE MISSING WRITER. Promotion was frequency-counted, printed, and then left
+        # for somebody to hand-copy — so `<field>_proposed` grew forever and every
+        # classified document stayed `pending` on terms the corpus had long earned.
+        #
+        # Refused on a narrowed walk, and only there: promotion is a DOCUMENT-COUNT
+        # decision, and `--only`/`--limit` chooses which documents exist. Counting
+        # three uses out of a five-document slice of a thousand promotes a term the
+        # corpus never voted for, permanently.
+        promotions = OrderedDict()
+        blocked = []  # type: list
+        for name, row in corpus.items():
+            vname = row["vocab"]
+            for term in row["promote"]:
+                if term in vocab.aliases(vname):
+                    # An alias source is not a term: admitting it as a value would
+                    # make the file self-inconsistent and load_vocab would refuse it.
+                    blocked.append("%s: %r is an alias of %r"
+                                   % (vname, term, vocab.aliases(vname)[term]))
+                    continue
+                if term not in promotions.setdefault(vname, []):
+                    promotions[vname].append(term)
+        promotions = OrderedDict((k, v) for k, v in promotions.items() if v)
+        if partial:
+            promote_failed = True
+            print("\n  [promote] REFUSED: this walk covered a subset (%s), so a "
+                  "document-frequency count over it would promote terms the corpus "
+                  "has not used %d times" % (narrowed_by or "partial",
+                                             int(vocab.threshold("promote_at", 3))))
+        elif not promotions:
+            print("\n# nothing has reached the promotion threshold — vocabulary "
+                  "unchanged")
+        else:
+            if unreadable:
+                # Under-counting only ever promotes FEWER terms, so this is safe to
+                # proceed through — but the operator is told, because the candidate
+                # list they are approving is not over the whole corpus.
+                print("\n  [promote] %d document(s) were unreadable, so these counts "
+                      "are a floor" % len(unreadable))
+            try:
+                with open(vocab_file, encoding="utf-8") as fh:
+                    before = fh.read()
+                after, applied = apply_promotions(before, promotions)
+                # VERIFIED THROUGH THE SAME READER that will load it in anger. A
+                # writer that renders what its own parser cannot read back is how a
+                # vocabulary file becomes unloadable in CI instead of here.
+                check = load_vocab(text=after)
+                for vname, terms in applied.items():
+                    unseen = [t for t in terms if t not in check.values(vname)]
+                    if unseen:
+                        raise VocabularyError(
+                            "%s: %s did not survive the round trip"
+                            % (vname, ", ".join(unseen)))
+            except (OSError, VocabularyError, YamlSubsetError) as e:
+                promote_failed = True
+                print("\n  [promote] REFUSED: %s (vocabulary unchanged)" % e)
+            else:
+                if not applied:
+                    print("\n# every candidate is already a governed term — "
+                          "vocabulary unchanged")
+                else:
+                    tmp = "%s.tmp.%d" % (vocab_file, os.getpid())
+                    try:
+                        with open(tmp, "w", encoding="utf-8") as fh:
+                            fh.write(after)
+                        os.replace(tmp, vocab_file)
+                    except OSError as e:
+                        promote_failed = True
+                        try:
+                            os.unlink(tmp)
+                        except OSError:
+                            pass
+                        print("\n  [promote] could not write %s: %s"
+                              % (vocab_file, e))
+                    else:
+                        print("\n# promoted into %s (version %s -> %s)"
+                              % (vocab_file, vocab.version, check.version))
+                        for vname in sorted(applied):
+                            print("#   %s: %s" % (vname, ", ".join(applied[vname])))
+                        print("#   re-run enrich_metadata.py to move these out of "
+                              "`<field>_proposed` in each document")
+        for line in blocked:
+            print("#   NOT promoted (already an alias) — merge it at the source: %s"
+                  % line)
+
     fail_ratio = float(vocab.threshold("facet_fail", 0.75))
     over = worst_ratio > fail_ratio
     if json_failed:
@@ -445,7 +568,7 @@ def main(argv=None):
     # corpus health rather than a defect, so it never fails a default run — but
     # printing FAIL and then exiting 0 unconditionally made the word meaningless.
     failed = (bool(n_err) or bool(cres["errors"]) or over or bool(unreadable)
-              or json_failed
+              or json_failed or promote_failed
               or (args.strict and (n_warn > 0 or cres["warnings"] > 0
                                    or failing > 0)))
     return 1 if failed else 0

@@ -271,3 +271,47 @@ def test_setup_is_installed_reflects_vendored_tree(tmp_path, monkeypatch):
     os.makedirs(str(prog))
     (prog / "soffice").write_text("x")
     assert su.is_installed() is True              # wrapper + target binary present
+
+
+def test_each_soffice_conversion_gets_its_own_user_profile(tmp_path, monkeypatch):
+    """LibreOffice single-instances on its user profile.
+
+    Without ``-env:UserInstallation`` every invocation shares
+    ``~/.config/libreoffice``, so a second concurrent ``--convert-to`` attaches to
+    the first process and silently converts nothing. The symptom is a
+    NONDETERMINISTIC ``libreoffice-convert-failed`` on a document that converts
+    perfectly on its own — which is exactly what it looked like here: six eval runs
+    under load gave 18/2, 17/3, 19/0 before this, and six clean runs after.
+    ``evals/gen_corpus.py`` had isolated its profile all along; the lane had not.
+    """
+    oc = _mod("office_convert")
+    seen = {}
+
+    def fake_check_output(argv, **kwargs):
+        seen["argv"] = list(argv)
+        # Produce the file soffice would have produced, so the caller succeeds.
+        outdir = argv[argv.index("--outdir") + 1]
+        src = argv[-1]
+        stem = os.path.splitext(os.path.basename(src))[0]
+        with open(os.path.join(outdir, stem + ".docx"), "wb") as fh:
+            fh.write(b"PK\x03\x04")
+        return b""
+
+    monkeypatch.setattr(oc.subprocess, "check_output", fake_check_output)
+    src = tmp_path / "legacy.doc"
+    src.write_bytes(b"\xd0\xcf\x11\xe0")
+    out = oc.soffice_to_ooxml("soffice", str(src), "docx")
+    assert out, "the stub conversion should have succeeded"
+
+    profiles = [a for a in seen["argv"] if a.startswith("-env:UserInstallation=")]
+    assert len(profiles) == 1, seen["argv"]
+    path = profiles[0].split("=", 1)[1]
+    assert path.startswith("file://"), path
+    home = os.path.expanduser("~")
+    assert not path[len("file://"):].startswith(home), (
+        "the profile must not be the user's shared LibreOffice profile: %s" % path)
+
+    # Two conversions must not share a profile, or they race with each other.
+    oc.soffice_to_ooxml("soffice", str(src), "docx")
+    second = [a for a in seen["argv"] if a.startswith("-env:UserInstallation=")][0]
+    assert second != profiles[0], "both conversions reused one profile directory"

@@ -39,10 +39,13 @@ import unicodedata
 from collections import namedtuple, Counter, OrderedDict
 from difflib import SequenceMatcher
 
+from backend.ingest import parse_block, render_block
+
 from ._lint import ERROR, INFO, WARN
 from ._schema import FIELDS, field, group_vocab, proposed_key, record_vocab
 
-__all__ = ["CorpusFinding", "corpus_findings", "alias_suggestions", "norm_key",
+__all__ = ["CorpusFinding", "apply_promotions", "corpus_findings",
+           "alias_suggestions", "norm_key",
            "strip_polarity", "identity_report", "synonym_report", "entity_report",
            "graph_report", "skew_report", "coverage_report", "vocabulary_hygiene",
            "vocabulary_usage"]
@@ -61,9 +64,11 @@ _POLARITY = ("does_not_", "did_not_", "do_not_", "cannot_", "can_not_", "not_",
 
 _DETAIL_CAP = 12
 
-# Above this many distinct strings the O(n^2) similarity sweep is bucketed by the
-# first two characters instead of run in full. Announced, never silent.
-_PAIRWISE_CAP = 4000
+# Above this many distinct terms in ONE registry field the similarity sweep narrows
+# its SCOPE (not its method — see `_similar_pairs`, which is complete at every size)
+# to terms the corpus has actually corroborated. Announced with its size, never
+# silent. Overridable as `lint.similarity_max_terms`.
+_SWEEP_MAX_TERMS = 4000
 
 # Most similarity findings a single scope may report. Past this the list has stopped
 # being a work queue and started being a wall, so the rest are COUNTED rather than
@@ -274,63 +279,197 @@ def _is_series(a, b, skeleton):
     return a != b and skeleton[a] == skeleton[b]
 
 
-def _similar_pairs(keys, threshold, similar_ok, scope, cap=_PAIRWISE_CAP,
-                   max_pairs=_FINDING_CAP):
-    # type: (list, float, set, str, int, int) -> tuple
-    """``([(a, b, ratio)], bucketed, dropped)`` for strings that look like each other.
+def _shingles(key, q):
+    # type: (str, int) -> list
+    """MULTISET q-grams of ``key`` as ``(gram, occurrence-index)`` tokens.
 
-    Three filters, cheapest first, and the first two are SOUND — they can only
+    The occurrence index is what makes the token list a multiset rather than a set,
+    and the bound in ``_shingle_plan`` is a multiset bound: a matching block of
+    length L contributes L-q+1 gram OCCURRENCES to both strings, and for any gram
+    value the number of such occurrences is at most ``min(count_a, count_b)``. Fold
+    the duplicates away into a set and the bound is no longer valid — measured on a
+    1000-document register corpus, a set-valued index dropped 616 of 101,044 true
+    pairs while claiming to be complete.
+    """
+    seen = {}
+    out = []  # type: list
+    for i in range(len(key) - q + 1):
+        g = key[i:i + q]
+        n = seen.get(g, 0)
+        seen[g] = n + 1
+        out.append((g, n))
+    return out
+
+
+def _shingle_plan(threshold):
+    # type: (float) -> tuple
+    """``(q, min_len)`` — the widest SOUND shingle for ``threshold``, and from what
+    length it is usable. ``(0, 0)`` means no shingle is sound at this threshold.
+
+    THE BOUND, because a blocking key nobody can check is how the previous version
+    (bucket by the first two characters) shipped a sweep with unknown recall.
+
+    Write ``S = la + lb``. A reported pair has ``ratio = 2M/S >= t``, so
+    ``M >= tS/2``. The matching blocks number ``k``; every extra block needs an
+    unmatched character on at least one side, so ``k <= (S - 2M) + 1``. A block of
+    length ``L`` contributes ``L - q + 1`` shared gram occurrences (never negative),
+    so the multiset shingle intersection obeys::
+
+        shared >= M - k(q-1) >= M(2q-1) - (q-1)(S+1) >= S[(2q-1)t/2 - (q-1)] - (q-1)
+
+    That is positive for every S only when ``t > 2(q-1)/(2q-1)``: q=2 needs
+    ``t > 0.667``, q=3 needs ``t > 0.8``, q=4 needs ``t > 0.857``. The shipped
+    threshold is 0.78, so BIGRAMS are the widest sound width — trigrams look more
+    selective and are simply wrong here, which is measurable rather than arguable.
+
+    ``min_len``: the bound only guarantees a shared shingle once it reaches 1, i.e.
+    ``S >= q / [(2q-1)t/2 - (q-1)]``. Combined with the length filter
+    (``S >= l(1+bound)``) that is a floor on the key's own length. Keys under it are
+    swept exhaustively — sound, and few: 11 of 6,497 on the register corpus.
+    """
+    bound = threshold / (2.0 - threshold) if threshold < 2.0 else 1.0
+    for q in (2,):
+        slope = (2 * q - 1) * threshold / 2.0 - (q - 1)
+        if slope <= 0:
+            continue
+        min_s = q / slope
+        min_len = int(min_s / (1.0 + bound))
+        while min_len * (1.0 + bound) < min_s:
+            min_len += 1
+        return (q, max(q, min_len))
+    return (0, 0)
+
+
+def _alpha(la, lb, q, threshold):
+    # type: (int, int, int, float) -> float
+    """Shingles a pair MUST share to be able to reach ``threshold`` (see the bound)."""
+    s = la + lb
+    return threshold * s / 2.0 * (2 * q - 1) - (q - 1) * (s + 1)
+
+
+def _similar_pairs(keys, threshold, similar_ok, scope, max_pairs=_FINDING_CAP):
+    # type: (list, float, set, str, int) -> tuple
+    """``([(a, b, ratio)], stats, dropped)`` for strings that look like each other.
+
+    COMPLETE at every corpus size — no pair that clears ``threshold`` is skipped,
+    which is the whole point of this rewrite. The previous version fell back to
+    bucketing by the first two characters above 4000 distinct strings, and that
+    bucketing is unsound in exactly the direction that matters: ``kubernetes`` and
+    ``ubernetes`` (a dropped leading character — the commonest paste defect there
+    is) land in different buckets and are never compared. Recall dropped silently to
+    an unknown number at precisely the corpus size where near-duplicates start to
+    matter.
+
+    Four filters, cheapest first, and every one of them is SOUND — each can only
     discard pairs that could never have cleared the threshold:
 
-      LENGTH   ``ratio = 2M/(la+lb)`` and ``M <= min(la, lb)``, so a pair can only
-               reach ``t`` if the shorter is at least ``t/(2-t)`` of the longer.
-               Keys are sorted by length, so the scan can stop early instead of
-               testing the rest.
-      SERIES   identical apart from digits — an enumerated family, not a typo.
-      QUICK    ``real_quick_ratio``/``quick_ratio`` are difflib's own upper bounds,
-               so the O(n*m) comparison runs only for genuine candidates.
+      LENGTH    ``ratio = 2M/(la+lb)`` and ``M <= min(la, lb)``, so a pair can only
+                reach ``t`` if the shorter is at least ``t/(2-t)`` of the longer.
+      SHINGLE   an inverted index over multiset bigrams, with the per-pair floor
+                ``_alpha``. This is the blocking: candidates come from the postings
+                of the probe's own shingles instead of from the whole corpus.
+      SERIES    identical apart from digits — an enumerated family, not a typo.
+      QUICK     ``real_quick_ratio``/``quick_ratio`` are difflib's own upper bounds,
+                so the O(n*m) comparison runs only for genuine candidates.
 
-    Above ``cap`` distinct strings the sweep additionally buckets by the first two
-    characters. That one is NOT sound — it misses a pair differing in its opening
-    letters — so the caller is told, because a narrowed sweep reported as a clean
-    one is a false all-clear. Findings are capped at ``max_pairs`` with the
-    remainder counted, for the same reason.
+    COMPLEXITY. Exhaustive is O(n^2) pair tests; blocked is O(sum of posting lengths
+    touched), which is data-dependent but bounded by the same worst case. Measured on
+    the 1000-document register corpus below (6,497 distinct keys, 101,044 true
+    pairs — a deliberately adversarial shape, since every key is drawn from one
+    naming template): 58.3s exhaustive vs 16.2s blocked, same 101,044 pairs, zero
+    missed and zero extra. The win is smaller than a textbook LSH would promise
+    because at t=0.78 the neighbourhood genuinely is large; the point is that the
+    result is now the SAME result, not a cheaper approximation of it.
+
+    ``stats`` carries the sweep's shape (terms, how many were compared exhaustively
+    because they are too short to block, the shingle width) so the caller can
+    disclose it. Findings are still capped at ``max_pairs`` with the remainder
+    counted, because a cap that does not say what it dropped reads as "this is all
+    of them".
     """
-    keys = sorted(set(k for k in keys if k), key=lambda k: (len(k), k))
-    skeleton = dict((k, _digit_skeleton(k)) for k in keys)
-    bucketed = len(keys) > cap
-    if bucketed:
-        buckets = OrderedDict()
-        for k in keys:
-            buckets.setdefault(k[:2], []).append(k)
-        groups = list(buckets.values())
-    else:
-        groups = [keys]
-
+    order = sorted(set(k for k in keys if k), key=lambda k: (len(k), k))
+    skeleton = dict((k, _digit_skeleton(k)) for k in order)
     # Minimum shorter/longer length ratio that can still reach `threshold`.
     bound = threshold / (2.0 - threshold) if threshold < 2.0 else 1.0
+    q, min_len = _shingle_plan(threshold)
     out = []  # type: list
     sm = SequenceMatcher(None)
-    for group in groups:
-        for i, a in enumerate(group):
-            la = len(a)
-            sm.set_seq2(a)                       # seq2 is the cached side
-            for b in group[i + 1:]:
-                if la < bound * len(b):
-                    break                        # sorted by length: no later b can
-                if _is_series(a, b, skeleton):
-                    continue
-                sm.set_seq1(b)
-                if sm.real_quick_ratio() < threshold:
-                    continue
-                if sm.quick_ratio() < threshold:
-                    continue
-                r = sm.ratio()
-                if r >= threshold and not _accepted(similar_ok, scope, a, b):
-                    out.append((a, b, r))
+
+    def keep(a, b, ratio):
+        # `a` is always the earlier key in `order`, so the pair is oriented exactly
+        # as the exhaustive sweep oriented it. That is not cosmetic: difflib's
+        # ratio() is NOT symmetric (measured: `ddrmstraddrset` vs `ddrslvaddr5set`
+        # is 0.786 one way and 0.429 the other), so swapping the operands would
+        # change WHICH pairs a corpus reports.
+        if ratio >= threshold and not _accepted(similar_ok, scope, a, b):
+            out.append((a, b, ratio))
+
+    # Phase 1 — keys too short for the shingle bound to bite. Every pair involving
+    # one of them is swept here, in full. They sort first (they are the shortest),
+    # so scanning forward from each covers every such pair exactly once.
+    short = [i for i, k in enumerate(order) if q == 0 or len(k) < min_len]
+    for i in short:
+        a = order[i]
+        la = len(a)
+        sm.set_seq2(a)                           # seq2 is the cached side
+        for b in order[i + 1:]:
+            if la < bound * len(b):
+                break                            # sorted by length: no later b can
+            if _is_series(a, b, skeleton):
+                continue
+            sm.set_seq1(b)
+            if sm.real_quick_ratio() < threshold:
+                continue
+            if sm.quick_ratio() < threshold:
+                continue
+            keep(a, b, sm.ratio())
+
+    # Phase 2 — the blocked sweep over everything else. Walked in REVERSE order so
+    # the probe is always the earlier key and the index holds the later ones; that
+    # keeps the orientation above and lets seq2 stay cached across a whole probe.
+    blocked = [k for k in order if not (q == 0 or len(k) < min_len)]
+    index = OrderedDict()
+    tokens = OrderedDict((k, _shingles(k, q)) for k in blocked)
+    compared = 0
+    for a in reversed(blocked):
+        la = len(a)
+        ta = tokens[a]
+        cand = Counter()
+        for g in ta:
+            posting = index.get(g)
+            if posting:
+                cand.update(posting)
+        sm.set_seq2(a)
+        for b, shared in cand.items():
+            lb = len(b)
+            if la < bound * lb:
+                continue
+            need = _alpha(la, lb, q, threshold)
+            if shared < need:
+                continue
+            if _is_series(a, b, skeleton):
+                continue
+            compared += 1
+            sm.set_seq1(b)
+            if sm.real_quick_ratio() < threshold:
+                continue
+            if sm.quick_ratio() < threshold:
+                continue
+            keep(a, b, sm.ratio())
+        for g in ta:
+            index.setdefault(g, []).append(a)
+
     out.sort(key=lambda t: (-t[2], t[0], t[1]))
     dropped = max(0, len(out) - max_pairs)
-    return (out[:max_pairs], bucketed, dropped)
+    stats = OrderedDict([
+        ("terms", len(order)),
+        ("shingle", q),
+        ("blocked_terms", len(blocked)),
+        ("exhaustive_terms", len(short)),
+        ("compared", compared),
+        ("complete", True),
+    ])
+    return (out[:max_pairs], stats, dropped)
 
 
 # --------------------------------------------------------------- row plumbing
@@ -517,6 +656,9 @@ def synonym_report(docs, vocab):
     rows, findings = _rows(docs)
     threshold = float(_threshold(vocab, "synonym_similarity", 0.78))
     similar_ok = _parse_similar_ok(_threshold(vocab, "similar_ok", []) or [])
+    max_terms = int(_threshold(vocab, "similarity_max_terms", _SWEEP_MAX_TERMS))
+    corroborated_at = int(_threshold(vocab, "promote_at", 3))
+    min_docs = int(_threshold(vocab, "corpus_min_docs", 5))
 
     registry_fields = [f.name for f in FIELDS
                        if f.vocab and _has(vocab, f.vocab)
@@ -571,14 +713,72 @@ def synonym_report(docs, vocab):
                 ["%s (%d doc%s)" % (m, len(where[m]), "" if len(where[m]) == 1 else "s")
                  for m in sorted(members, key=lambda m: (-len(where[m]), m))]))
 
-        pairs, bucketed, dropped = _similar_pairs(list(groups.keys()), threshold,
-                                                  similar_ok, vname)
-        if bucketed:
+        # DOCUMENT frequency per identity, so the scope floor below counts concepts
+        # rather than spellings — the same rule the collision check groups by.
+        key_docs = OrderedDict()
+        for key, members in groups.items():
+            seen_docs = set()
+            for m in members:
+                seen_docs |= where[m]
+            key_docs[key] = len(seen_docs)
+
+        # SCOPE, not method: `_similar_pairs` is complete at every size, so nothing
+        # here is a recall trade in the algorithm. What a huge registry field costs
+        # is ATTENTION — measured on 1000 synthetic silicon specs, `keywords` held
+        # 24,630 distinct terms and produced 371,223 similar pairs, of which the
+        # report can show 25. Past `max_terms` the sweep therefore asks its question
+        # only about terms the corpus has corroborated on `promote_at` documents,
+        # which is the same threshold that decides whether a term is real at all.
+        # Every excluded term is still covered by the exact-collision check above,
+        # and the count is reported — a narrowed sweep read as a clean one is the
+        # false all-clear this package exists to prevent.
+        sweep_keys = list(groups.keys())
+        excluded = 0
+        if len(sweep_keys) > max_terms:
+            kept = [k for k in sweep_keys if key_docs[k] >= corroborated_at]
+            excluded = len(sweep_keys) - len(kept)
+            sweep_keys = kept
             findings.append(_f(
-                "synonym-sweep-bucketed", INFO, name,
-                "%d distinct terms exceeds the pairwise cap, so the similarity sweep "
-                "was bucketed by leading characters — pairs differing in their first "
-                "two characters were not compared" % len(groups)))
+                "synonym-sweep-scoped", WARN, name,
+                "%d distinct terms is past the %d-term sweep cap, so the SIMILARITY "
+                "sweep was scoped to the %d term(s) on >= %d document(s); %d "
+                "single-use term(s) were not compared to each other (the exact "
+                "collision check above still covers all %d)"
+                % (len(groups), max_terms, len(sweep_keys), corroborated_at,
+                   excluded, len(groups))))
+
+        # A registry that grows a term per document is not a vocabulary. This is the
+        # `keywords` failure directly: seeded from every SCREAMING_SNAKE token in
+        # every body, it reached 24,630 terms over 1000 documents (44.5% of them used
+        # once, 6,526 at once "ready for promotion"). Neither the singleton rate nor
+        # the similarity sweep can say that — the singleton rate is computed over
+        # PROMOTED terms and reads 0.00 while the registry drowns.
+        hapax = sum(1 for k, n in key_docs.items() if n <= 1)
+        # More distinct terms than DOCUMENTS is the load-bearing half — a curated
+        # registry converges, so passing one term per document means it never will.
+        # The hapax share is the guard against firing on a large but real vocabulary
+        # that every document draws from.
+        if (len(rows) >= min_docs and len(groups) > len(rows)
+                and hapax * 4 >= len(groups)):
+            findings.append(_f(
+                "registry-flood", WARN, name,
+                "%d distinct terms across %d document(s), %d of them (%.0f%%) used "
+                "by a single document — a registry growing faster than the corpus is "
+                "an extractor writing free text into a governed field. Cap what seeds "
+                "`%s`, or regovern it."
+                % (len(groups), len(rows), hapax, 100.0 * hapax / len(groups), name),
+                ["%s (1 doc)" % m for m in
+                 sorted(k for k, n in key_docs.items() if n <= 1)]))
+
+        pairs, stats, dropped = _similar_pairs(sweep_keys, threshold,
+                                               similar_ok, vname)
+        if stats["exhaustive_terms"] and stats["terms"] > max_terms:
+            findings.append(_f(
+                "synonym-sweep-scope", INFO, name,
+                "similarity sweep compared %d term(s) in full: %d through the "
+                "bigram index and %d too short to block" % (
+                    stats["terms"], stats["blocked_terms"],
+                    stats["exhaustive_terms"])))
         if dropped:
             findings.append(_f(
                 "synonym-similar-truncated", WARN, name,
@@ -600,6 +800,13 @@ def synonym_report(docs, vocab):
             ("terms", len(where)),
             ("collisions", collisions),
             ("similar_pairs", len(pairs)),
+            # The sweep's own shape, in the machine-readable report as well as in
+            # the printed findings: a consumer must be able to see that a number
+            # was computed over a scoped set without parsing prose.
+            ("swept", stats["terms"]),
+            ("not_swept", excluded),
+            ("similar_pairs_dropped", dropped),
+            ("single_document_terms", hapax),
         ])
     return {"findings": findings, "metrics": metrics, "aliases": suggestions}
 
@@ -682,14 +889,19 @@ def entity_report(docs, vocab):
                 ["%s in %s" % (t, ", ".join(sorted(by_type[t])[:3]))
                  for t in sorted(by_type)]))
 
-    pairs, bucketed, dropped = _similar_pairs(list(groups.keys()), threshold,
-                                              similar_ok, "entities")
-    if bucketed:
+    pairs, sweep, dropped = _similar_pairs(list(groups.keys()), threshold,
+                                           similar_ok, "entities")
+    if sweep["terms"] > int(_threshold(vocab, "similarity_max_terms",
+                                       _SWEEP_MAX_TERMS)):
+        # Entities are NOT scoped by document frequency the way a registry field is:
+        # an entity named by one document is still a node in the graph, and a
+        # misspelling of it is still two nodes. The sweep is complete here at any
+        # size; what the operator is told is what it cost.
         findings.append(_f(
-            "entity-sweep-bucketed", INFO, "entities",
-            "%d distinct entity names exceeds the pairwise cap, so the similarity "
-            "sweep was bucketed by leading characters — near-duplicates differing in "
-            "their first two characters were not compared" % len(groups)))
+            "entity-sweep-scope", INFO, "entities",
+            "%d distinct entity names swept in full — %d through the bigram index, "
+            "%d too short to block; no pair was skipped"
+            % (sweep["terms"], sweep["blocked_terms"], sweep["exhaustive_terms"])))
     if dropped:
         findings.append(_f(
             "entity-similar-truncated", WARN, "entities",
@@ -1043,10 +1255,10 @@ def vocabulary_hygiene(vocab):
                     "the closed vocabulary itself lists %d terms that reduce to one "
                     "stem — a document using either is legal, so the split is "
                     "invisible in every document" % len(members), members))
-        # A curated term list is small by construction, so it is never bucketed and
+        # A curated term list is small by construction, so it is never scoped and
         # never truncated — both are corpus-scale concessions and neither applies to
         # a file somebody hand-maintains.
-        pairs, _b, _d = _similar_pairs([norm_key(v) for v in values], threshold,
+        pairs, _s, _d = _similar_pairs([norm_key(v) for v in values], threshold,
                                        similar_ok, name)
         by_key = OrderedDict((norm_key(v), v) for v in values)
         for a, b, ratio in pairs:
@@ -1160,19 +1372,32 @@ def _threshold(vocab, name, default):
     return default if val is None else val
 
 
-# Checks a TRUNCATED corpus cannot answer. The split is not stylistic: a subset can
-# only ever MISS a collision, never invent one, so identity/synonym/entity stay
-# honest on a partial walk. The four below invert under truncation — a `see_also`
-# whose target was excluded reads as dead, the newest schema version may be sitting
-# in a document that was skipped, a coverage rate is a rate over the wrong
-# denominator, and a term used only by an excluded document reads as dead. Each
-# would report a defect the corpus does not have, which is worse than reporting
-# nothing.
-_NEEDS_WHOLE_CORPUS = ("graph", "skew", "coverage", "vocab_usage")
+# Checks a TRUNCATED corpus cannot answer, each with what it stops answering. The
+# split is not stylistic: a subset can only ever MISS a collision, never invent one,
+# so identity/synonym/entity stay honest on a partial walk. The four below invert
+# under truncation — a `see_also` whose target was excluded reads as dead, the newest
+# schema version may be sitting in a document that was skipped, a coverage rate is a
+# rate over the wrong denominator, and a term used only by an excluded document reads
+# as dead. Each would report a defect the corpus does not have, which is worse than
+# reporting nothing.
+#
+# The descriptions are not decoration. "graph, skew, coverage, vocab_usage were
+# SKIPPED" is a line an operator reads past; naming what each one stops answering is
+# what makes the cost of a narrowed run legible.
+_NEEDS_WHOLE_CORPUS = OrderedDict([
+    ("graph", "see_also resolution across the corpus, orphan counts, and the "
+              "relation-endpoint resolution rate"),
+    ("skew", "which documents a schema_version / vocab_version bump has to "
+             "backfill, and which carry no version at all"),
+    ("coverage", "per-field coverage rates, the thin-field warning, and the "
+                 "dead-extractor check (a field populated on no document)"),
+    ("vocab_usage", "which governed terms no document ever draws on, and which "
+                    "are used by exactly one"),
+])
 
 
-def corpus_findings(docs, vocab, partial=False):
-    # type: (object, object, bool) -> dict
+def corpus_findings(docs, vocab, partial=False, unreadable=()):
+    # type: (object, object, bool, object) -> dict
     """Grade a whole corpus. ``docs`` is ``[{"path", "meta"}]`` or ``[(path, meta)]``.
 
     Returns ``{"findings": [CorpusFinding], "metrics": {check: {...}}, "aliases":
@@ -1180,9 +1405,21 @@ def corpus_findings(docs, vocab, partial=False):
     int}``. Never raises on bad data — a malformed row is a finding, for the same
     reason ``lint_document`` never raises: the linter reports the corpus it has.
 
-    ``partial=True`` says the caller walked a SUBSET (``--only``/``--limit``). The
-    four checks that would then invert are skipped and named in ``skipped``, so a
-    narrowed run cannot manufacture findings out of its own truncation.
+    TWO DIFFERENT KINDS OF INCOMPLETE, and conflating them is what P5.12 fixes.
+
+    ``partial=True`` says the OPERATOR asked for a subset (``--only``/``--limit``).
+    The corpus under grade is then a deliberate selection, every rate would be a rate
+    over the wrong denominator, and the four checks above are skipped — named one by
+    one in ``skipped`` and in the findings, so a narrowed run cannot manufacture
+    findings out of its own truncation.
+
+    ``unreadable`` is a list of documents the corpus HAS and this run could not
+    parse. That is a defect in those documents, not a licence to stop grading the
+    other 999: every check still runs, each unreadable document gets its own ERROR,
+    and one further finding names — individually — each check whose denominator now
+    excludes them, with the count. Treating this as "partial" turned one
+    tab-indented front matter into a clean-looking all-clear over a corpus nobody
+    checked.
 
     ``vocabulary_hygiene`` runs even when ``docs`` is empty, and even when partial. A
     term list is wrong or right on its own, and the most valuable moment to hear
@@ -1214,12 +1451,38 @@ def corpus_findings(docs, vocab, partial=False):
         metrics[name] = result.get("metrics") or OrderedDict()
         for fname, table in (result.get("aliases") or {}).items():
             aliases.setdefault(fname, OrderedDict()).update(table)
-    if skipped:
+    # One finding PER SKIPPED CHECK, not one summarising line. A reader has to be
+    # able to see which question went unanswered without knowing what the words
+    # "graph" and "skew" cover, and a single joined list is exactly the shape that
+    # reads as a formality.
+    for name in skipped:
         findings.append(_f(
-            "corpus-partial", INFO, "corpus",
-            "a subset of the corpus was walked, so %s were SKIPPED — each would "
-            "report defects created by the truncation rather than by the corpus"
-            % ", ".join(skipped)))
+            "corpus-check-skipped", INFO, name,
+            "SKIPPED — the operator narrowed the walk, so this check would report "
+            "defects created by the truncation rather than by the corpus. Not "
+            "answered by this run: %s" % _NEEDS_WHOLE_CORPUS[name]))
+
+    # An unreadable document is a defect in THAT document. It gets its own error,
+    # by name — never a corpus-wide amnesty.
+    bad = ["%s" % (u,) for u in (unreadable or [])]
+    for item in bad:
+        findings.append(_f(
+            "corpus-unreadable", ERROR, item.split(":", 1)[0],
+            "could not be read, so it contributes to NO corpus check — it cannot "
+            "collide, cannot be a see_also target, and is absent from every rate "
+            "below: %s" % item))
+    if bad and not skipped:
+        # The checks still RAN. What changed is the denominator, so say which ones
+        # by name and by how much, rather than switching them off.
+        findings.append(_f(
+            "corpus-denominator", WARN, "corpus",
+            "%d of %d document(s) could not be read; every check below still ran, "
+            "but these %d are missing from each of them"
+            % (len(bad), len(rows) + len(bad), len(bad)),
+            ["%s: %s" % (name, _NEEDS_WHOLE_CORPUS[name])
+             for name in _NEEDS_WHOLE_CORPUS]
+            + ["see_also resolution: a pointer into an unreadable document is "
+               "reported unresolved, with that caveat named in the finding"]))
 
     order = {ERROR: 0, WARN: 1, INFO: 2}
     findings.sort(key=lambda f: (order.get(f.severity, 3), f.code, f.where))
@@ -1242,3 +1505,142 @@ def alias_suggestions(docs, vocab):
     claim that two strings mean the same thing.
     """
     return synonym_report(docs, vocab).get("aliases") or OrderedDict()
+
+
+# --------------------------------------------------------------- promotion
+
+def _flow_open(text):
+    # type: (str) -> int
+    """Net unclosed ``[`` in ``text``, ignoring brackets inside quotes."""
+    depth = 0
+    quote = ""
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if quote:
+            if ch == "\\" and quote == '"':
+                i += 2
+                continue
+            if ch == quote:
+                quote = ""
+        elif ch in ("'", '"'):
+            quote = ch
+        elif ch == "[":
+            depth += 1
+        elif ch == "]":
+            depth -= 1
+        i += 1
+    return depth
+
+
+def _values_span(lines, start, end):
+    # type: (list, int, int) -> tuple
+    """``(first, last_exclusive)`` of the ``values:`` entry inside a field block.
+
+    ``(-1, -1)`` when the field declares none. A flow sequence may wrap over several
+    lines and a block sequence trails its items underneath, so the span is found by
+    following the construct rather than by assuming one line.
+    """
+    for i in range(start, end):
+        line = lines[i]
+        if not line.startswith("  values:"):
+            continue
+        rest = line.split(":", 1)[1].strip()
+        j = i + 1
+        if rest.startswith("["):
+            depth = _flow_open(rest)
+            while depth > 0 and j < end:
+                depth += _flow_open(lines[j])
+                j += 1
+        elif not rest:
+            while j < end and (not lines[j].strip()
+                               or lines[j].startswith("    ")):
+                j += 1
+            while j > i + 1 and not lines[j - 1].strip():
+                j -= 1                       # do not swallow the blank separator
+        return (i, j)
+    return (-1, -1)
+
+
+def _field_span(lines, name):
+    # type: (list, str) -> tuple
+    """``(first, last_exclusive)`` of a top-level ``name:`` block. ``(-1, -1)`` if absent."""
+    head = "%s:" % name
+    for i, line in enumerate(lines):
+        if line.rstrip() != head and not line.startswith(head + " "):
+            continue                         # a nested `  name:` cannot match
+        j = i + 1
+        while j < len(lines):
+            nxt = lines[j]
+            if nxt.strip() and not nxt[:1].isspace() and not nxt.lstrip().startswith("#"):
+                break
+            j += 1
+        return (i, j)
+    return (-1, -1)
+
+
+def apply_promotions(vocab_text, promotions):
+    # type: (str, dict) -> tuple
+    """``(new_text, applied)`` — write promoted terms into a vocabulary file's TEXT.
+
+    ``promotions`` is ``{vocabulary_name: [term]}``; ``applied`` reports what actually
+    changed, which is what makes the operation safe to run twice: a term already in
+    ``values`` is not re-added, and when nothing changes the text is returned byte
+    for byte.
+
+    WHY A SPLICE RATHER THAN A REPARSE-AND-RERENDER. ``config/vocab.yaml`` is a
+    hand-maintained file whose comments, ``rationale`` blocks and ``rules`` lists are
+    the reason anyone can review a governance decision. Round-tripping the whole file
+    through ``parse_block``/``render_block`` would drop every comment and reflow every
+    folded scalar — a writer that destroys the document it edits is not a writer
+    anybody runs twice. Only the ``values:`` entry of a promoted field is replaced.
+
+    The replacement is RENDERED BY ``render_block`` — the same codec that will parse
+    it back — so a term the vocabulary format cannot express is refused here rather
+    than corrupting the file (and a term like ``no`` or ``0644`` comes back as the
+    string it went in as, instead of being retyped by a YAML 1.1 reader).
+
+    A successful promotion also bumps the file's ``version``. That is the package
+    rule — ``version`` moves when the TERMS move, ``SCHEMA_VERSION`` when the field
+    inventory does — and it is what makes ``skew_report`` able to name the documents
+    a promotion invalidates. Nothing applied means nothing bumped.
+    """
+    lines = (vocab_text or "").split("\n")
+    applied = OrderedDict()
+    for name in sorted(promotions or {}):
+        terms = [t for t in (promotions[name] or []) if isinstance(t, str) and t.strip()]
+        if not terms:
+            continue
+        fstart, fend = _field_span(lines, name)
+        if fstart < 0:
+            continue                        # a vocabulary the file does not declare
+        vstart, vend = _values_span(lines, fstart + 1, fend)
+        current = []  # type: list
+        if vstart >= 0:
+            parsed = parse_block("\n".join(
+                l[2:] if l.startswith("  ") else l.strip()
+                for l in lines[vstart:vend]))
+            current = [v for v in (parsed.get("values") or [])
+                       if isinstance(v, str)]
+        added = [t for t in terms if t not in current]
+        if not added:
+            continue                        # already governed: run two writes nothing
+        merged = sorted(set(current) | set(added))
+        block = render_block(OrderedDict([("values", merged)]))
+        rendered = ["  " + l if l else l for l in block.rstrip("\n").split("\n")]
+        if vstart >= 0:
+            lines[vstart:vend] = rendered
+        else:
+            lines[fstart + 1:fstart + 1] = rendered
+        applied[name] = sorted(added)
+    if applied:
+        for i, line in enumerate(lines):
+            if not line.startswith("version:"):
+                continue
+            raw = line.split(":", 1)[1].strip()
+            try:
+                lines[i] = "version: %d" % (int(raw) + 1)
+            except ValueError:
+                pass                        # a hand-written version we cannot count
+            break
+    return ("\n".join(lines), applied)

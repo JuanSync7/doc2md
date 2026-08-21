@@ -271,3 +271,35 @@ def test_every_emitted_warning_code_is_documented():
     assert not missing, (
         "warning codes missing from docs/reference/output-schema.md: %s"
         % ", ".join(missing))
+
+
+def test_the_decision_vocabulary_is_closed_in_both_directions():
+    """`src/backend/provenance/CLAUDE.md` says a code cannot be added without
+    documenting it, "the parity test enforces it".
+
+    It said that while no such test existed — the same shape of claim as
+    `dropped_headers_footers`, which was documented and required and had zero
+    emitters for months. A rule nobody enforces is a rule nobody follows, so this
+    is the enforcement rather than a softened claim.
+    """
+    import sys
+    sys.path.insert(0, os.path.join(REPO, "src"))
+    from backend.provenance import DECISION_CODES
+
+    doc = _read(os.path.join(REPO, "docs", "reference", "output-schema.md"))
+    section = re.search(r"^### `decisions\[\]`(.*?)(?=^#{1,3} |\Z)", doc, re.S | re.M)
+    assert section, "no `decisions[]` section in output-schema.md"
+    documented = set(re.findall(r"`([a-z][a-z0-9_]+)`", section.group(1)))
+
+    undocumented = sorted(set(DECISION_CODES) - documented)
+    assert not undocumented, (
+        "decision codes the pipeline can emit but the contract does not name — a "
+        "reader meeting one in a report has nowhere to look it up: %s" % undocumented)
+
+    # And the other direction: the codes listed after "Codes:" must all be real.
+    listed = re.search(r"^Codes: (.*?)\.$", section.group(1), re.S | re.M)
+    assert listed, "the decisions[] section lists no codes"
+    claimed = set(re.findall(r"`([a-z][a-z0-9_]+)`", listed.group(1)))
+    phantom = sorted(claimed - set(DECISION_CODES))
+    assert not phantom, (
+        "documented decision codes nothing can emit: %s" % phantom)

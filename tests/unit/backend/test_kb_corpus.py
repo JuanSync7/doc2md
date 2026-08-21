@@ -4,8 +4,11 @@ kind: tests
 layer: backend
 summary: The checks one document cannot answer — identity collisions, synonym pollution, entity identity, graph integrity, schema skew, coverage and term-list hygiene.
 """
+import random
+
 import pytest
-from backend.kb import (ERROR, INFO, WARN, alias_suggestions, corpus_findings,
+from backend.kb import (ERROR, INFO, WARN, alias_suggestions, apply_promotions,
+                        corpus_findings,
                         coverage_report, entity_report, graph_report,
                         identity_report, load_vocab, norm_key, skew_report,
                         strip_polarity, synonym_report, vocabulary_hygiene,
@@ -532,7 +535,7 @@ def test_a_field_populated_on_no_document_is_not_silent(vocab):
     rows = [doc("d%d.md" % i, id="x%d" % i, type="runbook") for i in range(10)]
     f = codes(coverage_report(rows, vocab))["coverage-absent"][0]
     assert "relations" in f.detail
-    assert "19 model-written field(s)" in f.message   # named, and counted in full
+    assert "15 model-written field(s)" in f.message   # named, and counted in full
 
     # The contrast that makes it matter: one document populating `risks` warns, so a
     # corpus where NOTHING populates it must not be the quieter of the two.
@@ -653,7 +656,52 @@ def test_a_partial_walk_skips_exactly_the_checks_that_would_invert(vocab):
     assert found["identity-collision"]            # still reported: cannot be false
     assert "see-also-dangling" not in found       # would be an artefact of the cut
     assert "schema-unstamped" not in found
-    assert found["corpus-partial"][0].severity == INFO
+    # NAMED ONE BY ONE, not summarised. "graph, skew, coverage, vocab_usage were
+    # SKIPPED" is a line an operator reads past; a finding per check, each saying
+    # which question went unanswered, is what makes the cost legible.
+    skipped = found["corpus-check-skipped"]
+    assert sorted(f.where for f in skipped) == ["coverage", "graph", "skew",
+                                                "vocab_usage"]
+    assert all(f.severity == INFO for f in skipped)
+    assert "backfill" in [f for f in skipped if f.where == "skew"][0].message
+
+
+def test_one_unreadable_document_is_a_finding_about_it_not_an_amnesty(vocab):
+    # THE P5.12 case. An unreadable document used to set `partial`, which switched
+    # off see_also resolution, the graph, skew, coverage and vocabulary-usage gates
+    # for the WHOLE corpus and reported it as one INFO line. At 1000 bundles that is
+    # a clean-looking all-clear over a corpus nobody checked.
+    rows = [doc("a.md", id="alpha", schema_version=1),
+            doc("b.md", id="beta", schema_version=2)]
+    res = corpus_findings(rows, vocab, unreadable=["c.md: front matter not parseable"])
+    found = codes(res)
+
+    assert res["skipped"] == []                   # nothing was skipped ...
+    assert found["schema-skew"]                   # ... every gate still ran
+    # ... the unreadable document is an ERROR about ITSELF, named individually.
+    bad = found["corpus-unreadable"]
+    assert len(bad) == 1 and bad[0].severity == ERROR
+    assert bad[0].where == "c.md"
+    # ... and the denominator change is disclosed, naming every affected check.
+    note = found["corpus-denominator"][0]
+    assert note.severity == WARN
+    assert "1 of 3" in note.message
+    detail = " ".join(note.detail)
+    for name in ("graph", "skew", "coverage", "vocab_usage", "see_also"):
+        assert name in detail
+
+
+def test_an_operator_narrowed_run_and_an_unreadable_document_are_not_one_state(vocab):
+    # The one legitimate reason `partial` exists is preserved: --only/--limit really
+    # do truncate the walk and really do invert those four gates.
+    rows = [doc("a.md", id="alpha", schema_version=1),
+            doc("b.md", id="beta", schema_version=2)]
+    narrowed = codes(corpus_findings(rows, vocab, partial=True))
+    unread = codes(corpus_findings(rows, vocab, unreadable=["c.md: unreadable"]))
+    assert "schema-skew" not in narrowed          # skipped: the cut would invert it
+    assert unread["schema-skew"]                  # ran: one bad file is not a cut
+    assert "corpus-unreadable" not in narrowed
+    assert "corpus-check-skipped" not in unread
 
 
 def test_findings_are_ordered_by_severity_so_the_first_line_is_the_worst_one(vocab):
@@ -670,3 +718,184 @@ def test_evidence_lists_say_how_much_they_truncated(vocab):
          if x.code == "identity-collision"][0]
     assert len(f.detail) == 13
     assert f.detail[-1] == "... and 18 more"
+
+
+# ------------------------------------------------- blocking soundness at scale
+
+def _filler_entities(n, start=0):
+    """``n`` mutually DISSIMILAR names — corpus bulk, not the thing under test.
+
+    Deliberately not `host-01 .. host-9999`: an enumerated family is suppressed by
+    the series rule, so it would prove nothing about a sweep at size. These are
+    spread over the alphabet so the only near-duplicate in the corpus is the planted
+    one.
+    """
+    rng = random.Random(20260819 + start)
+    letters = "abcdefghijklmnopqrstuvwxyz"
+    out = []
+    while len(out) < n:
+        out.append("".join(rng.choice(letters) for _ in range(12)))
+    return out
+
+
+def _entity_doc(path, names):
+    return doc(path, entities={"software": [{"name": n, "type": "Software"}
+                                            for n in names]})
+
+
+def test_a_near_duplicate_differing_in_its_first_characters_is_found_at_any_size(vocab):
+    # THE defect the old blocking had. Above 4000 distinct strings the sweep used to
+    # bucket by the first two characters, so `kubernetes` and `ubernetes` — a dropped
+    # leading character, the commonest paste defect there is — landed in different
+    # buckets and were never compared. Near-duplicate detection switched itself off
+    # at exactly the corpus size where duplicates start to matter, and said so in one
+    # INFO line nobody reads.
+    #
+    # The property is that the ANSWER does not depend on the corpus size.
+    pair = ["kubernetes", "ubernetes"]
+
+    small = entity_report([_entity_doc("a.md", pair[:1]),
+                           _entity_doc("b.md", pair[1:])], vocab)
+    assert [f for f in small["findings"] if f.code == "entity-similar"]
+
+    # Same pair, buried in 4200 dissimilar names — past the old 4000 cap.
+    bulk = _filler_entities(4200)
+    rows = [_entity_doc("a.md", [pair[0]] + bulk[:2100]),
+            _entity_doc("b.md", [pair[1]] + bulk[2100:])]
+    big = entity_report(rows, vocab)
+    hits = [f for f in big["findings"] if f.code == "entity-similar"]
+    assert hits, "the sweep stopped finding the pair once the corpus grew"
+    assert any("kubernetes" in f.message and "ubernetes" in f.message for f in hits)
+    # ... and the run discloses the sweep's shape rather than a bucketing apology.
+    scope = [f for f in big["findings"] if f.code == "entity-sweep-scope"]
+    assert scope and "no pair was skipped" in scope[0].message
+    assert big["metrics"]["spellings"] == 4202
+
+
+def test_a_large_registry_field_scopes_the_sweep_and_says_by_how_much(vocab):
+    # Scope, not method. Past the term cap the SIMILARITY sweep asks its question
+    # only about terms the corpus corroborated on `promote_at` documents — because
+    # 24,630 keyword proposals produce 371,223 similar pairs and a report can show
+    # 25 of them. The exact-collision check still covers every term, and the number
+    # left out is reported with its threshold.
+    terms = _filler_entities(4100)
+    rows = []
+    for i in range(12):
+        rows.append(doc("d%02d.md" % i,
+                        tags_proposed=terms[i * 340:(i + 1) * 340]))
+    # One term on enough documents to stay in scope, plus its exact-key collision.
+    rows[0]["meta"]["tags_proposed"] = list(rows[0]["meta"]["tags_proposed"]) + [
+        "fleet-upgrade"]
+    rows[1]["meta"]["tags_proposed"] = list(rows[1]["meta"]["tags_proposed"]) + [
+        "Fleet_Upgrade"]
+    rows[2]["meta"]["tags_proposed"] = list(rows[2]["meta"]["tags_proposed"]) + [
+        "fleet-upgrade"]
+
+    res = synonym_report(rows, vocab)
+    found = {}
+    for f in res["findings"]:
+        found.setdefault(f.code, []).append(f)
+
+    scoped = found["synonym-sweep-scoped"][0]
+    assert scoped.severity == WARN
+    assert "not compared" in scoped.message
+    # The numbers are IN the finding: a narrowed sweep reported as a clean one is
+    # the false all-clear this package exists to prevent.
+    assert str(res["metrics"]["tags"]["not_swept"]) in scoped.message
+    assert res["metrics"]["tags"]["not_swept"] > 0
+    assert res["metrics"]["tags"]["swept"] < res["metrics"]["tags"]["terms"]
+    # ... and the exact-collision check is NOT scoped: it still covers every term.
+    assert found["synonym-collision"]
+    assert res["aliases"]["tags"]["Fleet_Upgrade"] == "fleet-upgrade"
+
+
+def test_a_registry_growing_faster_than_the_corpus_is_reported(vocab):
+    # `keywords` is seeded from every SCREAMING_SNAKE token in every body. Measured
+    # on 1000 synthetic silicon specs: 24,630 distinct terms, 44.5% of them used
+    # once, 6,526 "ready for promotion" at once — while `singleton_rate` (computed
+    # over PROMOTED terms) read 0.00 and the registry health line said `ok`. Nothing
+    # in the report could see it, which is what this finding is for.
+    rows = [doc("d%d.md" % i, keywords_proposed=["ONE_OFF_%d" % i,
+                                                 "ANOTHER_ONE_%d" % i,
+                                                 "SHARED_TERM"])
+            for i in range(10)]
+    flood = [f for f in synonym_report(rows, vocab)["findings"]
+             if f.code == "registry-flood"]
+    assert len(flood) == 1
+    assert flood[0].severity == WARN
+    assert "20 of them" in flood[0].message or "used by a single document" in \
+        flood[0].message
+    assert "keywords" in flood[0].where
+
+    # A registry every document draws from is healthy however big it gets.
+    healthy = [doc("d%d.md" % i, keywords_proposed=["ALPHA", "BRAVO", "CHARLIE"])
+               for i in range(10)]
+    assert not [f for f in synonym_report(healthy, vocab)["findings"]
+                if f.code == "registry-flood"]
+
+
+# ------------------------------------------------------------------- promotion
+
+_PROMOTABLE = """\
+# A comment that MUST survive the write.
+version: 3
+
+lint:
+  promote_at: 3
+
+tags:
+  governance: registry
+  values: []
+  rationale: >
+    A folded scalar the writer must not reflow.
+  rules:
+    - Unknown tags go to `tags_proposed`.
+
+lang:
+  governance: closed
+  values: [en-GB, en-US,
+           fr-FR]
+"""
+
+
+def test_promotion_splices_values_without_destroying_the_file_around_them():
+    text, applied = apply_promotions(_PROMOTABLE, {"tags": ["fleet-upgrade", "rhel8"]})
+    assert applied == {"tags": ["fleet-upgrade", "rhel8"]}
+
+    # A writer that drops the comments and reflows the rationale is a writer nobody
+    # runs twice: those are the only reason a governance decision is reviewable.
+    assert "# A comment that MUST survive the write." in text
+    assert "A folded scalar the writer must not reflow." in text
+    assert "Unknown tags go to `tags_proposed`." in text
+
+    # Read back through the SAME reader that will load it in anger.
+    v = load_vocab(text=text)
+    assert v.values("tags") == ["fleet-upgrade", "rhel8"]
+    assert v.values("lang") == ["en-GB", "en-US", "fr-FR"]   # untouched, still flow
+    # Terms moved, so `version` moved — that is what makes skew_report able to name
+    # the documents a promotion invalidates.
+    assert v.version == 4
+
+
+def test_promotion_is_safe_to_run_twice():
+    once, first = apply_promotions(_PROMOTABLE, {"tags": ["fleet-upgrade"]})
+    twice, second = apply_promotions(once, {"tags": ["fleet-upgrade"]})
+    assert first == {"tags": ["fleet-upgrade"]}
+    assert second == {}                  # nothing to do ...
+    assert twice == once                 # ... so not one byte changes
+    assert load_vocab(text=twice).version == 4      # and the version does not drift
+
+
+def test_promotion_leaves_a_vocabulary_it_cannot_find_alone():
+    text, applied = apply_promotions(_PROMOTABLE, {"nosuchfield": ["x"]})
+    assert applied == {}
+    assert text == _PROMOTABLE
+
+
+def test_a_promoted_term_round_trips_even_when_yaml_would_retype_it():
+    # `no`, `on` and `0644` are retyped by any YAML 1.1 reader. The writer renders
+    # through the codec that will parse it back, so the value comes out as the
+    # string it went in as instead of as a boolean.
+    text, applied = apply_promotions(_PROMOTABLE, {"tags": ["no", "0644"]})
+    assert applied == {"tags": ["0644", "no"]}
+    assert load_vocab(text=text).values("tags") == ["0644", "no"]

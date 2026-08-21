@@ -245,7 +245,14 @@ def w_text_p(text, style=None, num=None):
 def w_image_p(rid, name, cx, cy, docpr_id):
     # type: (str, str, int, int, int) -> str
     """A paragraph holding one inline picture (DrawingML)."""
-    return w_p(
+    return w_p(w_image_run(rid, name, cx, cy, docpr_id))
+
+
+def w_image_run(rid, name, cx, cy, docpr_id):
+    # type: (str, str, int, int, int) -> str
+    """One inline picture as a RUN, so it can sit inside a numbered step's own
+    paragraph — which is where a screenshot in a runbook actually lives."""
+    return (
         '<w:r><w:drawing><wp:inline distT="0" distB="0" distL="0" distR="0">'
         '<wp:extent cx="%d" cy="%d"/>'
         '<wp:docPr id="%d" name="%s"/>'
@@ -275,24 +282,53 @@ def w_tc(text, span=0, vmerge=""):
     return "<w:tc>%s%s</w:tc>" % (tcpr, body)
 
 
+def w_row(cells, grid_before=0, grid_after=0):
+    # type: (list, int, int) -> str
+    """One w:tr. ``grid_before``/``grid_after`` are the grid columns the row does
+    NOT occupy — how Word writes a row indented inside a wider table. A reader that
+    counts only the w:tc elements puts every value one column too far left."""
+    pr = []
+    if grid_before:
+        pr.append('<w:gridBefore w:val="%d"/>' % grid_before)
+    if grid_after:
+        pr.append('<w:gridAfter w:val="%d"/>' % grid_after)
+    trpr = ("<w:trPr>%s</w:trPr>" % "".join(pr)) if pr else ""
+    return "<w:tr>%s%s</w:tr>" % (trpr, "".join(cells))
+
+
+def w_textbox(paragraphs):
+    # type: (str) -> str
+    """A VML text box anchored in the paragraph that carries this run."""
+    return ('<w:r><w:pict><v:shape xmlns:v="urn:schemas-microsoft-com:vml">'
+            '<v:textbox><w:txbxContent>%s</w:txbxContent></v:textbox></v:shape>'
+            '</w:pict></w:r>' % paragraphs)
+
+
 def w_table(rows, col_widths):
     # type: (list, list) -> str
-    """A bordered w:tbl; ``rows`` is a list of lists of pre-built w:tc XML."""
+    """A bordered w:tbl. ``rows`` holds either a list of pre-built w:tc XML (an
+    ordinary row) or a pre-built ``<w:tr>`` string from ``w_row``."""
     border = ('<w:tblBorders>'
               + "".join('<w:%s w:val="single" w:sz="4" w:color="404040"/>' % side
                         for side in ("top", "left", "bottom", "right",
                                      "insideH", "insideV"))
               + '</w:tblBorders>')
     grid = "".join('<w:gridCol w:w="%d"/>' % w for w in col_widths)
-    trs = "".join("<w:tr>%s</w:tr>" % "".join(cells) for cells in rows)
+    trs = "".join(cells if isinstance(cells, str)
+                  else "<w:tr>%s</w:tr>" % "".join(cells) for cells in rows)
     return ('<w:tbl><w:tblPr><w:tblW w:w="0" w:type="auto"/>%s</w:tblPr>'
             '<w:tblGrid>%s</w:tblGrid>%s</w:tbl>' % (border, grid, trs))
 
 
-def docx_styles():
-    # type: () -> str
+def docx_styles(extra=""):
+    # type: (str) -> str
     """Heading 1-4 + Normal, with real formatting so a LibreOffice PDF render
-    shows a size/weight hierarchy docling's layout model can pick up."""
+    shows a size/weight hierarchy docling's layout model can pick up.
+
+    ``extra`` appends caller-supplied ``w:style`` XML (a code paragraph/character
+    style, say). The default "" reproduces the previous output BYTE for BYTE, so
+    the fixtures that were already pinned keep their hashes — determinism is a
+    gate here, not a preference."""
     heads = []
     sizes = {1: 34, 2: 30, 3: 26, 4: 24}          # half-points
     for lvl in (1, 2, 3, 4):
@@ -312,28 +348,47 @@ def docx_styles():
         '</w:docDefaults>'
         '<w:style w:type="paragraph" w:default="1" w:styleId="Normal">'
         '<w:name w:val="Normal"/><w:qFormat/></w:style>%s</w:styles>'
-        % (_W, "".join(heads)))
+        % (_W, "".join(heads) + extra))
 
 
-def docx_numbering():
-    # type: () -> str
-    """numId 1 = bullets (2 levels), numId 2 = decimal (2 levels)."""
-    def lvl(ilvl, fmt, text):
-        return ('<w:lvl w:ilvl="%d"><w:start w:val="1"/><w:numFmt w:val="%s"/>'
+def docx_numbering(deep=False, extra=False):
+    # type: (bool, bool) -> str
+    """numId 1 = bullets, numId 2 = decimal; two levels each, three when ``deep``.
+
+    ``deep`` is opt-in for the same reason ``docx_styles(extra=...)`` is: the
+    default output stays byte-identical, so adding a three-level fixture cannot
+    move an already-pinned hash.
+
+    ``extra`` adds the two instances the renumbering fixtures need: numId 3, a
+    decimal list declared to **start at 5** (``w:start``), and numId 4, an
+    ``upperLetter`` list — a format CommonMark has no marker for."""
+    def lvl(ilvl, fmt, text, start=1):
+        return ('<w:lvl w:ilvl="%d"><w:start w:val="%d"/><w:numFmt w:val="%s"/>'
                 '<w:lvlText w:val="%s"/><w:lvlJc w:val="left"/>'
                 '<w:pPr><w:ind w:left="%d" w:hanging="360"/></w:pPr></w:lvl>'
-                % (ilvl, fmt, text, 720 * (ilvl + 1)))
+                % (ilvl, start, fmt, text, 720 * (ilvl + 1)))
+    bullets = lvl(0, "bullet", "•") + lvl(1, "bullet", "◦")
+    decimals = lvl(0, "decimal", "%1.") + lvl(1, "decimal", "%1.%2.")
+    if deep:
+        bullets += lvl(2, "bullet", "▪")
+        decimals += lvl(2, "decimal", "%1.%2.%3.")
+    more = ""
+    if extra:
+        more = ('<w:abstractNum w:abstractNumId="2">%s</w:abstractNum>'
+                '<w:abstractNum w:abstractNumId="3">%s</w:abstractNum>'
+                '<w:num w:numId="3"><w:abstractNumId w:val="2"/></w:num>'
+                '<w:num w:numId="4"><w:abstractNumId w:val="3"/></w:num>'
+                % (lvl(0, "decimal", "%1.", start=5),
+                   lvl(0, "upperLetter", "%1.")))
     return (
         '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
         '<w:numbering %s>'
-        '<w:abstractNum w:abstractNumId="0">%s%s</w:abstractNum>'
-        '<w:abstractNum w:abstractNumId="1">%s%s</w:abstractNum>'
+        '<w:abstractNum w:abstractNumId="0">%s</w:abstractNum>'
+        '<w:abstractNum w:abstractNumId="1">%s</w:abstractNum>'
         '<w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num>'
-        '<w:num w:numId="2"><w:abstractNumId w:val="1"/></w:num>'
+        '<w:num w:numId="2"><w:abstractNumId w:val="1"/></w:num>%s'
         '</w:numbering>'
-        % (_W,
-           lvl(0, "bullet", "•"), lvl(1, "bullet", "◦"),
-           lvl(0, "decimal", "%1."), lvl(1, "decimal", "%1.%2.")))
+        % (_W, bullets, decimals, more))
 
 
 def docx_header():
@@ -568,6 +623,251 @@ def build_minimal_docx(path):
         ("word/_rels/document.xml.rels", rels),
         ("word/styles.xml", docx_styles()),
         ("docProps/core.xml", core_xml("Kestrel bring-up quick notes", "bring-up")),
+        ("docProps/app.xml", APP_XML),
+    ])
+
+
+# ------------------------------------------------------ the adversarial fixture
+#
+# Everything a naive docx->markdown converter mangles, in one plausible runbook.
+# The identifier strings below are the SAME literals as
+# backend.validate._rubric.ADVERSARIAL_PROBES and .ALLCAPS_CALLOUT — the rubric
+# asserts they survive byte-for-byte in the stored markdown, so they must be
+# typed here exactly, not paraphrased.
+
+# Character/paragraph styles this fixture adds on top of docx_styles(). The
+# w:name values are what backend.ingest recognises as "this is code"
+# (_CODE_STYLE_NAMES); the styleIds deliberately are NOT, so the fixture proves
+# the NAME is what is matched.
+ADVERSARIAL_STYLES = (
+    # A heading style nobody named a heading: only w:basedOn says what it is, and a
+    # reader that stops at the style's own w:name deletes the section it opens.
+    '<w:style w:type="paragraph" w:styleId="KestrelSection">'
+    '<w:name w:val="Kestrel Section"/><w:basedOn w:val="Heading2"/>'
+    '<w:qFormat/></w:style>'
+    # Numbering carried by the STYLE (Word's built-in "List Number"), inherited one
+    # more step through w:basedOn. Read only the paragraph's own w:pPr and the whole
+    # procedure disappears — on both sides at once, which is why no gate objected.
+    '<w:style w:type="paragraph" w:styleId="ListNumber">'
+    '<w:name w:val="List Number"/><w:basedOn w:val="Normal"/>'
+    '<w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="2"/></w:numPr></w:pPr>'
+    '</w:style>'
+    '<w:style w:type="paragraph" w:styleId="KestrelStep">'
+    '<w:name w:val="Kestrel Step"/><w:basedOn w:val="ListNumber"/></w:style>'
+    '<w:style w:type="paragraph" w:styleId="KestrelTranscript">'
+    '<w:name w:val="Source Code"/><w:basedOn w:val="Normal"/><w:qFormat/>'
+    '<w:pPr><w:spacing w:before="0" w:after="0"/></w:pPr>'
+    '<w:rPr><w:rFonts w:ascii="Liberation Mono" w:hAnsi="Liberation Mono"/>'
+    '<w:sz w:val="18"/><w:szCs w:val="18"/></w:rPr></w:style>'
+    '<w:style w:type="character" w:styleId="KestrelLiteral">'
+    '<w:name w:val="HTML Code"/><w:qFormat/>'
+    '<w:rPr><w:rFonts w:ascii="Liberation Mono" w:hAnsi="Liberation Mono"/>'
+    '</w:rPr></w:style>')
+
+
+def build_adversarial_docx(path):
+    # type: (str) -> None
+    """The hostile docx: every construct the office lane is known to get wrong.
+
+    A plausible Nimbus Semiconductor / Kestrel payments-tier runbook that packs,
+    in one document: copy-paste identifiers that markdown escaping would rewrite,
+    a shouted body sentence that a heading heuristic wants to promote, a
+    three-level ordered procedure with a bullet sub-list under it, direct
+    bold/italic/strike runs plus a character-styled code span, consecutive
+    code-styled paragraphs that must fuse into ONE fence, a table carrying both a
+    horizontal gridSpan and a vertical vMerge (and a cell with a literal pipe in
+    it), an external hyperlink, page furniture, and live revision marks.
+
+    Deliberately NOT in HANDBUILT: the eval expectation is wired separately."""
+    def fmt_run(text, props):
+        # type: (str, str) -> str
+        """A run carrying DIRECT formatting or a character style (w:rPr props)."""
+        return ('<w:r><w:rPr>%s</w:rPr><w:t xml:space="preserve">%s</w:t></w:r>'
+                % (props, xesc(text)))
+
+    b = []
+    b.append(w_text_p("Kestrel payments tier operations runbook", style="Heading1"))
+    # (1) The copy-paste identifiers, in PLAIN PROSE — no fence, no code style, so
+    # the only thing standing between them and the stored bytes is the escaper.
+    b.append(w_text_p(
+        "Operators copy the values in this section straight into a shell, so they "
+        "must survive conversion unchanged. The pool ceiling is DB_MAX_CONN_LIMIT, "
+        "the tier owns the [payments] section of the deployment config, every "
+        "rehearsal runs with --dry_run=true, and the parser that reads the flag "
+        "back is snake_case_helper."))
+    # (2) A shouted BODY sentence. It is a Normal paragraph; a converter that
+    # promotes it to a heading has invented a section that the source never had.
+    b.append(w_text_p(
+        "DO NOT REBOOT THE PRIMARY NODE WHILE A MIGRATION IS STILL DRAINING."))
+
+    b.append(w_text_p("Before you start", style="Heading2"))
+    # (7) External hyperlink.
+    b.append(w_p(w_run("Escalation owners and the live dashboard are listed in the ")
+                 + '<w:hyperlink r:id="rId20">%s</w:hyperlink>'
+                 % w_run("Kestrel payments runbook index")
+                 + w_run(" that the platform team maintains.")))
+    # (4) Direct formatting: bold, italic, strikethrough.
+    b.append(w_p(w_run("Draining the tier is ")
+                 + fmt_run("mandatory", "<w:b/>")
+                 + w_run(" before a failover, the two minute settle is ")
+                 + fmt_run("advisory", "<w:i/>")
+                 + w_run(", and the old ")
+                 + fmt_run("force_flush() hook", "<w:strike/>")
+                 + w_run(" was removed in release 2.4.")))
+    # (4) A run carrying a CHARACTER style whose w:name is a code name: an inline
+    # code span, which is also where the fifth identifier probe lives.
+    b.append(w_p(w_run("Confirm the tier is healthy with ")
+                 + fmt_run("kubectl get pods -n payments",
+                           '<w:rStyle w:val="KestrelLiteral"/>')
+                 + w_run(" and wait for every replica to report ready.")))
+
+    b.append(w_text_p("Drain procedure", style="Heading2"))
+    # (3) Three-level ORDERED list (ilvl 0/1/2) with a BULLET sub-list under it.
+    b.append(w_text_p("Announce the freeze in the operations channel.", num=(2, 0)))
+    b.append(w_text_p("Page the on-call owner for the payments tier.", num=(2, 1)))
+    b.append(w_text_p("Wait for an acknowledgement before going further.",
+                      num=(2, 2)))
+    # (10) A SCREENSHOT INSIDE STEP 2. The picture used to be emitted at column 0,
+    # which closes the list, so every step below it started again at 1 — while
+    # LibreOffice reads the same file as <ol start="3">.
+    b.append(w_p(w_run("Drain the tier and watch the queue depth fall to zero.")
+                 + w_image_run("rId10", "console.png", 1828800, 1219200, 11),
+                 num=(2, 0)))
+    b.append(w_text_p("The drain is idempotent; rerun it if it stalls.", num=(1, 1)))
+    b.append(w_text_p("A stalled drain leaves the tier read only, never offline.",
+                      num=(1, 1)))
+    # (11) A CALLOUT anchored in a step. A text box has to be lifted out of its
+    # anchor paragraph; lifting it to column 0 also split the procedure in two.
+    b.append(w_p(w_run("Run the migration, then re-enable writes.")
+                 + w_textbox(w_text_p("Rollback stays available until the "
+                                      "checksum is confirmed.")),
+                 num=(2, 0)))
+    # (12) A PARAGRAPH between two steps. Word does not restart a procedure because
+    # prose got in the way, so the step after it is 5, not 1.
+    b.append(w_text_p(
+        "Hold here until the queue depth has read zero for two minutes."))
+    b.append(w_text_p("Confirm the checksum against the migration plan.",
+                      num=(2, 0)))
+
+    # (13) A heading style that only w:basedOn identifies, over a procedure whose
+    # numbering lives in a paragraph STYLE, and a fallback list Word letters.
+    b.append(w_text_p("If the migration fails", style="KestrelSection"))
+    b.append(w_text_p("Stop the writer.", style="KestrelStep"))
+    b.append(w_text_p("Restore the snapshot.", style="KestrelStep"))
+    b.append(w_text_p("Replay the write-ahead log.", style="KestrelStep"))
+    b.append(w_text_p(
+        "The lettered fallback below is numbered A, B in the source; markdown has "
+        "no lettered marker, so the positions survive and the labels do not."))
+    b.append(w_text_p("Fail forward to the standby region.", num=(4, 0)))
+    b.append(w_text_p("Page the incident commander.", num=(4, 0)))
+    # (14) A list DECLARED to start at 5. Prose saying "see step 6" pointed at
+    # step 2 for as long as w:start went unread.
+    b.append(w_text_p("Continuation steps (5 onwards)", style="KestrelSection"))
+    b.append(w_text_p("Verify the backup before cutting over.", num=(3, 0)))
+    b.append(w_text_p("Cut over the primary region.", num=(3, 0)))
+
+    b.append(w_text_p("Command transcript", style="Heading2"))
+    # (5) Consecutive CODE PARAGRAPHS. One w:p is one line, so a converter that
+    # fences each on its own emits four separate programs instead of one session.
+    b.append(w_text_p("kestrelctl drain --tier=payments --dry_run=true",
+                      style="KestrelTranscript"))
+    b.append(w_text_p("kestrelctl drain --tier=payments --confirm",
+                      style="KestrelTranscript"))
+    b.append(w_text_p("kestrelctl migrate --plan /etc/kestrel/payments.plan",
+                      style="KestrelTranscript"))
+    b.append(w_text_p("kestrelctl writes enable --tier=payments",
+                      style="KestrelTranscript"))
+
+    b.append(w_text_p("Escalation matrix", style="Heading2"))
+    b.append(w_text_p(
+        "The group row spans the whole table; the escalation column merges "
+        "vertically wherever two checks page the same rota. The last row is "
+        "indented under the one above it and starts at grid column one."))
+    # (6) gridSpan + vMerge + a literal pipe inside a cell, and (15) a row that
+    # begins at grid column 1 (w:gridBefore). Read the cells and ignore the offset
+    # and every value in that row lands one column to the LEFT: a check named
+    # "after hours only" acquires the owner column's meaning.
+    rows = [[w_tc("Check"), w_tc("Owner"), w_tc("Escalate to"), w_tc("Notes")],
+            [w_tc("Payments tier, primary region", span=4)],
+            [w_tc("Connection pool"), w_tc("platform"),
+             w_tc("payments rota", vmerge="restart"),
+             w_tc("Ceiling is DB_MAX_CONN_LIMIT, currently 400")],
+            [w_tc("Queue depth"), w_tc("platform"), w_tc("", vmerge="cont"),
+             w_tc("Page when depth > 5000 | sustained for 10 minutes")],
+            [w_tc("Replica lag"), w_tc("data"), w_tc("data rota"),
+             w_tc("Compare against the snake_case_helper report")],
+            w_row([w_tc("storage"), w_tc("storage rota"),
+                   w_tc("Only after hours; daytime lag is expected")],
+                  grid_before=1)]
+    b.append(w_table(rows, [2600, 1500, 1700, 3400]))
+
+    b.append(w_text_p("Revision notes", style="Heading2"))
+    # (9) Live revision marks: an accepted insertion and a pending deletion. The
+    # lane takes the FINAL view, so the inserted words are body text and the
+    # deleted ones are gone — both sides of the gate must agree on that.
+    b.append(w_p(
+        w_run("The migration window is ")
+        + '<w:ins w:id="901" w:author="%s" w:date="%s">%s</w:ins>'
+        % (xesc(COMPANY), STAMP, w_run("ninety minutes"))
+        + w_run(" long")
+        + '<w:del w:id="902" w:author="%s" w:date="%s"><w:r>'
+          '<w:delText xml:space="preserve"> plus a sixty minute buffer</w:delText>'
+          '</w:r></w:del>' % (xesc(COMPANY), STAMP)
+        + w_run(", measured from the first drain command.")))
+
+    # (8) Header and footer parts, so dropped_headers_footers has something to fire on.
+    sect = ('<w:sectPr>'
+            '<w:headerReference w:type="default" r:id="rId3"/>'
+            '<w:footerReference w:type="default" r:id="rId4"/>'
+            '<w:pgSz w:w="11906" w:h="16838"/>'
+            '<w:pgMar w:top="1134" w:right="1134" w:bottom="1134" w:left="1134"'
+            ' w:header="567" w:footer="567" w:gutter="0"/></w:sectPr>')
+    document = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+                '<w:document %s %s %s><w:body>%s%s</w:body></w:document>'
+                % (_W, _R, _DRAW, "".join(b), sect))
+    rels = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/'
+        'relationships">'
+        '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/'
+        'officeDocument/2006/relationships/styles" Target="styles.xml"/>'
+        '<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/'
+        'officeDocument/2006/relationships/numbering" Target="numbering.xml"/>'
+        '<Relationship Id="rId3" Type="http://schemas.openxmlformats.org/'
+        'officeDocument/2006/relationships/header" Target="header1.xml"/>'
+        '<Relationship Id="rId4" Type="http://schemas.openxmlformats.org/'
+        'officeDocument/2006/relationships/footer" Target="footer1.xml"/>'
+        '<Relationship Id="rId10" Type="http://schemas.openxmlformats.org/'
+        'officeDocument/2006/relationships/image" Target="media/console.png"/>'
+        '<Relationship Id="rId20" Type="http://schemas.openxmlformats.org/'
+        'officeDocument/2006/relationships/hyperlink" '
+        'Target="https://nimbus-semi.example/kestrel/payments-runbook" '
+        'TargetMode="External"/>'
+        '</Relationships>')
+    wp = "application/vnd.openxmlformats-officedocument.wordprocessingml"
+    ct = content_types(
+        [("/word/document.xml", wp + ".document.main+xml"),
+         ("/word/styles.xml", wp + ".styles+xml"),
+         ("/word/numbering.xml", wp + ".numbering+xml"),
+         ("/word/header1.xml", wp + ".header+xml"),
+         ("/word/footer1.xml", wp + ".footer+xml"),
+         ("/docProps/core.xml",
+          "application/vnd.openxmlformats-package.core-properties+xml"),
+         ("/docProps/app.xml",
+          "application/vnd.openxmlformats-officedocument.extended-properties+xml")],
+        defaults=(("png", "image/png"),))
+    write_zip(path, [
+        ("[Content_Types].xml", ct),
+        ("_rels/.rels", PKG_RELS % "word/document.xml"),
+        ("word/document.xml", document),
+        ("word/_rels/document.xml.rels", rels),
+        ("word/styles.xml", docx_styles(extra=ADVERSARIAL_STYLES)),
+        ("word/numbering.xml", docx_numbering(deep=True, extra=True)),
+        ("word/header1.xml", docx_header()),
+        ("word/footer1.xml", docx_footer()),
+        ("word/media/console.png", png_bytes(96, 64, _px_grid)),
+        ("docProps/core.xml", core_xml("Kestrel payments tier operations runbook",
+                                       "operations")),
         ("docProps/app.xml", APP_XML),
     ])
 
@@ -1191,6 +1491,12 @@ HANDBUILT = [
     ("office/kestrel-registers.xlsx", build_registers_xlsx),
     ("office/kestrel-overview.pptx", build_overview_pptx),
     ("office/kestrel-dataflow.pptx", build_dataflow_pptx),
+    # The document written to break a naive converter: identifiers markdown
+    # mangles, a three-level procedure, mixed ordered/bullet nesting, code
+    # runs, merged cells, tracked changes and a shouted callout that is not a
+    # heading. It has already earned its place — it found a real list-nesting
+    # defect at token_recall 1.0 with zero structural errors.
+    ("office/kestrel-adversarial.docx", build_adversarial_docx),
 ]
 
 # (source relpath, soffice target ext, dest relpath)

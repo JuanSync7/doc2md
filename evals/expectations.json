@@ -26,14 +26,15 @@
    "ClkGateCtrl_enable_sync",
    "ClkGateCtrl block (base 0x4000)",
    "DmaArbiterUnit block (base 0x5000)",
-   "DmaArbiterUnit owns quality-of-service",
+   "Dma**ArbiterUnit** owns quality-of-service",
    "clk_ref_sel",
    "\\<rst_n>",
    "\\*not\\* latched during scan | test modes",
    "  - Chapter 4: clocks and resets",
-   "1. Wait for the lock counter to saturate.\n   1. Poll PllLockMon_status_q until it reads one.\n1. Release the downstream gates.",
+   "2. Wait for the lock counter to saturate.\n   1. Poll PllLockMon_status_q until it reads one.\n3. Release the downstream gates.",
    "1. Program the feedback divider."
   ],
+  "_note_numbering": "The markers are the numbers Word shows, not a repeated '1.'. CommonMark takes a list's start from its FIRST marker and counts up on its own, so writing '1.' on every item was only correct while nothing ever split the list; the nested step is 2.1, so its own marker is 1 and the step after it is 3.",
   "md_min_count": {
    "| RW |": 3,
    "![](images/": 3
@@ -56,7 +57,9 @@
     "text": "Kestrel PDK release notes",
     "url": "https://nimbus-semi.example/kestrel/pdk-release-notes"
    }
-  ]
+  ],
+  "structure_fidelity_gate": "pass",
+  "_note_emphasis": "The source bolds only the second half of the identifier (a plain run 'Dma' followed by a bold run 'ArbiterUnit'), which is how Word actually stores partial-word formatting. Faithful output is therefore 'Dma**ArbiterUnit**'. The tradeoff is deliberate and recorded in docs/quality-plan.md: the emphasis is real information the document carries, and markdown_to_text strips the markers before tokenizing, so the identifier is intact in the text layer the index and the KB consume. What is lost is a raw grep of document.md for the unsplit identifier."
  },
  "office/kestrel-readme.docx": {
   "kind": "bundle",
@@ -72,7 +75,8 @@
    "# Kestrel bring-up quick notes",
    "Power the board from the bench supply"
   ],
-  "savings_ratio_min": 10.0
+  "savings_ratio_min": 10.0,
+  "structure_fidelity_gate": "pass"
  },
  "office/kestrel-registers.xlsx": {
   "kind": "bundle",
@@ -93,7 +97,8 @@
    "0.125",
    "FALSE",
    "Reserved for bring-up notes."
-  ]
+  ],
+  "structure_fidelity_gate": "unmeasured"
  },
  "office/kestrel-overview.pptx": {
   "kind": "bundle",
@@ -111,7 +116,8 @@
    "### Speaker notes",
    "week nine",
    "- sensor front end"
-  ]
+  ],
+  "structure_fidelity_gate": "unmeasured"
  },
  "office/kestrel-dataflow.pptx": {
   "kind": "bundle",
@@ -126,7 +132,8 @@
    "- result mailbox",
    "- push",
    "- pop"
-  ]
+  ],
+  "structure_fidelity_gate": "unmeasured"
  },
  "legacy/kestrel-clock-spec.doc": {
   "kind": "bundle",
@@ -150,7 +157,9 @@
     "url": "https://nimbus-semi.example/kestrel/pdk-release-notes"
    }
   ],
-  "_note_links": "hyperlink measured to survive the soffice doc round-trip verbatim (text+url character-identical; also true for odt/rtf, probed on .doc as the binary representative). Observed on LibreOffice 6.4.7.2 — if a future soffice normalizes URLs (trailing slash, percent-encoding), this probe names the behavior change; adjust deliberately, never silently."
+  "_note_links": "hyperlink measured to survive the soffice doc round-trip verbatim (text+url character-identical; also true for odt/rtf, probed on .doc as the binary representative). Observed on LibreOffice 6.4.7.2 — if a future soffice normalizes URLs (trailing slash, percent-encoding), this probe names the behavior change; adjust deliberately, never silently.",
+  "structure_fidelity_gate": "pass",
+  "_note_fidelity": "pass, not unmeasured: the LibreOffice pre-convert lands on .docx, and the gate follows the EFFECTIVE extension. So a binary .doc is graded structurally too — and the probe proves the round-trip through soffice preserves heading levels, list nesting and table geometry, not merely the words."
  },
  "legacy/kestrel-clock-spec.rtf": {
   "kind": "bundle",
@@ -166,7 +175,8 @@
   "md_contains": [
    "# 1 Introduction",
    "ClkGateCtrl_enable_sync"
-  ]
+  ],
+  "structure_fidelity_gate": "pass"
  },
  "legacy/kestrel-clock-spec.odt": {
   "kind": "bundle",
@@ -183,7 +193,8 @@
    "# 1 Introduction",
    "ClkGateCtrl_enable_sync",
    "#### 2.1.1.1 Timing budget"
-  ]
+  ],
+  "structure_fidelity_gate": "pass"
  },
  "legacy/kestrel-registers.xls": {
   "kind": "bundle",
@@ -200,7 +211,8 @@
    "## PowerBudget",
    "Kestrel power budget (mW)",
    "412.5"
-  ]
+  ],
+  "structure_fidelity_gate": "unmeasured"
  },
  "legacy/kestrel-overview.ppt": {
   "kind": "bundle",
@@ -216,7 +228,8 @@
    "## Slide 1",
    "week nine",
    "display read"
-  ]
+  ],
+  "structure_fidelity_gate": "unmeasured"
  },
  "pdf/kestrel-clock-spec.pdf": {
   "kind": "bundle",
@@ -250,7 +263,9 @@
   ],
   "md_not_contains": [
    "Confidential"
-  ]
+  ],
+  "structure_fidelity_gate": "unmeasured",
+  "_note_fidelity": "unmeasured, not best-effort: there is no second implementation that can read structure out of a PDF, so nothing was graded and the block says so. best-effort would imply a measurement was taken on a best-effort basis. Derived, not observed — the PDF lane needs DOC2MD_PDF_PYTHON, which the office CI job does not set; assemble_bundle with source_structure=None produces exactly this block by construction."
  },
  "pdf/kestrel-dataflow.pdf": {
   "_note": "TRUTHFUL CURRENT BEHAVIOR, not the desired one. TODO: this is a DIGITAL diagram-only PDF, but its text layer is under pdf_has_text_layer's min_chars_per_page threshold, so the lane misroutes it to OCR: losslessness reads pdf-ocr-transcription (no recall is measured), most shape labels are dropped by RapidOCR, and the OCR path never extracts figure pixels so the detected picture placeholder bails (images gate degraded). Fix candidates: area-weighted text-layer probe; measure OCR output against the existing text layer when one exists; extract figures on the OCR path too.",
@@ -269,7 +284,8 @@
   ],
   "md_contains": [
    "result mailbox"
-  ]
+  ],
+  "structure_fidelity_gate": "unmeasured"
  },
  "pdf/kestrel-clock-spec-scan.pdf": {
   "_note": "Scanned (rasterized) PDF: honestly reported as OCR transcription, degraded. The degraded images gate is also truthful current behavior — TODO: the OCR path never extracts figure pixels, so every detected picture placeholder bails (image_inline_bailed + image_bytes_missing).",
@@ -287,7 +303,8 @@
   "md_contains": [
    "Introduction",
    "ClkGateCtrl_enable_sync"
-  ]
+  ],
+  "structure_fidelity_gate": "unmeasured"
  },
  "text/design-notes.md": {
   "kind": "text",
@@ -343,5 +360,71 @@
  },
  "text/synth-flow.tcl": {
   "kind": "unsupported"
+ },
+ "office/kestrel-adversarial.docx": {
+  "_note": "The document written to BREAK a naive converter, and it has already earned its place: on first conversion it found a real list-nesting defect (a bullet sub-list under a numbered step, carrying a different w:numId, was promoted to top level) at token_recall 1.0 with structural_errors 0 — invisible to every gate that existed before structure_fidelity. Every probe below is a measured value from a passing run, not a wish.",
+  "_note_renumbering": "It then earned it again. The fixture now carries the five ways a procedure was silently renumbered — a screenshot inside step 2, a paragraph between two steps, a callout text box anchored in a step, a list declared to start at 5 (w:start), and numbering carried by a paragraph STYLE through w:basedOn — plus a table row that begins at grid column 1 (w:gridBefore) and a heading style only w:basedOn identifies. Every one of them used to convert wrong at token_recall 1.0 with structure_fidelity pass; the style-carried list was invisible to BOTH sides at once, which is why the gate agreed.",
+  "kind": "bundle",
+  "lane": "office",
+  "status": "ok",
+  "losslessness_method": "ooxml-ground-truth",
+  "losslessness_gate": "pass",
+  "token_recall_min": 1.0,
+  "structure_fidelity_gate": "pass",
+  "coverage_gate": "pass",
+  "has_toc": false,
+  "max_depth": 2,
+  "images_gate": "pass",
+  "images_referenced": 1,
+  "warning_codes": [
+   "dropped_headers_footers",
+   "flattened_table_spans",
+   "tracked_changes_resolved",
+   "decimalised_list_numbering",
+   "lifted_text_boxes"
+  ],
+  "warning_codes_absent": [
+   "libreoffice_preconvert",
+   "image_bytes_missing",
+   "empty_source"
+  ],
+  "md_contains": [
+   "DB_MAX_CONN_LIMIT",
+   "--dry_run=true",
+   "[payments]",
+   "snake_case_helper",
+   "`kubectl get pods -n payments`",
+   "DO NOT REBOOT THE PRIMARY NODE",
+   "~~",
+   "```",
+   "3. Run the migration, then re-enable writes.",
+   "\n4. Confirm the checksum against the migration plan.",
+   "## If the migration fails",
+   "5. Stop the writer.",
+   "## Continuation steps (5 onwards)",
+   "5. Verify the backup before cutting over.\n6. Cut over the primary region.",
+   "   Rollback stays available until the checksum is confirmed.",
+   "|  | storage | storage rota | Only after hours; daytime lag is expected |"
+  ],
+  "md_not_contains": [
+   "\\\\[payments\\\\]",
+   "DB\\\\_MAX",
+   "Confidential",
+   "\n1. Run the migration",
+   "\n1. Confirm the checksum",
+   "\n1. Verify the backup"
+  ],
+  "md_min_count": {
+   "| --- |": 1,
+   "![](images/": 1
+  },
+  "outline_titles": [
+   "Before you start",
+   "Drain procedure",
+   "If the migration fails",
+   "Continuation steps (5 onwards)",
+   "Command transcript",
+   "Escalation matrix"
+  ]
  }
 }

@@ -65,7 +65,7 @@ def test_the_shipped_vocabulary_loads_with_no_arguments_and_self_validates(monke
 
     assert vocab_path() == SHIPPED
     v = load_vocab()
-    assert v.version == 1
+    assert v.version == 2
     assert len(v.fields()) >= 15
     for name, _node in v.fields():
         assert v.governance(name) in ("closed", "registry", "ref"), name
@@ -87,7 +87,7 @@ def test_the_file_stays_inside_the_strict_yaml_subset_every_consumer_parses_with
     # A hand edit that reaches for an anchor, a flow map or a second document would
     # take the whole metadata layer down, so parse the raw bytes here directly.
     data = parse_block(raw)
-    assert data["version"] == 1
+    assert data["version"] == 2
     assert list(data.keys())[:3] == ["version", "standards", "lint"]
     # `demoted` is documentation (a deleted field and why), not a governed field.
     assert "demoted" in data
@@ -120,8 +120,11 @@ def test_decision_status_collapsed_to_the_five_madr_values_with_the_rest_as_alia
         "accepted", {"review_required": True})
 
     # Same token, different vocabulary, different verdict — which is why membership
-    # is asked per field and never against a bare list at a call site.
-    assert "recommended" in shipped.values("requirement_level")
+    # is asked per field and never against a bare list at a call site. `recommended`
+    # is a decision that nobody has ratified; as a TAG it would be an ordinary
+    # registry proposal, and the two answers must not come from one list.
+    assert shipped.governance("tags") == "registry"
+    assert "recommended" not in shipped.values("tags")
 
 
 def test_the_stix_rename_landed_so_targets_is_the_predicate_and_threatens_an_alias(shipped):
@@ -182,8 +185,9 @@ def test_registry_fields_ship_empty_so_terms_arrive_by_promotion_not_by_guess(sh
 
 
 def test_enum_values_are_strings_that_no_yaml_reader_will_retype(shipped, raw):
-    assert shipped.values("requirement_level") == [
-        "mandatory", "recommended", "conditional", "optional", "excluded"]
+    # `none` is the live instance: a cadence of "none" is a decision, and a reader
+    # that retyped it to null would erase it rather than record it.
+    assert "none" in shipped.values("review_cadence")
     for name, _node in shipped.fields():
         for value in shipped.values(name):
             # bool before int: a retyped `no` arrives as False and then compares

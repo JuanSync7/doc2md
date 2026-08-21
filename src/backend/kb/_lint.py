@@ -237,14 +237,19 @@ def _check_value(vocab, vname, value, where, findings, registry_proposals):
             registry_proposals.setdefault(vname, []).append(value)
 
 
-def _check_refs(meta, anchors, known_ids, findings):
-    # type: (dict, set, set, list) -> None
+def _check_refs(meta, anchors, known_ids, findings, unreadable=0):
+    # type: (dict, set, set, list, int) -> None
     """Referential integrity: refs are governed by what they point at.
 
     ``anchors`` is what the body actually makes addressable and ``known_ids`` the
     page ids the corpus contains. When a caller supplies neither, the check is
     SKIPPED rather than passed — an unverifiable pointer must not be reported as
     verified.
+
+    ``unreadable`` is how many documents the corpus HAS but could not parse. It does
+    not disable the check — one bad file must not buy the other 999 an amnesty — it
+    QUALIFIES the one finding it can invert: a ``see_also`` whose target lives in the
+    unreadable document reads as dead, so the finding says so and names the count.
     """
     # What a `control`/`protects` may point at. The vocabulary's rule says "an id in
     # this document's registers", but in real documents a control is far more often
@@ -316,7 +321,11 @@ def _check_refs(meta, anchors, known_ids, findings):
             if target not in known_ids:
                 findings.append(Finding(
                     "see-also-unresolved", WARN, where,
-                    "%r does not resolve to a known page id" % target))
+                    "%r does not resolve to a known page id%s"
+                    % (target,
+                       "" if not unreadable else
+                       " (%d document(s) in this corpus could not be read, so the "
+                       "target may be one of them — fix those first)" % unreadable)))
         else:                                    # control / protects
             if val not in register_ids:
                 findings.append(Finding(
@@ -377,14 +386,17 @@ def _check_authorship(meta, findings):
 
 # --------------------------------------------------------------- entry points
 
-def lint_document(meta, vocab, anchors=None, known_ids=None):
-    # type: (dict, object, set, set) -> dict
+def lint_document(meta, vocab, anchors=None, known_ids=None, unreadable=0):
+    # type: (dict, object, set, set, int) -> dict
     """Grade one document's metadata block.
 
     Returns ``{"findings": [Finding], "facets": [FacetRow], "proposals": {field:
     [value]}, "errors": int, "warnings": int}``. Never raises on bad data — a
     malformed block is a FINDING, because the linter's job is to report the corpus
     it has rather than the corpus it wishes it had.
+
+    ``unreadable`` — documents the corpus holds but could not parse — qualifies the
+    ``see_also`` finding rather than switching the check off; see ``_check_refs``.
     """
     meta = meta or {}
     findings = []  # type: list
@@ -467,7 +479,7 @@ def lint_document(meta, vocab, anchors=None, known_ids=None):
             _check_value(vocab, gv["group_name"], cat, "links.%s" % cat,
                          findings, proposals)
 
-    _check_refs(meta, anchors, known_ids, findings)
+    _check_refs(meta, anchors, known_ids, findings, unreadable)
     _check_authorship(meta, findings)
 
     facets = facet_report(_facet_pairs(meta, vocab, []),

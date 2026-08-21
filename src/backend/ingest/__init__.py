@@ -37,6 +37,7 @@ from ._ooxml_md import (docx_markdown, pptx_markdown, xlsx_markdown,
                         docx_source_text, pptx_source_text, xlsx_source_text,
                         ooxml_markdown, ooxml_source_text, svg_text, OOXML_MAIN_PARTS,
                         furniture_drops)
+from ._ooxml_struct import docx_source_structure, policy_drops
 from ._recovery import (classify_failure, recovery_action,
                         plan_admission, order_todo,
                         FAIL_NONE, FAIL_OOM, FAIL_HANG, FAIL_DOCLING, FAIL_TRANSIENT,
@@ -92,6 +93,8 @@ __all__ = [
     "ooxml_markdown",
     "ooxml_source_text",
     "furniture_drops",
+    "docx_source_structure",
+    "policy_drops",
     "svg_text",
     "OOXML_MAIN_PARTS",
     "doc_id",

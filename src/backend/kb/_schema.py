@@ -35,7 +35,8 @@ __all__ = ["Field", "FIELDS", "META_KEY", "PROVENANCE_KEY", "SCHEMA_VERSION",
            "TIER_NAMES", "SOURCE_AUTHORED", "SOURCE_GENERATED", "SOURCE_DERIVED",
            "SOURCE_EXTRACTED", "VALUE_SOURCES", "field", "field_names",
            "model_writable", "proposed_key", "record_required", "record_vocab",
-           "group_vocab", "REF_FIELDS", "DOCUMENT_FILE", "KNOWLEDGE_FILE",
+           "group_required", "group_vocab", "ALIAS_FIELDS", "CANONICAL_ID",
+           "REF_FIELDS", "DOCUMENT_FILE", "KNOWLEDGE_FILE",
            "KNOWLEDGE_HEADER", "in_knowledge", "knowledge_document",
            "knowledge_field_names", "knowledge_payload", "meta_collisions",
            "split_meta", "merge_meta"]
@@ -89,7 +90,12 @@ KNOWLEDGE_HEADER = ("doc_id", "id", "uid", "schema_version", "vocab_version",
 #   v1  single `meta` block in document.md front matter
 #   v2  descriptors stay in front matter; the knowledge payload moves to
 #       knowledge.json (see the seam above)
-SCHEMA_VERSION = 2
+#   v3  ONE identity (`id` is canonical and path-derived; `uid` is its alias),
+#       four unread fields removed (classification/aliases/prerequisites/
+#       out_of_scope), every knowledge record must cite a section anchor, and
+#       `_provenance` no longer stores `tier`. Retiering `id` and removing fields
+#       are both inventory moves, which is exactly what this number versions.
+SCHEMA_VERSION = 3
 
 TIER_NAMES = {0: "deterministic", 1: "derived", 2: "model"}
 
@@ -119,28 +125,32 @@ FIELDS = (
        note="which revision of this inventory wrote the block"),
     _f("vocab_version", 0, "scalar", maps_to="local",
        note="which revision of the term list the values were checked against"),
+    _f("id", 0, "scalar", maps_to="dcterms:identifier",
+       note="THE canonical identity: the source path, slugified per segment, "
+            "unique by construction; authored wins so a rename can keep it"),
     _f("uid", 0, "scalar", maps_to="dcterms:identifier",
-       note="stable machine identity, namespaced from the source path"),
+       note="DEPRECATED alias of `id`, always exactly equal to it; kept so a "
+            "consumer written against v2 keeps resolving"),
     _f("version", 0, "scalar", maps_to="local",
        note="the source document's own revision, when it declares one"),
     _f("source", 0, "map", maps_to="dcterms:source",
-       note="uri/publisher/authored_by/supersedes/is_derivative"),
+       note="uri/url/publisher/authored_by/supersedes/is_derivative"),
     _f("extraction", 0, "map", maps_to="prov:Activity",
        note="run_at/schema/extractor — prov:generatedAtTime + prov:SoftwareAgent"),
 
     # ---- tier 1: derived by rule ----------------------------------------------
-    _f("id", 1, "scalar", maps_to="dcterms:identifier",
-       note="human-stable slug; authored wins, derived from title otherwise"),
     _f("slug", 1, "scalar", maps_to="local", note="url form of the title"),
     _f("word_count", 1, "scalar", maps_to="local"),
     _f("reading_time_minutes", 1, "scalar", maps_to="local"),
 
     # ---- tier 2: model proposes, human corrects -------------------------------
     _f("title", 2, "scalar", maps_to="dcterms:title",
-       note="extracted when the source has a real one; the junk-title path is "
-            "exactly where a model should propose from the first heading"),
-    _f("short_title", 2, "scalar", maps_to="local", note="compression judgement"),
-    _f("abstract", 2, "scalar", maps_to="dcterms:abstract"),
+       note="a deterministic floor always fills this (source property, else first "
+            "heading, else filename); a model may only improve a floor value that "
+            "was a GUESS, never one read from a document property"),
+    _f("abstract", 2, "scalar", maps_to="dcterms:abstract",
+       note="a derived floor (the lede paragraph, sentence-truncated) fills this "
+            "with no model; a model may improve it, a person outranks both"),
     _f("type", 2, "scalar", vocab="document_types", maps_to="dcterms:type"),
     _f("subtype", 2, "list", vocab="subtype", maps_to="dcterms:type"),
     _f("lang", 2, "scalar", vocab="lang", maps_to="dcterms:language"),
@@ -148,16 +158,15 @@ FIELDS = (
     _f("keywords", 2, "list", vocab="keywords", maps_to="skos:Concept"),
     _f("topics", 2, "list", vocab="topics", maps_to="dcterms:subject"),
     _f("audience", 2, "list", vocab="audience", maps_to="dcterms:audience"),
-    _f("aliases", 2, "list", maps_to="skos:altLabel"),
     _f("entities", 2, "groups", vocab="entity_types", maps_to="schema:Thing"),
     _f("relations", 2, "records", vocab="relation_predicates", maps_to="local"),
     _f("decisions", 2, "records", vocab="decision_status", maps_to="madr:status"),
     _f("risks", 2, "records", vocab="impact", maps_to="iso31000"),
     _f("open_questions", 2, "records", maps_to="local"),
-    _f("links", 2, "groups", vocab="link_categories", maps_to="dcterms:references"),
+    _f("links", 2, "groups", vocab="link_categories", maps_to="dcterms:references",
+       note="every outbound URL the body carries is HARVESTED at tier 0 from the "
+            "outline; a model may categorise and add, never delete or contradict"),
     _f("see_also", 2, "list", maps_to="dcterms:references"),
-    _f("prerequisites", 2, "list", maps_to="dcterms:requires"),
-    _f("out_of_scope", 2, "list", maps_to="local"),
 
     # ---- authored only: accountability and safety boundaries ------------------
     _f("status", 2, "scalar", vocab="document_status", authored_only=True,
@@ -166,15 +175,16 @@ FIELDS = (
        maps_to="dcterms:accessRights",
        note="a field whose entire purpose is a safety boundary cannot have a "
             "model as its author"),
-    _f("classification", 2, "scalar", authored_only=True, maps_to="local",
-       note="the human-facing wording of confidentiality"),
     _f("owner", 2, "scalar", authored_only=True, maps_to="prov:wasAttributedTo"),
     _f("accountable_roles", 2, "records", authored_only=True,
        maps_to="prov:wasAttributedTo"),
     _f("review_cadence", 2, "scalar", vocab="review_cadence", authored_only=True,
        maps_to="local"),
     _f("last_reviewed", 2, "scalar", authored_only=True, maps_to="dcterms:modified"),
-    _f("next_review_due", 2, "scalar", authored_only=True, maps_to="local"),
+    _f("next_review_due", 2, "scalar", authored_only=True, maps_to="local",
+       note="authored-only, but DERIVABLE: last_reviewed + review_cadence is "
+            "arithmetic over two authored values, so computing it restates a "
+            "person's commitment rather than making one for them"),
     _f("validated_against_version", 2, "scalar", authored_only=True, maps_to="local",
        note="the product/tool version the document's claims were checked against"),
 )
@@ -190,14 +200,21 @@ _RECORD_VOCAB = {
     "risks": OrderedDict([("impact", "impact"), ("mode", "failure_modes")]),
 }
 
-# Which of those sub-keys a record MUST carry. The rest are qualifiers: nuance was
+# Which sub-keys a record MUST carry. The rest are qualifiers: nuance was
 # deliberately pushed into them, so most records legitimately omit them and
 # demanding one would make every ordinary relation an error. A record missing a
 # REQUIRED key is a different thing — nothing then checks it against a vocabulary.
+#
+# `ref` IS REQUIRED ON EVERY KNOWLEDGE RECORD. Without it `{"p": "runs_on"}` is a
+# schema-valid relation and "which section says this?" is unanswerable — the claim
+# cannot be checked, quoted or repaired, so it is not knowledge, it is a rumour with
+# a predicate. `s`/`o` are required for the same reason a relation with one endpoint
+# is not an edge.
 _RECORD_REQUIRED = {
-    "relations": ("p",),
-    "decisions": ("status",),
-    "risks": ("impact",),
+    "relations": ("s", "p", "o", "ref"),
+    "decisions": ("status", "ref"),
+    "risks": ("impact", "ref"),
+    "open_questions": ("ref",),
 }
 
 # For a `groups` field: which vocabulary governs the GROUP NAMES, and (for
@@ -207,8 +224,31 @@ _GROUP_VOCAB = {
     "links": OrderedDict([("group_name", "link_categories")]),
 }
 
+# The same rule for the members of a `groups` field. Applied only to the LIST shape
+# — a group written as a mapping keys its members BY name, so demanding a `name`
+# sub-key there would reject the one shape that cannot omit it.
+_GROUP_REQUIRED = {
+    "entities": ("name", "ref"),
+    "links": ("url", "ref"),
+}
+
 # Governed by referential integrity rather than by a term list (vocab.yaml `refs`).
 REF_FIELDS = ("ref", "backs", "see_also", "control", "protects")
+
+# ONE IDENTITY, and which one it is.
+#
+# v2 shipped two: `uid` (from the source path) and `id` (from the title). Both were
+# resolvable — `kb_lint` looked refs up in both — so a corpus could grow two disjoint
+# link graphs that each linted clean, and half of every document's inbound links were
+# invisible from the other half.
+#
+# `id` is canonical because it is the name everything already points AT: `see_also`,
+# the knowledge-header join key, and the hand-authorable escape hatch that survives a
+# file move. Its VALUE now comes from the source path (see `_enrich.unique_id`), which
+# is what makes it unique by construction; the title keeps its own slug in `slug`,
+# where a collision is harmless because nothing resolves against it.
+CANONICAL_ID = "id"
+ALIAS_FIELDS = OrderedDict([("uid", CANONICAL_ID)])
 
 
 def field_names():
@@ -253,6 +293,12 @@ def record_required(name):
     # type: (str) -> tuple
     """Sub-keys a record of this field must carry (the rest are optional qualifiers)."""
     return tuple(_RECORD_REQUIRED.get(name) or ())
+
+
+def group_required(name):
+    # type: (str) -> tuple
+    """Sub-keys a LIST-shaped member of this ``groups`` field must carry."""
+    return tuple(_GROUP_REQUIRED.get(name) or ())
 
 
 def group_vocab(name):

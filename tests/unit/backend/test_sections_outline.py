@@ -117,19 +117,59 @@ def test_bulleted_lists_do_not_become_headings():
     assert out["outline"][0]["children"] == []
 
 
-def test_tables_counted_in_owning_section():
+def test_tables_are_addressable_nodes_in_their_owning_section():
     text = ("# T\n| Bits | Name |\n|------|------|\n| 0 | A |\n| 1 | B |\n"
             "## Sub\nno table here\n")
     out = document_outline(text)
-    assert out["outline"][0]["tables"] == 1
-    assert out["outline"][0]["children"][0]["tables"] == 0
+    tables = out["outline"][0]["tables"]
+    assert len(tables) == 1
+    tbl = tables[0]
+    assert tbl["line"] == 1                       # the header row, body-relative
+    assert tbl["rows"] == 3 and tbl["cols"] == 2  # header + 2 data rows
+    assert tbl["has_header"] is True
+    assert tbl["table_id"].startswith("tbl-")
+    assert out["outline"][0]["children"][0]["tables"] == []
+
+
+def test_table_id_is_content_derived_not_positional():
+    # The point of C5: a table must stay citable across an edit above it. Inserting a
+    # paragraph moves `line`; it must NOT move `table_id`.
+    before = "# T\nintro\n| Role | Contact |\n|---|---|\n| Lead | Ravi |\n"
+    after = "# T\nintro\nA NEW paragraph lands here.\n| Role | Contact |\n|---|---|\n| Lead | Ravi |\n"
+    a = document_outline(before)["outline"][0]["tables"][0]
+    b = document_outline(after)["outline"][0]["tables"][0]
+    assert a["table_id"] == b["table_id"]
+    assert a["line"] != b["line"]                 # position moved, identity did not
+
+
+def test_two_tables_are_distinguished_by_header_then_by_ordinal():
+    text = ("# One\n| Role | Contact |\n|---|---|\n| Lead | Ravi |\n"
+            "| Sev | Action |\n|---|---|\n| 1 | Page |\n"
+            "| Role | Contact |\n|---|---|\n| Deputy | Mira |\n"
+            "## Two\n| Role | Contact |\n|---|---|\n| Lead | Ravi |\n")
+    out = document_outline(text)
+    first = [t["table_id"] for t in out["outline"][0]["tables"]]
+    second = [t["table_id"] for t in out["outline"][0]["children"][0]["tables"]]
+    assert len(first) == 3 and len(set(first)) == 3      # same header, different ids
+    # ...and the same header in a DIFFERENT section is a different table.
+    assert second[0] not in first
 
 
 def test_anchors_disambiguate_repeats():
+    # The RENDERER's suffix (`-1`, `-2`), not an invented one: this is what
+    # kb.body_anchors publishes and what a `#fragment` has to match.
     text = "# Overview\na\n# Details\nb\n# Overview\nc\n"
     out = document_outline(text)
     anchors = [n["anchor"] for n in out["outline"]]
-    assert anchors == ["overview", "details", "overview#2"]
+    assert anchors == ["overview", "details", "overview-1"]
+
+
+def test_anchor_keeps_the_section_number():
+    # "1.2 Scope" is addressable as "#12-scope" in every common renderer, so that is
+    # what structure.json advertises — dropping the number would advertise a fragment
+    # no renderer emits (quality-plan C3).
+    out = document_outline("# 1.2 Scope\nbody\n")
+    assert out["outline"][0]["anchor"] == "12-scope"
 
 
 def test_ids_are_sequential_and_unique():

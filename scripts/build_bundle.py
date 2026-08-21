@@ -49,7 +49,13 @@ from backend.ingest import (load_source_root,    # noqa: E402
 from backend.validate import image_report, caption_report   # noqa: E402  (report policy)
 from backend.provenance import (code_identity, host_identity,   # noqa: E402
                                 compact_run, config_provenance, corpus_id,
-                                decision, path_id, redact_argv, run_block)
+                                decision, path_id, redact_argv, run_block,
+                                stamp_stage)
+
+# This script's own name in `run.entrypoint`, in every `decisions[].stage` it
+# writes and in every manifest row it appends — one string, so the three can never
+# disagree about which stage produced what.
+ENTRYPOINT = "build_bundle"
 
 # Our extracted images are content-addressed: <sha16>.<ext>. Used to scope the orphan
 # GC so it only ever removes files this pipeline wrote, never a stray hand-placed file.
@@ -95,27 +101,38 @@ def _converter_id(lane="ooxml"):
     return stamp
 
 
-def _run_context(entrypoint, args, argv, run_id, tools=None):
-    # type: (str, object, list, str, dict) -> OrderedDict
+def _run_context(entrypoint, args, argv, run_id, tools=None, paths=None,
+                 root_attr="src", extra_config=None):
+    # type: (str, object, list, str, dict, dict, str, dict) -> OrderedDict
     """The ``run{}`` block: what was asked for, by which code, on what.
 
     Configuration provenance is resolved by DIFFERENCE against the real loader (see
     backend.provenance) so there is no second copy of the precedence rules. Path
     arguments are redacted — the root CLAUDE.md forbids absolute host paths in
-    published output, and a bundle is published output."""
+    published output, and a bundle is published output.
+
+    Shared by every entrypoint that writes into a bundle root, which is why the
+    three things that differ between them are arguments: which flags a REPLAY must
+    be able to fill back in (``paths``), which flag names the root whose identity is
+    recorded (``root_attr``), and any settings the ingest loader does not own
+    (``extra_config`` — enrichment's namespace and permalink base resolve through
+    argparse, not through the toml)."""
     from backend.ingest import load_ingest_config as _cfg
     now = _cfg()._asdict()
     no_env = _cfg(env={})._asdict()
     no_file = _cfg(env={}, config_path=os.devnull)._asdict()
     env_present = sorted(k for k in os.environ if k.startswith("DOC2MD_"))
     ident = code_identity(_REPO, dirty=_git_dirty())
+    config = config_provenance(now, no_env, no_file, env_present)
+    for key, rec in sorted((extra_config or {}).items()):
+        config[key] = rec
     return run_block(
         entrypoint, run_id,
-        argv=redact_argv(argv, {"--src": "<src>", "--out": "<out>"}),
+        argv=redact_argv(argv, paths or {"--src": "<src>", "--out": "<out>"}),
         code=ident, host=host_identity(),
-        config=config_provenance(now, no_env, no_file, env_present),
+        config=config,
         tools=tools or {},
-        source_root_id=path_id(os.path.abspath(getattr(args, "src", "") or "")))
+        source_root_id=path_id(os.path.abspath(getattr(args, root_attr, "") or "")))
 
 
 def _resolve_tokenizer(cli_override):
@@ -354,9 +371,32 @@ def _failure_report(row, error, warnings, run_id="", converter="", run=None,
     rep["losslessness"] = {"method": "ooxml-ground-truth", "gate": "fail",
                            "error": error}
     rep["warnings"] = list(warnings or [])
-    rep["decisions"] = list(decisions or [])
+    rep["decisions"] = stamp_stage(decisions, ENTRYPOINT)
     if run:
+        record_stage_run(rep, run, writer=True)
+    return rep
+
+
+def record_stage_run(rep, run, writer=False):
+    # type: (dict, dict, bool) -> dict
+    """Add ``run`` to a report's stage history; for the WRITER, also to ``run{}``.
+
+    ``run{}`` stays exactly what it has always been — the run that produced the
+    markdown — because replay_run and the rubric index by it, and a later stage
+    overwriting it would destroy the conversion's provenance to record its own.
+    ``runs[]`` is the history: one entry per entrypoint that has written into this
+    report, oldest first, a re-run of a stage replacing its own entry so nothing
+    accumulates. It exists because a bundle is not written once — enrichment
+    rewrites ``meta.id``, ``meta.uid`` and ``meta.source.url`` afterwards, and
+    before this the switches that decided those three were in no artifact at all.
+    A rebuild starts the history over, which is correct: the earlier stages no
+    longer describe these bytes."""
+    if writer:
         rep["run"] = run
+    runs = [r for r in (rep.get("runs") or [])
+            if r.get("entrypoint") != run.get("entrypoint")]
+    runs.append(run)
+    rep["runs"] = runs
     return rep
 
 
@@ -422,7 +462,8 @@ def build_one(row, soffice, out_root, run_id, token_count=None, token_model=None
         lane="office", source_text=info["source_text"], body_md=body_md,
         source_meta=info["meta"], converter=converter, source_sha256=src_sha,
         warnings=warnings, extras=extras, timing_ms={"convert": t_convert},
-        generated_run=run_id, token_count=token_count, token_model=token_model)
+        generated_run=run_id, token_count=token_count, token_model=token_model,
+        source_structure=info.get("source_structure") or {})
     rep = bundle["report"]
     rep["decisions"] = decisions
     # An empty (or effectively empty) source is vacuously lossless -- there was
@@ -444,8 +485,9 @@ def build_one(row, soffice, out_root, run_id, token_count=None, token_model=None
     # silent (and never leaves a half-written bundle behind).
     if rep["status"] == "failed" or rep["losslessness"].get("gate") == "fail":
         rep["timing_ms"]["validate"] = int((time.time() - t1) * 1000)
+        rep["decisions"] = stamp_stage(decisions, ENTRYPOINT)
         if run:
-            rep["run"] = run
+            record_stage_run(rep, run, writer=True)
         _write_json(os.path.join(doc_dir, "report.json"), rep)
         return {"doc_id": row["id"], "source_relpath": row["rel"], "lane": "office",
                 "status": "failed", "markdown_sha256": rep["markdown_sha256"],
@@ -499,8 +541,9 @@ def build_one(row, soffice, out_root, run_id, token_count=None, token_model=None
                                   {"images": carried}))
 
     rep["timing_ms"]["validate"] = int((time.time() - t1) * 1000)
+    rep["decisions"] = stamp_stage(decisions, ENTRYPOINT)
     if run:
-        rep["run"] = run
+        record_stage_run(rep, run, writer=True)
     _write_json(os.path.join(doc_dir, "report.json"), rep)
     _write_atomic(os.path.join(doc_dir, "document.md"), bundle["document_md"])
     _write_json(os.path.join(doc_dir, "structure.json"), bundle["structure"])
@@ -596,7 +639,7 @@ def main(argv=None):
     if soffice:
         tools["soffice"] = oc.soffice_version(soffice) or "unknown"
     started = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    run = _run_context("build_bundle", args, raw_argv, run_id, tools)
+    run = _run_context(ENTRYPOINT, args, raw_argv, run_id, tools)
     # Per document: everything except the ~30-entry resolved-config table, which is
     # identical for every bundle in the run. The omission is NAMED, and the full
     # block is one join away in runs.jsonl.
@@ -618,6 +661,7 @@ def main(argv=None):
             m["run_id"] = run_id
             m["ts"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
             m["action"] = action
+            m["stage"] = ENTRYPOINT
             mf.write(json.dumps(m) + "\n")
             rows_written.append(m)
 

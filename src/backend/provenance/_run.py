@@ -18,11 +18,13 @@ summary: What a run was — argv, resolved configuration with the provenance of 
 # Pure: strings and dicts in, an OrderedDict out. Every disk touch (reading .git,
 # asking soffice its version, hashing a tree) belongs to the caller.
 import hashlib
+import re
 
 from collections import OrderedDict
 
-__all__ = ["run_block", "decision", "config_provenance", "redact_argv",
-           "path_id", "corpus_id", "compact_run", "DECISION_CODES"]
+__all__ = ["run_block", "decision", "stamp_stage", "config_provenance",
+           "redact_argv", "safe_value", "path_id", "corpus_id", "compact_run",
+           "DECISION_CODES"]
 
 # Every branch the pipeline is allowed to record. A closed list on purpose: an
 # unnamed decision is one nobody can aggregate, and a typo would silently create a
@@ -38,6 +40,10 @@ DECISION_CODES = (
     "empty_source",           # a zero-byte source: vacuously lossless, nothing to lose
     "captions_carried",       # a --force rebuild reused prior captions by image_id
     "skipped_existing",       # an already-built bundle was left alone
+    "metadata_tier",          # enrichment ran with a model, or deterministically
+    "vocabulary_selected",    # which term list every value was graded against
+    "identity_namespace",     # the namespace meta.id / meta.uid were derived under
+    "permalink_base",         # whether meta.source.url came out absolute or relative
 )
 
 _REDACT = ("--src", "--out", "--bundles", "--assets", "--assets-dir", "--md-dir",
@@ -68,6 +74,65 @@ def corpus_id(rows):
     return hashlib.sha256("\n".join(pairs).encode("utf-8")).hexdigest()
 
 
+def _redact_piece(piece):
+    # type: (str) -> str
+    """One whitespace-free fragment with any absolute host path replaced by its id.
+
+    THE TEST IS ON THE VALUE, never on the flag that carried it. Matching flag
+    names was unsound twice over: argparse accepts unambiguous PREFIXES, so a set
+    keyed on ``--src`` never fired for ``--sr /tmp/x``; and switches nobody thought
+    to list take paths routinely (``--only /abs/spec.docx``,
+    ``--tokenizer char:/home/me/models/tok``). Anything shaped like an absolute
+    path is redacted whatever switch carried it."""
+    if piece.startswith("//"):                  # a scheme-relative URL, not a path
+        return piece
+    if piece.startswith("/") and len(piece) > 1:
+        return "<path:%s>" % path_id(piece)
+    head, sep, tail = piece.partition(":")
+    # A path riding inside a compound value: `char:/home/me/models/tok`. A URL is
+    # excluded by the `//` test above, so `--source-base-url https://wiki/docs`
+    # survives verbatim — it is a switch that decided the output, not a host path.
+    if sep and tail.startswith("/") and not tail.startswith("//"):
+        return "%s:<path:%s>" % (head, path_id(tail))
+    return piece
+
+
+def _redact_value(value):
+    # type: (object) -> object
+    """A whole value with every absolute host path inside it replaced by its id.
+
+    A value that IS an absolute path is redacted whole, spaces and all — plenty of
+    source documents live at ``/vols/spec drafts/radar spec.docx``. Only a value
+    that is not itself a path is split on whitespace, because one argv element can
+    be an entire command line (``--worker-cmd "python3 /repo/w.py --shard 1"``) and
+    a path buried at word three leaks exactly as much as one at word one."""
+    if not isinstance(value, str) or "/" not in value:
+        return value
+    if value.startswith("/"):
+        return _redact_piece(value)
+    parts = re.split(r"(\s+)", value)
+    return "".join(p if i % 2 else _redact_piece(p) for i, p in enumerate(parts))
+
+
+def _placeholder_for(flag, paths):
+    # type: (str, dict) -> str
+    """The placeholder a named path flag asks for, honouring argparse's PREFIXES.
+
+    ``--sr`` IS ``--src`` to argparse. A prefix that is ambiguous within the known
+    set gets no placeholder and falls through to the value test above, which is the
+    safe direction: it redacts rather than reconstructs."""
+    if flag in paths:
+        return paths[flag]
+    if flag in _REDACT:
+        return "<path>"
+    if not flag.startswith("--") or len(flag) < 4:
+        return ""
+    known = dict((name, "<path>") for name in _REDACT)
+    known.update(paths)
+    hits = sorted(set(v for name, v in known.items() if name.startswith(flag)))
+    return hits[0] if len(hits) == 1 else ""
+
+
 def redact_argv(argv, paths=None):
     # type: (list, dict) -> list
     """``argv`` with path VALUES replaced by placeholders, keeping every switch.
@@ -75,40 +140,49 @@ def redact_argv(argv, paths=None):
     A replay needs to know that ``--tokenizer tiktoken:cl100k_base`` was passed far
     more than it needs the operator's home directory, and the one thing that must
     never land in a published artifact is an absolute host path. ``paths`` maps a
-    flag to the placeholder to use, e.g. ``{"--src": "<src>"}``; anything in the
-    default set that is not named there becomes ``<path>``."""
+    flag to the placeholder a REPLAY can fill back in, e.g. ``{"--src": "<src>"}``;
+    the flags in the default set become ``<path>``; and every remaining value is
+    scrubbed by shape, so a path can never reach an artifact through a switch
+    nobody listed."""
     paths = paths or {}
     out = []
     expect = None
     for arg in list(argv or []):
-        if expect is not None:
+        # A value never starts with `--`; a flag that swallowed the next SWITCH
+        # would silently delete it from the record.
+        if expect is not None and not arg.startswith("--"):
             out.append(expect)
             expect = None
             continue
-        out.append(arg)
-        flag = arg.split("=", 1)[0]
-        if flag in _REDACT or flag in paths:
-            placeholder = paths.get(flag, "<path>")
-            if "=" in arg:
-                out[-1] = "%s=%s" % (flag, placeholder)
-            else:
-                expect = placeholder
+        expect = None
+        flag, eq, value = arg.partition("=")
+        placeholder = _placeholder_for(flag, paths) if arg.startswith("-") else ""
+        if eq:
+            out.append("%s=%s" % (flag, placeholder or _redact_value(value)))
+        elif placeholder:
+            out.append(arg)
+            expect = placeholder
+        else:
+            out.append(_redact_value(arg))
     return out
 
 
-def _safe_value(value):
+def safe_value(value):
     # type: (object) -> object
-    """A configuration value with any absolute host path replaced by its id.
+    """A published value with any absolute host path replaced by its id.
+
+    Public, because every caller that writes a value into an artifact needs it
+    and the alternative is each of them re-deciding what a path looks like.
 
     Resolved configuration is full of paths (``markdown_dir``, ``assets_dir``, a
     vendored soffice), and the root ``CLAUDE.md`` forbids an absolute host path in
     published output. Hashing keeps the value COMPARABLE — two runs that used the
-    same directory still agree — without disclosing whose directory it was."""
+    same directory still agree — without disclosing whose directory it was. Same
+    shape test as ``argv``, so the two cannot drift into disagreeing about what a
+    path looks like."""
     if isinstance(value, (list, tuple)):
-        return [_safe_value(v) for v in value]
-    if isinstance(value, str) and value.startswith("/") and len(value) > 1:
-        return "<path:%s>" % path_id(value)
-    return value
+        return [safe_value(v) for v in value]
+    return _redact_value(value)
 
 
 def config_provenance(now, without_env, without_file, env_names=()):
@@ -134,7 +208,7 @@ def config_provenance(now, without_env, without_file, env_names=()):
             source = "file"
         else:
             source = "default"
-        out[key] = OrderedDict([("value", _safe_value(value)), ("from", source)])
+        out[key] = OrderedDict([("value", safe_value(value)), ("from", source)])
     if env_names:
         out["_env_present"] = OrderedDict(
             [("value", sorted(env_names)), ("from", "env")])
@@ -151,10 +225,36 @@ def decision(code, chose, reason, evidence=None):
     if code not in DECISION_CODES:
         raise ValueError("unknown decision code %r (add it to DECISION_CODES and "
                          "docs/reference/output-schema.md)" % (code,))
-    rec = OrderedDict([("code", code), ("chose", chose), ("reason", reason)])
+    # `chose` and `evidence` are published output like everything else here, and a
+    # caller reaching for "which vocabulary file" or "which base url" is exactly the
+    # caller most likely to hand this an absolute path.
+    rec = OrderedDict([("code", code), ("chose", safe_value(chose)),
+                       ("reason", reason)])
     if evidence:
-        rec["evidence"] = OrderedDict(sorted(evidence.items()))
+        rec["evidence"] = OrderedDict(
+            (key, safe_value(val)) for key, val in sorted(evidence.items()))
     return rec
+
+
+def stamp_stage(decisions, stage):
+    # type: (list, str) -> list
+    """Every record re-emitted carrying the stage that took it, right after ``code``.
+
+    Two entrypoints now write into one ``decisions[]`` — the writer converts, the
+    enricher re-derives ``meta.id`` and the permalink — and an unattributed record
+    can answer neither "which run chose this?" nor "which records are mine to
+    replace?". ``stage`` is that stage's ``run.entrypoint``, so there is one word
+    for one thing. Pure: a new list of new records, the input untouched."""
+    out = []
+    for rec in decisions or []:
+        stamped = OrderedDict()
+        for key, value in rec.items():
+            stamped[key] = value
+            if key == "code":
+                stamped["stage"] = stage
+        stamped["stage"] = stage
+        out.append(stamped)
+    return out
 
 
 def run_block(entrypoint, run_id, argv=(), code=None, host=None, config=None,

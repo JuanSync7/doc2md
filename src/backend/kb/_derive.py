@@ -93,7 +93,20 @@ def reading_time_minutes(words, wpm=WORDS_PER_MINUTE):
 
 # GitHub/GFM, Python-Markdown and pandoc all KEEP underscores and unicode
 # letters in an anchor. Dropping them reported live links as dead.
-_ANCHOR_DROP = re.compile(r"[^\w \-]", re.UNICODE)
+# Keep word characters, ANY whitespace, and the hyphen; drop the rest.
+#
+# The whitespace class is ``\s``, not a literal space. A literal space dropped the
+# tab out of "Reset\tsequence" and the NBSP out of "Reset\xa0sequence" INSTEAD of
+# hyphenating them, so this returned ``resetsequence`` where the layer that publishes
+# anchors returned ``reset-sequence`` — the same heading, two fragments, and
+# ``_check_refs`` grading a live ``#reset-sequence`` as a dead link.
+_ANCHOR_DROP = re.compile(r"[^\w\s\-]", re.UNICODE)
+# A RUN of spacing and hyphens collapses to ONE hyphen. Joining on ``s.split()``
+# left the source's own hyphens in place, so the ordinary Word heading
+# "Overview - part 2" became ``overview---part-2`` here and ``overview-part-2``
+# there. Collapsing is the rule the other two implementations follow (see
+# ``docs/reference/output-schema.md``); this is the copy that was wrong.
+_ANCHOR_RUN = re.compile(r"[\s\-]+", re.UNICODE)
 # CommonMark allows up to three leading spaces before the hashes.
 _HEADING = re.compile(r"^ {0,3}(#{1,6})[ \t]+(.+?)[ \t]*#*[ \t]*$", re.M)
 
@@ -103,15 +116,24 @@ def heading_anchor(heading_text):
     """The ``#fragment`` a heading is addressable by, WITHOUT the leading ``#``.
 
     The common markdown-renderer rule: lowercase, drop everything that is not a
-    letter, digit, space or hyphen, then spaces to hyphens. Deliberately NOT
-    ``slugify`` — that turns every punctuation mark into a separator, so
-    ``7.3 Standing rule`` would become ``7-3-standing-rule`` where a renderer
-    produces ``73-standing-rule``. A ``ref`` that does not match what the renderer
-    emits is a dead link, so the rule has to be the renderer's, not ours.
+    word character, whitespace or a hyphen, then collapse every run of spacing and
+    hyphens to a single hyphen and trim. Deliberately NOT ``slugify`` — that turns
+    every punctuation mark into a separator, so ``7.3 Standing rule`` would become
+    ``7-3-standing-rule`` where a renderer produces ``73-standing-rule``. A ``ref``
+    that does not match what the renderer emits is a dead link, so the rule has to
+    be the renderer's, not ours.
+
+    This is one of THREE separate implementations of that rule, and the separation
+    is deliberate: ``sections.gfm_anchor`` PRODUCES the anchors structure.json
+    publishes, ``validate.gfm_anchor`` GRADES them, and this one is what
+    ``kb._lint._check_refs`` RESOLVES a ``ref`` against — a grader that imported the
+    producer would only be checking that a module agrees with itself. They must
+    still agree on every input, which is what ``tests/unit/backend/
+    test_anchor_parity.py`` exists to prove.
     """
     s = (heading_text or "").strip().lower()
     s = _ANCHOR_DROP.sub("", s)
-    return "-".join(s.split())
+    return _ANCHOR_RUN.sub("-", s).strip("-")
 
 
 def body_anchors(body_md):

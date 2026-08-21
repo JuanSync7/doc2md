@@ -5,7 +5,8 @@ layer: backend
 summary: Size-driven, heading-anchored chunking — bounded section counts, stable ids, content fingerprints.
 """
 import pytest
-from backend.sections import chunk_sections, normalize_title, is_heading
+from backend.sections import (chunk_sections, fenced_lines, is_heading,
+                              normalize_title)
 
 pytestmark = pytest.mark.unit
 
@@ -162,3 +163,35 @@ def test_is_heading_levels():
     assert is_heading("### Deep") == 3
     assert is_heading("1.2.3 Something Here") == 3
     assert is_heading("just a normal sentence that goes on for a while") == 0
+
+
+# ------------------------------------------------- fenced code is not prose
+
+def test_fenced_lines_marks_the_delimiters_and_everything_between():
+    lines = ["prose", "```sh", "# reset", "code", "```", "after"].copy()
+    assert fenced_lines(lines) == [False, True, True, True, True, False]
+
+
+def test_an_unclosed_fence_runs_to_the_end_like_commonmark():
+    assert fenced_lines(["a", "~~~", "b", "c"]) == [False, True, True, True]
+
+
+def test_a_chunk_never_breaks_on_a_shell_comment():
+    # A size-driven break lands AT a heading, and a shell comment inside a
+    # transcript used to be one — so a chunk could open on the middle of a code
+    # block, with no opening fence and no way for a carder to know it was code.
+    body = "filler prose line that carries some weight\n" * 500
+    text = ("# Runbook\n" + body
+            + "```sh\n# reset the board\nkestrelctl board reset\n```\n"
+            + body)
+    secs = chunk_sections("d", text)
+    lines = text.split("\n")
+    fenced = fenced_lines(lines)
+    for s in secs:
+        assert not fenced[s.l0], "chunk opened inside a code fence: %r" % lines[s.l0]
+
+
+def test_pipe_art_inside_a_fence_is_not_a_table_header_to_repeat():
+    from backend.sections._chunk import _table_headers
+    lines = ("```\n| col |\n| --- |\n| 1 |\n```\n").split("\n")
+    assert _table_headers(lines) == {}

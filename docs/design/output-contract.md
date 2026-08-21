@@ -132,7 +132,8 @@ The **faithful heading tree** of the document: every heading, nested by level, w
 token counts and image placement. This is **not** `chunk_sections` — that is the
 size-bounded RAG *derivation*. The outline is the *map*; the RAG system chunks from
 the outline + markdown. Both share the heading helpers (`is_heading`,
-`normalize_title`) so they agree on what a heading is.
+`gfm_anchor`, `normalize_title`) so they agree on what a heading is and what it is
+addressable by.
 
 Produced by the **deterministic layer, no LLM.** Token counts come from an injected
 tokenizer (the same `token_count` callable the chunker takes); with no tokenizer,
@@ -153,16 +154,36 @@ the 3.6/stdlib backend so no tokenizer dependency leaks in. `build_bundle.py
                                        //   not transactionally)
   "token_model": "cl100k_base",        // or "char-estimate/4" when no tokenizer
   "total_tokens": 12345,
+  "levels_inferred": false,              // true when the nesting was read from the titles'
+                                         //   section numbering because the extractor emitted
+                                         //   one level for the whole document
   "outline": [
     {
-      "id": "sec-0001",
+      "id": "sec-0001",                  // POSITIONAL — addresses a place, not a section
+      "section_id": "3f2a10c4d5e6b708",  // sha1(anchor)[:16] — content-derived, survives an
+                                         //   inserted heading; the corpus key is (doc_id, this)
+      "parent": null,                    // parent node's section_id; null at top level
       "level": 1,
       "title": "System Design",
-      "anchor": "system-design",         // normalize_title, disambiguated within doc
+      "anchor": "system-design",         // THE url fragment a renderer emits for this heading,
+                                         //   section number kept ("1.2 Scope" -> "12-scope");
+                                         //   repeats take the renderer's suffix ("-1", "-2"),
+                                         //   so the set matches kb.body_anchors exactly
       "line_span": [10, 120],            // [l0, l1) into the markdown BODY (see note below)
       "self_tokens": 900,                // body tokens before children
       "subtree_tokens": 4200,            // incl. all descendants
-      "tables": 2,
+      "fingerprint": "9c1f0b7a4e2d6531",  // sha1 of this node's OWN body, markdown stripped
+      "tables": [                        // tables are NODES, addressable like images
+        {
+          "table_id": "tbl-7c4a1e9b02",  // sha1(anchor + normalised header + ordinal)[:10] —
+                                         //   content-derived, so an edit above it does not
+                                         //   move it; editing the header row does
+          "line": 55,                    // the header row's placement in the BODY
+          "rows": 5,                     // header row + data rows (md_structure's convention)
+          "cols": 4,
+          "has_header": true
+        }
+      ],
       "images": [
         {
           "image_id": "219f951a5046d997",         // sha16 of the image bytes
@@ -271,7 +292,10 @@ enough metrics for a dashboard to triage without opening the markdown.
     // not measure the source side (e.g. PDF: binary glyphs, no raw-text repr).
   },
   "structure": {
-    "max_depth": 4, "largest_section_tokens": 4200, "has_toc": true,
+    "max_depth": 4,                      // TREE depth, not max(level)
+    "largest_section_tokens": 4200,      // biggest subtree anywhere (includes the root)
+    "largest_leaf_tokens": 1350,         // biggest LEAF — the unit actually retrieved
+    "has_toc": true,
     "coverage": {                        // OUTLINE-COVERAGE gate (structure-side recall):
       "content_lines": 812,              // non-blank lines in the markdown body
       "covered_lines": 809,              // lines inside some outline node's line_span
@@ -303,9 +327,9 @@ enough metrics for a dashboard to triage without opening the markdown.
   },
   "doc_meta": {                          // OVERLAY coverage gate (metadata enrichment):
     "enabled": true,                     // a model was reachable this run
-    "schema_version": 2, "vocab_version": 1,   // field inventory / term list revisions
-                                         // v2 = descriptors here, knowledge in knowledge.json
-    "expected": 20,                      // counted over the MERGED view: 6 of these
+    "schema_version": 3, "vocab_version": 2,   // field inventory / term list revisions
+                                         // v3 = one identity, section-anchored records
+    "expected": 16,                      // counted over the MERGED view: 5 of these
                                          // fields live in knowledge.json, not here
     "filled": 14,                        // fields with a valid value
     "authored": 2, "invalid": 0,         // written by a PERSON / present but off-vocabulary
@@ -412,10 +436,10 @@ captioning stage runs.
 ```json
 {
   "doc_id": "mem-spec",
-  "id": "memory-controller-design-spec",
+  "id": "specs/mem",
   "uid": "specs/mem",
-  "schema_version": 2,
-  "vocab_version": 1,
+  "schema_version": 3,
+  "vocab_version": 2,
   "markdown_sha256": "…",
 
   "entities":       { "hosts": [ … ], "software": [ … ] },

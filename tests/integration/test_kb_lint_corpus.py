@@ -8,6 +8,8 @@ summary: The corpus linter end to end — closed-vocabulary failure, --strict, c
 import importlib.util
 import json
 import os
+import random
+import time
 from collections import OrderedDict
 
 import pytest
@@ -351,7 +353,13 @@ def test_a_narrowed_run_skips_the_gates_that_truncation_would_invert(
 
     assert kb.main(_argv(bundles, "--only", "b01")) == 0
     out = capsys.readouterr().out
-    assert "graph, skew, coverage, vocab_usage were SKIPPED" in out
+    # Named ONE BY ONE, with what each stops answering — a joined list on one line
+    # is the shape an operator reads past.
+    skipped = [l for l in out.splitlines() if "SKIPPED" in l]
+    assert len(skipped) == 4
+    for name in ("graph", "skew", "coverage", "vocab_usage"):
+        assert any(name in l for l in skipped), name
+    assert "backfill" in " ".join(skipped)                      # skew, said in words
     assert "resolve to no document in this corpus" not in out   # would be an artefact
     assert "backfill work list" not in out
     assert "[PARTIAL]" in out
@@ -408,24 +416,60 @@ def test_strict_promotes_a_corpus_warning_to_a_failure_too(tmp_path, capsys):
     assert kb.main(_argv(bundles, "--strict")) == 1
 
 
-def test_an_unreadable_document_narrows_the_corpus_exactly_as_a_flag_would(
+def test_one_unreadable_document_does_not_disable_the_corpus_gates(tmp_path, capsys):
+    # An unreadable document used to set `partial`, which set known_ids = None and
+    # switched off see_also resolution, the graph, skew, coverage and
+    # vocabulary-usage gates FOR THE WHOLE CORPUS — reported as one INFO line. At
+    # 1000 bundles that is a clean-looking all-clear over a corpus nobody checked.
+    # It is a finding about THAT document now, and every gate still runs.
+    kb = _mod("kb_lint")
+    bundles = tmp_path / "bundles"
+    _write_doc(bundles, "b01", _meta("alpha-runbook",
+                                     [("see_also", ["beta-runbook"]),
+                                      ("schema_version", 1)]))
+    _write_doc(bundles, "b03", _meta("gamma-runbook", [("schema_version", 2)]))
+    _write_raw(bundles, "b02", '---\nmeta:\n\tid: "beta-runbook"\n---\n\n' + BODY)
+
+    assert kb.main(_argv(bundles)) == 1              # unreadable is still a failure
+    out = capsys.readouterr().out
+    assert "UNREADABLE b02/document.md" in out
+    assert "[PARTIAL]" not in out                    # it is not a narrowed walk
+    assert "SKIPPED" not in out                      # and nothing was skipped
+    assert "backfill work list" in out               # skew still ran ...
+    # ... and the one document that could not be read is an ERROR about itself.
+    bad = [l for l in out.splitlines() if "contributes to NO corpus check" in l]
+    assert len(bad) == 1 and "b02/document.md" in bad[0]
+    # The denominator change is disclosed by name rather than by switching gates off.
+    assert "every check below still ran" in out
+
+
+def test_a_see_also_into_an_unreadable_document_is_reported_with_its_caveat(
         tmp_path, capsys):
-    # A document that cannot be READ truncates the corpus just as --only does, and
-    # the corpus gates cannot tell the difference: b01's see_also points at the
-    # document that failed to parse, so treating only the flags as narrowing made a
-    # single tab-indented front matter manufacture a dead link that does not exist.
+    # The one thing an unreadable document genuinely can invert: b01's see_also
+    # points at the document that failed to parse. Silence would be a false clean
+    # bill; an unqualified "dead link" would be a defect the corpus does not have.
+    # So it is reported WITH the reason it may be wrong, and the caveat is absent
+    # when every document parsed.
     kb = _mod("kb_lint")
     bundles = tmp_path / "bundles"
     _write_doc(bundles, "b01", _meta("alpha-runbook",
                                      [("see_also", ["beta-runbook"])]))
     _write_raw(bundles, "b02", '---\nmeta:\n\tid: "beta-runbook"\n---\n\n' + BODY)
 
-    assert kb.main(_argv(bundles)) == 1              # unreadable is still a failure
+    assert kb.main(_argv(bundles)) == 1
     out = capsys.readouterr().out
-    assert "UNREADABLE b02/document.md" in out
-    assert "[PARTIAL]" in out
-    assert "were SKIPPED" in out
-    assert "resolve to no document in this corpus" not in out   # not invented
+    dead = [l for l in out.splitlines() if "does not resolve to a known page id" in l]
+    assert len(dead) == 1
+    assert "could not be read" in dead[0]            # the caveat, with its count
+    assert "1 document(s)" in dead[0]
+
+    clean = tmp_path / "clean"
+    _write_doc(clean, "b01", _meta("alpha-runbook", [("see_also", ["ghost"])]))
+    _write_doc(clean, "b02", _meta("beta-runbook"))
+    assert kb.main(_argv(clean)) == 0
+    dead = [l for l in capsys.readouterr().out.splitlines()
+            if "does not resolve to a known page id" in l]
+    assert len(dead) == 1 and "could not be read" not in dead[0]
 
 
 def test_quiet_never_hides_the_findings_that_decide_the_exit_code(tmp_path, capsys):
@@ -656,3 +700,161 @@ def test_every_findings_row_in_the_json_report_has_the_same_shape(tmp_path, caps
     assert rows                                   # both kinds of document present
     assert all(len(f) == 5 for f in rows)
     assert all(f[4] in ("document.md", KNOWLEDGE_FILE) for f in rows)
+
+
+# ---------------------------------------------------------------- promotion
+
+def _vocab_copy(tmp_path):
+    """A writable copy of the shipped vocabulary — a test must never edit the repo's."""
+    dst = os.path.join(str(tmp_path), "vocab.yaml")
+    with open(VOCAB, encoding="utf-8") as fh:
+        text = fh.read()
+    with open(dst, "w", encoding="utf-8") as fh:
+        fh.write(text)
+    return dst, text
+
+
+def test_promote_writes_the_earned_terms_and_is_safe_to_run_twice(tmp_path, capsys):
+    # Promotion was frequency-counted, printed, and then left for somebody to hand
+    # copy — so `<field>_proposed` grew forever and every classified document stayed
+    # `pending` on terms the corpus had long since earned.
+    kb = _mod("kb_lint")
+    vocab_file, original = _vocab_copy(tmp_path)
+    promote_at = int(load_vocab(vocab_file).threshold("promote_at", 3))
+    bundles = tmp_path / "bundles"
+    for i in range(promote_at):
+        _write_doc(bundles, "b%02d" % i,
+                   _meta("doc-%d" % i, [("tags", ["fleet-upgrade"])]))
+    _write_doc(bundles, "b90", _meta("doc-90", [("tags", ["one-off-topic"])]))
+
+    argv = ["--bundles", str(bundles), "--vocab", vocab_file, "--promote"]
+    kb.main(argv)
+    out = capsys.readouterr().out
+    assert "promoted into" in out and "fleet-upgrade" in out
+    assert "one-off-topic" not in out.split("promoted into")[1]   # below threshold
+
+    after = load_vocab(vocab_file)
+    assert "fleet-upgrade" in after.values("tags")
+    assert "one-off-topic" not in after.values("tags")
+    # Terms moved, so the vocabulary version moved — that is what lets skew_report
+    # name the documents this promotion invalidates.
+    assert int(after.version) == int(load_vocab(text=original).version) + 1
+    # Everything a human wrote in that file is still there.
+    with open(vocab_file, encoding="utf-8") as fh:
+        text = fh.read()
+    assert "# doc2md — controlled vocabularies for document metadata." in text
+    assert "Hard-closing tags at document 1 means guessing the corpus shape." in text
+
+    # SAFE TO RUN TWICE: the term is governed now, so it is no longer a candidate,
+    # so there is nothing to write and not one byte changes.
+    kb.main(argv)
+    second = capsys.readouterr().out
+    assert "nothing has reached the promotion threshold" in second
+    with open(vocab_file, encoding="utf-8") as fh:
+        assert fh.read() == text
+
+
+def test_promote_is_refused_on_a_walk_the_operator_narrowed(tmp_path, capsys):
+    # Promotion is a DOCUMENT-COUNT decision and --only/--limit chooses which
+    # documents exist. Counting three uses out of a five-document slice of a
+    # thousand promotes a term the corpus never voted for, permanently.
+    kb = _mod("kb_lint")
+    vocab_file, _original = _vocab_copy(tmp_path)
+    bundles = tmp_path / "bundles"
+    for i in range(6):
+        _write_doc(bundles, "b%02d" % i,
+                   _meta("doc-%d" % i, [("tags", ["fleet-upgrade"])]))
+    with open(vocab_file, "rb") as fh:
+        before = fh.read()
+
+    rc = kb.main(["--bundles", str(bundles), "--vocab", vocab_file,
+                  "--promote", "--limit", "3"])
+    out = capsys.readouterr().out
+    assert rc == 1                                   # a refused write is not a pass
+    assert "[promote] REFUSED" in out and "--limit" in out
+    with open(vocab_file, "rb") as fh:
+        assert fh.read() == before                   # nothing was written
+
+
+def test_a_promotion_list_too_long_to_read_is_counted_rather_than_dumped(
+        tmp_path, capsys):
+    # A 1000-document silicon corpus put 6,526 keyword candidates on this one line —
+    # ~100KB of comma-separated text that hides every other field's candidates above
+    # and below it.
+    kb = _mod("kb_lint")
+    bundles = tmp_path / "bundles"
+    terms = ["candidate-term-%03d" % i for i in range(40)]
+    for i in range(3):
+        _write_doc(bundles, "b%02d" % i, _meta("doc-%d" % i, [("tags", terms)]))
+
+    kb.main(_argv(bundles))
+    line = [l for l in capsys.readouterr().out.splitlines()
+            if l.strip().startswith("promote")][0]
+    assert "40 candidate(s)" in line                  # the count is never dropped
+    assert "and 28 more" in line                      # ... and so is what it hid
+    assert len(line) < 600
+
+
+# ------------------------------------------------------- D7: soundness at scale
+
+def _scale_corpus(bundles, n_docs=1000, shared=("kubernetes", "ubernetes")):
+    """``n_docs`` bundles that look like a real registry corpus: a small shared
+    vocabulary plus one-off identifiers per document."""
+    rng = random.Random(20260819)
+    letters = "abcdefghijklmnopqrstuvwxyz"
+    for i in range(n_docs):
+        oneoff = ["".join(rng.choice(letters) for _ in range(12)) for _ in range(6)]
+        tags = list(oneoff)
+        # Entities are NOT scoped by document frequency — an entity named once is
+        # still a node — so these five thousand names go through the blocked sweep
+        # in full. That is the half of the run the shingle index has to carry.
+        ents = [{"name": "".join(rng.choice(letters) for _ in range(14)),
+                 "type": "Software"} for _ in range(5)]
+        # The planted near-duplicate pair differs in its FIRST characters, which is
+        # exactly what the old first-two-character bucketing could never compare.
+        # Both spellings sit on enough documents to stay inside a scoped sweep.
+        if i % 100 == 0:
+            tags.append(shared[0])
+        elif i % 100 == 1:
+            tags.append(shared[1])
+        _write_doc(bundles, "b%04d" % i,
+                   _meta("scale-doc-%04d" % i,
+                         [("tags_proposed", tags),
+                          ("entities", {"software": ents})]))
+
+
+def test_the_corpus_gates_stay_sound_and_affordable_at_a_thousand_documents(
+        tmp_path, capsys):
+    # Rubric D7. Two things have to hold at once, and the old code traded one for
+    # the other: the gates must still ANSWER at scale (the sweep used to fall back
+    # to unsound first-two-character bucketing above 4000 terms) and they must still
+    # RUN in a time somebody will wait for.
+    kb = _mod("kb_lint")
+    bundles = tmp_path / "bundles"
+    _scale_corpus(bundles, n_docs=1000)
+
+    started = time.time()
+    rc = kb.main(_argv(bundles))
+    elapsed = time.time() - started
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "RESULT documents=1000" in out
+    # 5000 entity names went through the sweep with nothing skipped, and the run
+    # says so — the old code reported "bucketed by leading characters" here.
+    assert "no pair was skipped" in out
+    # SOUND: the planted near-duplicate is found even though it differs in its first
+    # two characters and is buried in ~6000 one-off terms.
+    similar = [l for l in out.splitlines() if "% similar" in l]
+    assert any("kubernetes" in l and "ubernetes" in l for l in similar), similar[:5]
+    # DISCLOSED: the scope reduction is a warning carrying both counts, never silence.
+    scoped = [l for l in out.splitlines() if "sweep cap" in l]
+    assert len(scoped) == 1 and "not compared" in scoped[0]
+    # ... and the shape that caused it is named for what it is.
+    assert "registry growing faster than the corpus" in out
+    # NOTHING was skipped: a big corpus is not a partial one.
+    assert "[PARTIAL]" not in out and "SKIPPED" not in out
+    # AFFORDABLE. The old sweep was O(n^2) inside first-two-character buckets and
+    # took ~58s over 24,630 keyword terms; this budget is loose enough for a shared
+    # CI box and tight enough that a return to quadratic sweeping fails here.
+    assert elapsed < 60, "corpus gates took %.1fs over 1000 documents" % elapsed

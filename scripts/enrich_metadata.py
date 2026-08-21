@@ -5,10 +5,17 @@ Walks ``<bundles>/<doc_id>/`` and writes the DESCRIPTORS into ``document.md``'s
 ``meta`` front-matter block, the KNOWLEDGE payload into ``knowledge.json``, and a
 ``doc_meta`` gate into ``report.json``:
 
-    tier 0  deterministic  uid, version, source{}, extraction{} — from the bundle
-    tier 1  derived        id, slug, word_count, reading_time_minutes — by rule
-    tier 2  model          type, tags, abstract, entities, relations, ... — proposed
-                           by a model against the CLOSED vocabulary, then validated
+    tier 0  deterministic  id, version, source{}, extraction{} — from the bundle
+    tier 1  derived        slug, word_count, reading_time_minutes — by rule
+    tier 2  model          type, tags, entities, relations, ... — proposed by a
+                           model against the CLOSED vocabulary, then validated
+
+A model is the CEILING, never the floor. ``title``, ``abstract`` and ``links`` are
+tier-2 fields that a no-model run still fills, from evidence the pipeline already
+has: the docx core properties, the lede paragraph, and the outbound URLs harvested
+into ``structure.json`` at recall 1.0. Whether a model may then improve a floor value
+depends on where the floor came from — a title the document DECLARES is evidence and
+is protected, a title inferred from a filename is a guess and is not.
 
 Everything about what is allowed lives in ``backend.kb``; this file is transport.
 
@@ -55,18 +62,24 @@ _REPO = os.path.dirname(_HERE)
 sys.path.insert(0, os.path.join(_REPO, "src"))
 sys.path.insert(0, _HERE)
 
+import build_bundle as bb                        # noqa: E402  (shared writer helpers)
 from backend.ingest import (cache_last_wins, load_ingest_config,   # noqa: E402
                             render_front_matter, split_front_matter, YamlSubsetError)
-from backend.kb import (accept_model_meta, check_schema_bindings,   # noqa: E402
-                        derive_uid, keyword_candidates,
+from backend.provenance import (compact_run, decision,   # noqa: E402
+                                safe_value, stamp_stage)
+from backend.kb import (abstract_floor, accept_model_meta,        # noqa: E402
+                        body_anchors, check_schema_bindings,
+                        harvested_links, is_authored, keyword_candidates,
                         knowledge_document, knowledge_payload,
-                        load_vocab, merge_meta, meta_collisions, meta_coverage,
-                        order_meta, reading_time_minutes, request_spec,
-                        revalidate_generated, set_provenance, slugify, split_meta,
-                        word_count,
-                        KNOWLEDGE_FILE, META_KEY, PROVENANCE_KEY,
+                        load_vocab, merge_group_evidence, merge_meta,
+                        meta_collisions, meta_coverage,
+                        next_review_due, order_meta, reading_time_minutes,
+                        request_spec, revalidate_generated, set_provenance,
+                        slugify, source_url, split_meta, title_floor, unique_id,
+                        value_source, word_count,
+                        ALIAS_FIELDS, KNOWLEDGE_FILE, META_KEY, PROVENANCE_KEY,
                         SCHEMA_VERSION, SOURCE_AUTHORED, SOURCE_DERIVED,
-                        SOURCE_EXTRACTED)
+                        SOURCE_EXTRACTED, SOURCE_GENERATED)
 from backend.validate import doc_meta_report              # noqa: E402  (gate policy)
 
 from collections import OrderedDict                        # noqa: E402
@@ -74,6 +87,44 @@ from collections import OrderedDict                        # noqa: E402
 CACHE_NAME = "_kb_meta.jsonl"
 COV_NAME = "_kb_meta_coverage.jsonl"
 EXTRACTOR = "doc2md.kb/%d" % SCHEMA_VERSION
+
+# This stage's name in `run.entrypoint`, in every `decisions[].stage` it writes and
+# in every manifest row it appends. One string, so the three can never disagree.
+ENTRYPOINT = "enrich_metadata"
+
+# THIS STAGE IS A WRITER TOO, and until now it was the only one that recorded
+# nothing. Running it with `--namespace acme.internal --source-base-url
+# https://wiki/docs/` rewrites `meta.id`, `meta.uid` and `meta.source.url` — the
+# three fields the rubric grades as D2/D3/D4 — while `report.json`, `runs.jsonl`
+# and `manifest.jsonl` stayed byte-identical. The switches that decided the output
+# were recorded nowhere, so the run was neither repeatable nor even detectable.
+#
+# HOW IT COEXISTS WITH THE WRITER'S ROWS, since enrichment rewrites bundles
+# `build_bundle` wrote into the SAME root:
+#   runs.jsonl      one more row, `entrypoint: enrich_metadata`. Rows were already
+#                   keyed by run_id alone, and both stages accept `--run-id` — the
+#                   grader passes the SAME id to both — so a lookup by run_id could
+#                   silently return the writer's config for an enrichment report.
+#                   `replay_run` now matches on (run_id, entrypoint).
+#   manifest.jsonl  one row per document per run, in the existing shape. `status`
+#                   keeps meaning the CONVERSION verdict (read from report.json, not
+#                   invented here) so the column is not two vocabularies in a
+#                   trenchcoat; what enrichment did is the `action`, which is what
+#                   that column has always been for.
+#   report.json     `run{}` is left alone — it is the run that produced the markdown
+#                   and overwriting it would trade one stage's provenance for
+#                   another's. The stage history is `runs[]`; see
+#                   `build_bundle.record_stage_run`.
+
+# What this stage can have DONE to a document, as a closed list for the same reason
+# `DECISION_CODES` is closed: an unnamed action is one nobody can aggregate, and a
+# typo would silently create a category of one.
+_ACTIONS = (
+    "enriched",       # metadata was written
+    "unchanged",      # the run converged: nothing moved, nothing was written
+    "failed",         # unreadable / unparseable / a raised error, that document only
+    "deferred",       # --limit cut it before this run reached it
+)
 
 # Stamps about THIS run's writer, re-derived every time and never inherited — not
 # even from a block with no provenance, which the merge below otherwise treats as
@@ -109,28 +160,84 @@ def _write_atomic(dest, text):
     os.replace(tmp, dest)
 
 
+# Which of this script's own switches read an environment variable when the flag is
+# absent. `config_provenance` derives the INGEST settings by difference against the
+# real loader, which is the right trick when there is a loader; these resolve
+# through argparse, and argparse is the only loader they have.
+_ENV_BACKED = {"source_base_url": "DOC2MD_SOURCE_BASE_URL"}
+
+
+def _cli_provenance(parser, args):
+    # type: (object, object) -> dict
+    """Where each of THIS script's own switches got its value, as ``{value, from}``.
+
+    ``--namespace`` and ``--source-base-url`` decide ``meta.id``, ``meta.uid`` and
+    ``meta.source.url``, and `argv` alone cannot answer for them: a value that came
+    from ``$DOC2MD_SOURCE_BASE_URL`` never appears on the command line at all, so a
+    reader re-establishing the run elsewhere would rebuild it with a different
+    permalink and no artifact would say why.
+
+    Three cases, written out rather than modelled, because three is all there is: a
+    value argparse did not default to came from the FLAG; a value equal to an
+    env-backed default with that variable set came from the ENV; anything else is
+    the built-in DEFAULT."""
+    out = OrderedDict()
+    for action in parser._actions:                # the parser IS the spec here
+        name = action.dest
+        if name == "help" or not hasattr(args, name):
+            continue
+        value = getattr(args, name)
+        env_name = _ENV_BACKED.get(name)
+        if value != action.default:
+            source = "flag"
+        elif env_name and os.environ.get(env_name) not in (None, ""):
+            source = "env"
+        else:
+            source = "default"
+        # `--bundles` defaults to an absolute path under the repo root, so this
+        # table is a leak vector unless every value goes through the same shape
+        # test `argv` does. It does — one implementation, in backend.provenance.
+        rec = OrderedDict([("value", safe_value(value)), ("from", source)])
+        if source == "env":
+            # Name the variable in the record rather than leaving a replay to
+            # rebuild the mapping: it is the one fact that lets another machine
+            # check "is this still set, and still to that?" with no coupling.
+            rec["env"] = env_name
+        out["cli.%s" % name] = rec
+    return out
+
+
 def _sha12(s):
     # type: (str) -> str
     return hashlib.sha256(s.encode("utf-8")).hexdigest()[:12]
 
 
-def build_prompt(spec, title, body, excerpt_chars=12000):
-    # type: (dict, str, str, int) -> str
+def build_prompt(spec, title, body, excerpt_chars=12000, anchors=()):
+    # type: (dict, str, str, int, object) -> str
     """The full request: the rules, the field spec with its enums, then the document.
 
     The spec is embedded as JSON so the enums are unambiguous, and the document is
     truncated rather than dropped — a long runbook still classifies correctly from
     its opening sections, and announcing the truncation is better than silently
     changing what the model saw.
+
+    The SECTION ANCHORS block is what makes ``ref`` answerable. The spec says every
+    knowledge record must cite the section that asserts it; without the list of legal
+    anchors in front of the model that instruction can only be guessed at, and a
+    guessed anchor is rejected on arrival — so the constraint would cost a whole
+    answer instead of shaping one.
     """
     head = body[:excerpt_chars]
     truncated = len(body) > excerpt_chars
     parts = [BASE_PROMPT,
              "\nFIELDS TO FILL (JSON schema-ish; `values` is a closed list):\n",
              json.dumps(spec, indent=1, ensure_ascii=False),
-             "\n\nDOCUMENT TITLE: %s\n" % (title or "(none)"),
-             "\nDOCUMENT (markdown%s):\n" % (", truncated" if truncated else ""),
-             head]
+             "\n\nDOCUMENT TITLE: %s\n" % (title or "(none)")]
+    if anchors:
+        parts.append("\nSECTION ANCHORS (the only legal `ref` values, verbatim):\n"
+                     + ", ".join("#%s" % a for a in sorted(anchors)) + "\n")
+    parts.append("\nDOCUMENT (markdown%s):\n" % (", truncated" if truncated else ""))
+    parts.append(head)
     return "".join(parts)
 
 
@@ -178,8 +285,8 @@ def parse_json_reply(text):
     return {}
 
 
-def deterministic_meta(fm, body, run_id, namespace=""):
-    # type: (dict, str, str, str) -> tuple
+def deterministic_meta(fm, body, run_id, namespace="", source_base_url=""):
+    # type: (dict, str, str, str, str) -> tuple
     """The tier-0 and tier-1 block, computed from the bundle alone.
 
     Never needs a model, so a corpus can be brought up to a new schema revision
@@ -199,10 +306,13 @@ def deterministic_meta(fm, body, run_id, namespace=""):
     title = fm.get("source_title") or ""
 
     put("schema_version", SCHEMA_VERSION, SOURCE_DERIVED)
-    put("uid", derive_uid(relpath, namespace), SOURCE_DERIVED)
+    # ONE IDENTITY, derived from the path and unique by construction. `uid` is
+    # written as the alias it now is — the same value, never a second namespace.
+    ident = unique_id(relpath, namespace)
+    put("id", ident, SOURCE_DERIVED)
+    put("uid", ident, SOURCE_DERIVED)
     put("version", fm.get("source_version"), SOURCE_EXTRACTED)
     if title:
-        put("id", slugify(title), SOURCE_DERIVED)
         put("slug", slugify(title), SOURCE_DERIVED)
     put("word_count", words, SOURCE_DERIVED)
     put("reading_time_minutes", reading_time_minutes(words), SOURCE_DERIVED)
@@ -215,6 +325,11 @@ def deterministic_meta(fm, body, run_id, namespace=""):
                        ("last_modified_by", "source_last_modified_by")):
         if fm.get(fmkey):
             source[key] = fm[fmkey]
+    if source.get("uri"):
+        # The PERMALINK. `uri` is a filesystem path and cannot be clicked; this is a
+        # URI reference that can — absolute when --source-base-url says where the
+        # sources live, relative otherwise. Never invented, always resolvable.
+        source["url"] = source_url(source_base_url, source["uri"])
     source["is_derivative"] = True            # every bundle is converted, never original
     put("source", source, SOURCE_EXTRACTED)
 
@@ -226,6 +341,92 @@ def deterministic_meta(fm, body, run_id, namespace=""):
         extraction["converter"] = fm["converter"]
     put("extraction", extraction, SOURCE_DERIVED)
     return (meta, prov, title)
+
+
+def read_structure(doc_dir):
+    # type: (str) -> list
+    """The outline ``structure.json`` publishes, or ``None`` when there is none.
+
+    ``None`` and ``[]`` are different answers and the floor treats them differently:
+    an empty outline is a document with no links to harvest, while a missing or
+    unreadable sidecar is NO INFORMATION, and no information must never be read as
+    "this document has no links" — that would delete harvested edges from a bundle
+    whose structure file merely failed to open.
+    """
+    path = os.path.join(doc_dir, "structure.json")
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError, UnicodeDecodeError):
+        return None
+    outline = data.get("outline") if isinstance(data, dict) else None
+    return outline if isinstance(outline, list) else None
+
+
+def _blank(value):
+    # type: (object) -> bool
+    return value is None or value == "" or value == [] or value == {}
+
+
+def apply_floor(meta, fm, body, outline, anchors):
+    # type: (dict, dict, str, list, set) -> list
+    """Fill from evidence the pipeline already has. Returns the field names filled.
+
+    THE POLICY IS ``backend.kb``'s (the ``*_floor`` functions); this is the wiring
+    that hands each one its inputs and stamps the provenance. Every fill is a GAP
+    fill — a value already in the block, whoever wrote it, is left exactly as it is —
+    except ``links``, where the unit is the record rather than the field, and ``uid``,
+    which is an alias and therefore never has a value of its own.
+    """
+    filled = []  # type: list
+
+    def fill(name, value, source):
+        if _blank(value) or not _blank(meta.get(name)):
+            return
+        meta[name] = value
+        set_provenance(meta, name, source)
+        filled.append(name)
+
+    title, title_source = title_floor(fm.get("source_title"), body,
+                                      fm.get("source_relpath") or "", outline)
+    fill("title", title, title_source)
+    fill("abstract", abstract_floor(body, outline), SOURCE_DERIVED)
+    # Arithmetic over two AUTHORED values is not a model guessing a review date; it
+    # restates a commitment a person already made (see kb.next_review_due).
+    fill("next_review_due",
+         next_review_due(meta.get("last_reviewed"), meta.get("review_cadence")),
+         SOURCE_DERIVED)
+
+    if outline is not None:
+        harvested = harvested_links(outline, anchors)
+        current = meta.get("links")
+        prov = (meta.get(PROVENANCE_KEY) or {}).get("links")
+        if not is_authored(prov, current):
+            merged = merge_group_evidence(harvested, current or {})
+            if merged != current:
+                filled.append("links")
+            if merged:
+                meta["links"] = merged
+                set_provenance(meta, "links",
+                               value_source(merged, SOURCE_GENERATED))
+            else:
+                # A document may honestly have no outbound links. The provenance
+                # record is still written, because "looked, found none" and "never
+                # looked" are different facts and only one of them means the
+                # harvested edges were thrown away. Never silently skip.
+                meta.pop("links", None)
+                set_provenance(meta, "links", SOURCE_EXTRACTED,
+                               value=OrderedDict())
+
+    # An alias is not a peer: it is recomputed from the canonical field every run, so
+    # the two can never drift apart and no corpus can grow a second link graph.
+    for alias, canonical in ALIAS_FIELDS.items():
+        if meta.get(canonical):
+            meta[alias] = meta[canonical]
+            set_provenance(meta, alias, SOURCE_DERIVED)
+    return filled
 
 
 def _prior_doc_meta(doc_dir):
@@ -280,12 +481,76 @@ def render_knowledge(fm, meta, keep_empty=False):
     return json.dumps(doc, indent=2, ensure_ascii=False) + "\n"
 
 
-def enrich_one(doc_dir, vocab, client, run_id, args, cache):
-    # type: (str, object, object, str, object, dict) -> dict
-    """One bundle: read, compute, optionally ask a model, write back. Never raises."""
+def _manifest_row(res, run_id, action):
+    # type: (dict, str, str) -> OrderedDict
+    """One ``manifest.jsonl`` row for one document in this enrichment run.
+
+    Deliberately the SAME shape the writers append, and `status` deliberately keeps
+    the writers' meaning — the CONVERSION verdict, read out of `report.json`. Two
+    vocabularies in one column would make `status == "ok"` mean "converted" on some
+    rows and "nothing outstanding" on others, and no consumer could tell which. What
+    THIS stage did is the `action`, which is what that column has always been for,
+    and `stage` says who did it."""
+    if action not in _ACTIONS:
+        raise ValueError("unknown manifest action %r (add it to _ACTIONS and "
+                         "docs/reference/output-schema.md)" % (action,))
+    row = OrderedDict()
+    row["doc_id"] = res.get("doc_id", "")
+    row["source_relpath"] = res.get("source_relpath", "")
+    row["lane"] = res.get("lane", "")
+    row["status"] = res.get("bundle_status", "")
+    row["markdown_sha256"] = res.get("markdown_sha256", "")
+    # Carried from the report so `corpus_sha256` over these rows names the same
+    # corpus the build named — that identity is what makes "did enrichment run over
+    # the documents I think it did?" answerable.
+    row["source_sha256"] = res.get("source_sha256", "")
+    row["error"] = res.get("error", "") if action == "failed" else ""
+    row["run_id"] = run_id
+    row["ts"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    row["action"] = action
+    row["stage"] = ENTRYPOINT
+    return row
+
+
+def _log_manifest(bundles, run_id, results, deferred_ids):
+    # type: (str, str, list, list) -> list
+    """Append this run's manifest rows and return them.
+
+    A row for every document the run touched AND for every one `--limit` cut, for
+    the same reason the writers log their skips: a log with a hole where the
+    deferrals were cannot say how many runs there have been."""
+    rows = []
+    for res in results:
+        if res["status"] in ("unreadable", "unparseable", "error"):
+            action = "failed"
+        elif res.get("unchanged"):
+            action = "unchanged"
+        else:
+            action = "enriched"
+        rows.append(_manifest_row(res, run_id, action))
+    for did in deferred_ids:
+        rows.append(_manifest_row({"doc_id": did}, run_id, "deferred"))
+    with open(os.path.join(bundles, bb.MANIFEST), "a", encoding="utf-8") as fh:
+        for row in rows:
+            fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+    return rows
+
+
+def enrich_one(doc_dir, vocab, client, run_id, args, cache, run_doc=None,
+               run_decisions=()):
+    # type: (str, object, object, str, object, dict, dict, object) -> dict
+    """One bundle: read, compute, optionally ask a model, write back. Never raises.
+
+    ``run_doc`` is this stage's compact ``run{}`` block and ``run_decisions`` the
+    choices that were made once for the whole run (which tier, which vocabulary,
+    which namespace, which permalink base). Both are recorded into every bundle's
+    ``report.json``, because a bundle has to be able to answer for itself: a reader
+    holding one document should not have to find the run log to learn which
+    switches produced the ``id`` in front of them."""
     doc_id = os.path.basename(doc_dir.rstrip(os.sep))
     md_path = os.path.join(doc_dir, "document.md")
     out = {"doc_id": doc_id, "status": "skipped", "rejected": [], "proposals": {}}
+    decisions = list(run_decisions or [])
     try:
         with open(md_path, encoding="utf-8") as fh:
             text = fh.read()
@@ -319,7 +584,8 @@ def enrich_one(doc_dir, vocab, client, run_id, args, cache):
     # ONE merged view from here on. Every rule in backend.kb was written against a
     # single mapping and stays that way: the split is storage, not policy.
     existing = merge_meta(front, prior_know)
-    det, det_prov, title = deterministic_meta(fm, body, run_id, args.namespace)
+    det, det_prov, title = deterministic_meta(fm, body, run_id, args.namespace,
+                                              args.source_base_url)
 
     meta = OrderedDict()
     meta.update(det)
@@ -333,7 +599,18 @@ def enrich_one(doc_dir, vocab, client, run_id, args, cache):
         prior_src = ((existing.get(PROVENANCE_KEY) or {}).get(key) or {}).get("source")
         if key in _ALWAYS_DERIVED:
             continue                           # a run stamp is never inherited
-        if key in det and prior_src in (None, "authored"):
+        prov_entry = ((existing.get(PROVENANCE_KEY) or {}).get(key) or {})
+        # A HAND EDIT UNDER A MACHINE STAMP IS STILL A HAND EDIT. Deciding on the
+        # provenance LABEL alone reverted every correction an operator made to a
+        # field this pipeline had already written — which is every field, in every
+        # bundle it has ever produced. `unique_id`'s own docstring tells a reader
+        # to write an `id` by hand after a collision and promises it "outranks this
+        # forever"; without consulting `is_authored`, the next run silently put the
+        # colliding value back and orphaned every `see_also` pointing at it.
+        # `is_authored` is what carries the value_sha edit detection, so it is what
+        # can tell a stamp that still describes its value from one that does not.
+        if key in det and (prior_src in (None, "authored")
+                           or is_authored(prov_entry, val)):
             meta[key] = val
             if prior_src is None:
                 inherited_authored.add(key)
@@ -355,11 +632,21 @@ def enrich_one(doc_dir, vocab, client, run_id, args, cache):
     meta, moved = revalidate_generated(meta, vocab)
     out["revalidated"] = moved
 
+    # THE FLOOR, before the model is asked. Order matters twice over: a title read
+    # from the document's own properties has to be in the block for `is_protected` to
+    # stop the model contradicting it, and the harvested links have to be there for
+    # the model's links to MERGE with rather than replace.
+    outline = read_structure(doc_dir)
+    anchors = body_anchors(body)
+    out["floor"] = apply_floor(meta, fm, body, outline, anchors)
+
     # The prompt is built from TIER-0/1 INPUTS ONLY — deliberately not from a title a
     # previous run's model produced. Feeding generated output back into the request
     # makes the prompt depend on enrichment state, which changes its sha, which misses
-    # the cache and re-asks forever. The body's own first heading tells the model the
-    # title anyway.
+    # the cache and re-asks forever. The deterministic floor title is safe on both
+    # counts: it is a function of the source bytes, so it is the same every run.
+    floor_title = title_floor(fm.get("source_title"), body,
+                              fm.get("source_relpath") or "", outline)[0] or title
     keyword_seed = keyword_candidates(body, limit=args.keyword_limit)
 
     model = getattr(client, "model", "") if client else ""
@@ -382,7 +669,8 @@ def enrich_one(doc_dir, vocab, client, run_id, args, cache):
             # itself between runs. A stable request is what makes "safe to run twice"
             # true. Whether to ask at all is still decided by `missing`.
             spec = request_spec(vocab)
-            prompt = build_prompt(spec, title, body, args.excerpt_chars)
+            prompt = build_prompt(spec, floor_title, body, args.excerpt_chars,
+                                  anchors)
             if keyword_seed:
                 prompt += ("\n\nIDENTIFIERS FOUND IN THE BODY (candidates for "
                            "`keywords`; include only the ones that matter):\n"
@@ -392,6 +680,14 @@ def enrich_one(doc_dir, vocab, client, run_id, args, cache):
             hit = cache.get(key)
             if hit is not None and not args.no_cache:
                 reply = hit
+                # A choice, not a problem: "how many documents were answered from
+                # the cache" is the question that says whether a re-run cost
+                # anything, and it is unanswerable from prose.
+                decisions.append(decision(
+                    "cache_hit", "stored-reply",
+                    "a stored answer for this body, model, prompt and vocabulary "
+                    "version was reused instead of re-asked",
+                    {"key": key}))
             else:
                 res = client.text_result(
                     prompt, response_format=None if args.no_json_mode
@@ -411,26 +707,31 @@ def enrich_one(doc_dir, vocab, client, run_id, args, cache):
                         # reporting nothing. Say so and leave it retryable.
                         out["status"] = "reply-unparsed"
                         out["reply_chars"] = len(res.get("text", "") or "")
-            verdict = accept_model_meta(reply, vocab, meta, model, prompt_sha)
+            verdict = accept_model_meta(reply, vocab, meta, model, prompt_sha,
+                                        anchors)
             for name, value in verdict["accepted"].items():
                 meta[name] = value
-                set_provenance(meta, name, "generated", model, prompt_sha)
+                # The verdict decided the SOURCE too: a grouped field that still
+                # carries harvested records is not wholly generated, and stamping it
+                # `generated` would vouch for the evidence with the model's name.
+                rec = verdict["provenance"].get(name) or {}
+                set_provenance(meta, name, rec.get("source") or SOURCE_GENERATED,
+                               model, prompt_sha)
             for name, values in verdict["proposals"].items():
                 slot = name + "_proposed"
                 meta[slot] = sorted(set(list(meta.get(slot) or []) + list(values)))
             out["rejected"] = verdict["rejected"]
             out["proposals"] = verdict["proposals"]
 
-    # Tier 1 depends on a tier-2 parent here: a source with no usable title is
-    # exactly the junk-title case a model is meant to rescue, so `id`/`slug` are
-    # derived once a title exists — on this run or a later one — rather than only
-    # from `source_title` at build time.
+    # Tier 1 depends on a tier-2 parent here: `slug` is the URL form of whatever the
+    # title finally turned out to be, so it is derived once a title exists — on this
+    # run or a later one — rather than only from `source_title` at build time. It is
+    # NOT an identity: nothing resolves against it, so two documents called "Overview"
+    # sharing a slug costs nothing. `id` is the identity, and it comes from the path.
     have_title = meta.get("title") or title
-    if have_title:
-        for name in ("id", "slug"):
-            if not meta.get(name):
-                meta[name] = slugify(have_title)
-                set_provenance(meta, name, SOURCE_DERIVED)
+    if have_title and not meta.get("slug"):
+        meta["slug"] = slugify(have_title)
+        set_provenance(meta, "slug", SOURCE_DERIVED)
 
     cov = meta_coverage(meta, vocab)
     meta["vocab_version"] = vocab.version
@@ -499,16 +800,34 @@ def enrich_one(doc_dir, vocab, client, run_id, args, cache):
             client is not None, cov["expected"], cov["filled"], cov["authored"],
             cov["invalid"], cov["pending"], SCHEMA_VERSION, vocab.version,
             model, prompt_sha or prior_sha)
+        # Replace exactly THIS stage's records and leave every other stage's alone.
+        # Appending would grow the list without bound across re-runs; rewriting the
+        # list would delete the conversion's choices to record the enricher's.
+        report["decisions"] = (
+            [d for d in (report.get("decisions") or [])
+             if d.get("stage") != ENTRYPOINT]
+            + stamp_stage(decisions, ENTRYPOINT))
+        if run_doc:
+            bb.record_stage_run(report, run_doc)
         _write_atomic(rp, json.dumps(report, indent=2, ensure_ascii=False) + "\n")
+        # What the manifest row needs about the CONVERSION, read rather than
+        # invented: enrichment never opens the source document, so a status or a
+        # source hash it made up here would be a second, weaker source of truth.
+        out["bundle_status"] = report.get("status", "")
+        out["source_sha256"] = report.get("source_sha256", "")
 
     if out["status"] == "skipped":
         out["status"] = "ok" if cov["pending"] == 0 and cov["invalid"] == 0 \
             else "incomplete"
+    out["source_relpath"] = fm.get("source_relpath") or ""
+    out["lane"] = fm.get("lane") or ""
+    out["markdown_sha256"] = fm.get("markdown_sha256") or ""
     out.update(cov)
     return out
 
 
 def main(argv=None, client=None):
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
     ap = argparse.ArgumentParser(
         description="Fill each bundle's document metadata block: the deterministic "
                     "tiers always, the model tier when a model is reachable.")
@@ -517,7 +836,12 @@ def main(argv=None, client=None):
     ap.add_argument("--vocab", default="",
                     help="vocabulary file (default $DOC2MD_VOCAB / config/vocab.yaml)")
     ap.add_argument("--namespace", default="",
-                    help="prefix for the derived uid (e.g. an org or corpus name)")
+                    help="prefix for the derived id (e.g. an org or corpus name)")
+    ap.add_argument("--source-base-url",
+                    default=os.environ.get("DOC2MD_SOURCE_BASE_URL", ""),
+                    help="where the source documents are served, e.g. "
+                         "https://intranet/docs — makes meta.source.url absolute "
+                         "(default $DOC2MD_SOURCE_BASE_URL; relative otherwise)")
     ap.add_argument("--only", action="append", default=[],
                     help="enrich ONLY this doc id; repeatable")
     ap.add_argument("--limit", type=int, default=0, help="stop after N documents")
@@ -571,9 +895,11 @@ def main(argv=None, client=None):
         if not dirs:
             ap.error("--only matched no bundle: %s" % ", ".join(sorted(want)))
     total = len(dirs)
+    selected = list(dirs)                    # after --only, before --limit
     if args.limit:
         dirs = dirs[:args.limit]
-    deferred = total - len(dirs)
+    deferred_ids = selected[len(dirs):]
+    deferred = len(deferred_ids)
 
     cache_path = os.path.join(args.bundles, CACHE_NAME)
     cache = {}
@@ -598,13 +924,49 @@ def main(argv=None, client=None):
         getattr(client, "model", "") or "none", vocab.version, args.bundles)
     print(msg, file=sys.stderr)
 
+    # THE RUN, recorded before anything is written. `--bundles` is redacted to
+    # `<src>` rather than `<path>` because that is the root a replay must be handed
+    # back — see replay_run.ENTRYPOINTS, which knows this stage reads and writes the
+    # same root and therefore needs no `--out`.
+    started = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    run = bb._run_context(ENTRYPOINT, args, raw_argv, run_id, tools={},
+                          paths={"--bundles": "<src>"}, root_attr="bundles",
+                          extra_config=_cli_provenance(ap, args))
+    run_doc = compact_run(run, "%s#%s" % (bb.RUNS, run_id))
+    # The choices this run made ONCE, for every document. Each of them moves a field
+    # the rubric grades: the tier decides whether tier-2 is filled or PENDING, the
+    # vocabulary decides which values survive, the namespace decides `meta.id` and
+    # its `uid` alias, and the base decides whether `meta.source.url` is a permalink
+    # or a relative reference.
+    run_decisions = [
+        decision("metadata_tier", "model" if client is not None else "deterministic",
+                 "a model was reachable" if client is not None
+                 else "no --vlm-url or the endpoint was unreachable: tier-2 fields "
+                      "stay pending rather than guessed",
+                 {"model": getattr(client, "model", "") or ""}),
+        decision("vocabulary_selected", "v%s" % vocab.version,
+                 "every closed-vocabulary value was graded against this term list",
+                 {"schema_version": SCHEMA_VERSION}),
+        decision("identity_namespace", args.namespace or "(none)",
+                 "meta.id and its uid alias are derived from the source path under "
+                 "this namespace",
+                 {"namespace": args.namespace or ""}),
+        decision("permalink_base",
+                 "absolute" if args.source_base_url else "relative",
+                 "meta.source.url is resolved against --source-base-url"
+                 if args.source_base_url else
+                 "no base is configured, so meta.source.url is a relative URI "
+                 "reference — a base is never invented",
+                 {"base": args.source_base_url or ""}),
+    ]
+
     t0 = time.time()
     results = []  # type: list
     new_cache = []  # type: list
     for did in dirs:
         try:
             res = enrich_one(os.path.join(args.bundles, did), vocab, client, run_id,
-                             args, cache)
+                             args, cache, run_doc, run_decisions)
         except Exception as e:                      # never lose the whole run
             # enrich_one guards the conditions it knows about, but a corrupt bundle,
             # a client that raises, or a disk error must cost one document, not the
@@ -645,6 +1007,19 @@ def main(argv=None, client=None):
     unparsed = sum(1 for r in results if r["status"] == "reply-unparsed")
     unavailable = sum(1 for r in results if r["status"] == "model-unavailable")
     pending = sum(r.get("pending", 0) for r in results)
+
+    # THE RUN LOG. One row per document per run, the deferred ones included, in the
+    # same shape and the same file the writers append to — a stage that rewrote
+    # `meta.id` for 500 documents and left no trace in the corpus log is exactly the
+    # hole this closes. Then one runs.jsonl row, which is what the rows join to.
+    rows_written = _log_manifest(args.bundles, run_id, results, deferred_ids)
+    run["started_at"] = started
+    run["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    bb._append_run(args.bundles, run, rows_written,
+                   {"ok": ok, "incomplete": incomplete, "failed": failed,
+                    "unchanged": sum(1 for r in results if r.get("unchanged")),
+                    "deferred": deferred})
+
     print("kb-enrich: ok=%d incomplete=%d failed=%d model-unavailable=%d "
           "reply-unparsed=%d fields-pending=%d in %.1fs"
           % (ok, incomplete, failed, unavailable, unparsed, pending,

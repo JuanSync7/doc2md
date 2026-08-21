@@ -51,7 +51,8 @@ from backend.ingest import (  # noqa: E402
     supported_formats,
     ROUTE_OOXML, ROUTE_LIBREOFFICE, ROUTE_DOCLING, ROUTE_FENCE, ROUTE_PASSTHROUGH,
     ooxml_markdown, ooxml_source_text, core_properties, front_matter,
-    OOXML_MAIN_PARTS, load_source_root, load_ingest_config, furniture_drops)
+    OOXML_MAIN_PARTS, load_source_root, load_ingest_config, furniture_drops,
+    docx_source_structure, policy_drops)
 from backend.validate import conversion_report  # noqa: E402  (the validator layer)
 
 COV_NAME = "_coverage_ooxml.jsonl"
@@ -139,15 +140,28 @@ def soffice_to_ooxml(soffice, src_path, target_ext, timeout=180):
     fresh temp dir; return the produced file's path, or ``""`` on any failure.
 
     Caller owns the returned file's temp dir and must remove it. Generic — keys only
-    off the extension, never a per-document path."""
+    off the extension, never a per-document path.
+
+    Each call gets its **own throwaway user profile** via ``-env:UserInstallation``.
+    Without it every invocation shares ``~/.config/libreoffice``, and LibreOffice
+    single-instances on that profile: a second concurrent ``--convert-to`` attaches
+    to the first process and silently converts nothing, or dies. The symptom is a
+    nondeterministic ``libreoffice-convert-failed`` on a file that converts fine on
+    its own — measured here as three eval runs failing different legacy documents
+    while other work ran. ``evals/gen_corpus.py`` already isolated its profile; the
+    lane did not, so a sharded corpus or two users on one host raced."""
     tmp = tempfile.mkdtemp(prefix="doc2md_lo_")
+    profile = tempfile.mkdtemp(prefix="doc2md_loprofile_")
     try:
         subprocess.check_output(
-            [soffice, "--headless", "--convert-to", target_ext, "--outdir", tmp, src_path],
+            [soffice, "-env:UserInstallation=file://%s" % profile,
+             "--headless", "--convert-to", target_ext, "--outdir", tmp, src_path],
             stderr=subprocess.STDOUT, timeout=timeout)
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
         shutil.rmtree(tmp, ignore_errors=True)
         return ""
+    finally:
+        shutil.rmtree(profile, ignore_errors=True)
     expected = os.path.join(tmp, os.path.splitext(os.path.basename(src_path))[0] + "." + target_ext)
     if os.path.isfile(expected):
         return expected
@@ -234,6 +248,20 @@ def load_parts(row, soffice="", want_media=False, furniture_out=None):
 _FURNITURE_READ = re.compile(r"^word/(header|footer)\d*\.xml$")
 
 
+def zip_members(path):
+    # type: (str) -> list
+    """Every member name in the package, unfiltered.
+
+    ``read_parts`` deliberately keeps only the parts the converter reads, which is
+    why an embedded OLE object is invisible to it — and to ``--audit-parts``, which
+    inspects only members ending in ``.xml``. Reporting a drop needs the full list."""
+    try:
+        with zipfile.ZipFile(path) as zf:
+            return zf.namelist()
+    except Exception:                                    # noqa: BLE001
+        return []
+
+
 def read_parts(path, ext, furniture_out=None):
     # type: (str, str, dict) -> dict
     """The converter's input: {part_name: xml_text} for this format's main parts.
@@ -291,14 +319,14 @@ def read_media(path):
 _CONTENT_PARTS = {
     "docx": re.compile(r"^word/document\.xml$"
                        r"|^word/(footnotes|endnotes|comments)\.xml$"
-                       r"|^word/charts/chart\d+\.xml$|^word/diagrams/data\d+\.xml$"),
+                       r"|^word/charts/chart(?:Ex)?\d+\.xml$|^word/diagrams/data\d+\.xml$"),
     "pptx": re.compile(r"^ppt/slides/slide\d+\.xml$"
                        r"|^ppt/notesSlides/notesSlide\d+\.xml$"
-                       r"|^ppt/diagrams/data\d+\.xml$|^ppt/charts/chart\d+\.xml$"
+                       r"|^ppt/diagrams/data\d+\.xml$|^ppt/charts/chart(?:Ex)?\d+\.xml$"
                        r"|^ppt/comments/[^/]+\.xml$"),
     "xlsx": re.compile(r"^xl/worksheets/[^/]+\.xml$|^xl/workbook\.xml$"
                        r"|^xl/sharedStrings\.xml$|^xl/comments\d*\.xml$"
-                       r"|^xl/charts/chart\d+\.xml$"),
+                       r"|^xl/charts/chart(?:Ex)?\d+\.xml$"),
 }
 
 
@@ -339,7 +367,10 @@ def bundle_inputs(row, soffice="", emit_images=False):
     media read).
 
     Returns a dict ``{error, body, source_text, meta, warnings, eff_ext, media,
-    source_repr_chars}``. ``error`` is ``""`` on success; ``"empty-source-file"`` is a
+    source_repr_chars, source_structure}``. ``source_structure`` is the
+    converter-blind STRUCTURAL ground truth (docx only today) that the
+    ``structure_fidelity`` gate grades the emitted markdown against; ``{}`` means
+    unmeasured, and an unmeasured lane can never claim a structural pass. ``error`` is ``""`` on success; ``"empty-source-file"`` is a
     SUCCESS sentinel (a 0-byte upload is vacuously lossless — nothing to lose), while
     every other non-empty ``error`` is a genuine failure and ``body``/``source_text``
     are empty. ``source_repr_chars`` is the decompressed size (chars) of every XML part
@@ -386,8 +417,17 @@ def bundle_inputs(row, soffice="", emit_images=False):
     # The raw-representation size the markdown replaces: decompressed chars of every
     # XML part parsed (report ``savings`` block; measured, never estimated).
     repr_chars = sum(len(v) for v in parts.values())
+    # Every deliberate flattening or drop, NAMED with its counts. A drop nobody
+    # counted reads exactly like a bug (end-goal.md §1).
+    warnings.extend(policy_drops(parts, zip_members(row["src"])))
     body = ooxml_markdown(eff_ext, parts, emit_images)
     src_text = ooxml_source_text(eff_ext, parts)
+    # Only docx has a structural ground truth so far. pptx (every paragraph is a
+    # bullet) and xlsx (every sheet is one table) have far less structure to lose,
+    # and claiming to grade them without a second implementation would be the exact
+    # dishonesty this gate exists to end.
+    src_struct = (docx_source_structure(parts)
+                  if eff_ext.lower().lstrip(".") == "docx" else {})
     if not body.strip() and src_text.strip():
         return {"error": "empty-conversion", "body": "", "source_text": src_text,
                 "meta": OrderedDict(), "warnings": warnings, "eff_ext": eff_ext,
@@ -396,7 +436,7 @@ def bundle_inputs(row, soffice="", emit_images=False):
                            parts.get("docProps/app.xml", ""))
     return {"error": "", "body": body, "source_text": src_text, "meta": meta,
             "warnings": warnings, "eff_ext": eff_ext, "media": media,
-            "source_repr_chars": repr_chars}
+            "source_repr_chars": repr_chars, "source_structure": src_struct}
 
 
 def convert_one(row, soffice=""):

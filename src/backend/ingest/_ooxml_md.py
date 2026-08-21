@@ -40,18 +40,18 @@ _WS = re.compile(r"\s+")
 OOXML_MAIN_PARTS = {
     "docx": (r"^word/document\.xml$", r"^word/styles\.xml$", r"^word/numbering\.xml$",
              r"^word/footnotes\.xml$", r"^word/endnotes\.xml$", r"^word/comments\.xml$",
-             r"^word/_rels/document\.xml\.rels$", r"^word/charts/chart\d+\.xml$",
+             r"^word/_rels/document\.xml\.rels$", r"^word/charts/chart(?:Ex)?\d+\.xml$",
              r"^word/diagrams/data\d+\.xml$", r"^word/media/[^/]+\.svg$",
              r"^docProps/(core|app)\.xml$"),
     "pptx": (r"^ppt/slides/slide\d+\.xml$", r"^ppt/slides/_rels/slide\d+\.xml\.rels$",
              r"^ppt/notesSlides/notesSlide\d+\.xml$", r"^ppt/diagrams/data\d+\.xml$",
-             r"^ppt/charts/chart\d+\.xml$", r"^ppt/comments/[^/]+\.xml$",
+             r"^ppt/charts/chart(?:Ex)?\d+\.xml$", r"^ppt/comments/[^/]+\.xml$",
              r"^ppt/media/[^/]+\.svg$", r"^docProps/(core|app)\.xml$"),
     "xlsx": (r"^xl/workbook\.xml$", r"^xl/_rels/workbook\.xml\.rels$",
              r"^xl/sharedStrings\.xml$", r"^xl/worksheets/[^/]+\.xml$",
              r"^xl/drawings/drawing\d+\.xml$", r"^xl/drawings/_rels/drawing\d+\.xml\.rels$",
              r"^xl/comments\d*\.xml$",
-             r"^xl/charts/chart\d+\.xml$", r"^xl/media/[^/]+\.svg$",
+             r"^xl/charts/chart(?:Ex)?\d+\.xml$", r"^xl/media/[^/]+\.svg$",
              r"^docProps/(core|app)\.xml$"),
 }
 
@@ -266,20 +266,39 @@ _LEAD_MARK = re.compile(r"^([#+*-])(\s)")
 _WORD_CH = re.compile(r"[0-9A-Za-z]")
 
 
+# The two character sequences that let a bracket mean something: an inline link
+# `[text](url)` and a reference link `[text][label]`. Nothing else can.
+_BRACKET_MEANS = ("](", "][")
+
+
 def _esc_special(m):
     # type: (object) -> str
-    """Escape one markdown special — except an underscore that cannot mean anything.
+    """Escape one markdown special — except one that cannot mean anything.
+
+    Two exemptions, both the same argument. Escaping a character that could never
+    have been syntax buys no safety and corrupts the stored bytes — a renderer
+    hides the backslash, but a BM25 index, an embedder and a human grep do not.
 
     A SINGLE underscore flanked by word characters can neither open nor close
     emphasis under CommonMark's flanking rule (and ``markdown_to_text``'s ``_ITALIC``
-    already mirrors that rule), so escaping it buys no safety and corrupts the stored
-    bytes: ``DB_MAX_CONN_LIMIT`` became ``DB\\_MAX\\_CONN\\_LIMIT``, which a renderer
-    hides but a BM25 index, an embedder and a human grep do not. A run of two or more
-    stays escaped — ``__x__`` IS strong emphasis to ``markdown_to_text``'s ``_BOLD``,
-    which carries no flanking guard, so unescaping there would move the recall gate."""
+    already mirrors that rule): ``DB_MAX_CONN_LIMIT`` became
+    ``DB\\_MAX\\_CONN\\_LIMIT``. A run of two or more stays escaped — ``__x__`` IS
+    strong emphasis to ``markdown_to_text``'s ``_BOLD``, which carries no flanking
+    guard, so unescaping there would move the recall gate.
+
+    A BRACKET is only syntax next to ``](`` or ``][``. On its own, ``[payments]``
+    is a *shortcut reference link* — and it resolves only against a link reference
+    definition, which this converter never emits, so there is nothing for it to
+    resolve to and every renderer prints it literally. An ini section name, a bus
+    slice ``[31:0]``, a ticket id: all of them were being stored as ``\\[…\\]`` for
+    a danger that cannot arise. The test is on the whole run text rather than the
+    single character, because it takes two characters to make the danger."""
     run = m.group(2)
     if run is None:
-        return "\\" + m.group(1)
+        ch = m.group(1)
+        if ch in "[]" and not any(seq in m.string for seq in _BRACKET_MEANS):
+            return ch
+        return "\\" + ch
     s, i, j = m.string, m.start(2), m.end(2)
     if (len(run) == 1 and i > 0 and j < len(s)
             and _WORD_CH.match(s[i - 1]) and _WORD_CH.match(s[j])):
@@ -293,6 +312,15 @@ def _esc(text):
     if not text:
         return ""
     return _MD_SPECIAL.sub(_esc_special, text.replace("\\", "\\\\"))
+
+
+def _num_val(value, default):
+    # type: (str, int) -> int
+    """An OOXML integer attribute, or ``default`` when it is absent or junk."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def _list_indent(cols, depth, marker):
@@ -321,6 +349,67 @@ def _list_indent(cols, depth, marker):
     return " " * indent
 
 
+def _list_number(counters, num_id, depth, start):
+    # type: (dict, str, int, int) -> int
+    """The number Word shows on this item, plus the bookkeeping the next one needs.
+
+    One counter per (numbering instance, level). A level counts up from its
+    ``w:start``; every DEEPER level returns to its own start the moment a shallower
+    one advances, which is why the first sub-step of step 2 is 2.1 and not 2.4.
+    Counters are per INSTANCE, so two procedures Word gave their own ``w:numId`` do
+    not share a sequence. ``w:lvlRestart`` is not read — the default restart is what
+    is modelled, and a document that overrides it is the one case this can misnumber."""
+    for key in [k for k in counters if k[0] == num_id and k[1] > depth]:
+        del counters[key]
+    key = (num_id, depth)
+    counters[key] = counters.get(key, start - 1) + 1
+    return counters[key]
+
+
+def _ordered_marker(open_lists, depth, number):
+    # type: (dict, int, int) -> str
+    """``"3."`` — an ordered marker whose delimiter keeps the RENDERED number equal
+    to the one Word wrote.
+
+    CommonMark takes a list's start from its first marker and then counts up on its
+    own, ignoring every later number. So an item that must show a restart cannot just
+    write its number: glued to the items above it, a renderer prints it as that list's
+    next one instead. Switching the delimiter (``.`` <-> ``)``) is CommonMark's own way
+    of beginning a new list with no separating block between, and inside a run of
+    adjacent items it is the only way there is."""
+    for k in [k for k in open_lists if k > depth]:
+        del open_lists[k]
+    cur = open_lists.get(depth)
+    if cur is None:
+        delim = "."
+    elif number == cur[1] + 1:
+        delim = cur[0]
+    else:
+        delim = ")" if cur[0] == "." else "."
+    open_lists[depth] = (delim, number)
+    return "%d%s" % (number, delim)
+
+
+def _close_ordered(open_lists, depth):
+    # type: (dict, int) -> None
+    """A bullet at ``depth`` ends any ordered list open there or deeper — a change of
+    list type is a new list to CommonMark, so the next number must be a start again."""
+    for k in [k for k in open_lists if k >= depth]:
+        del open_lists[k]
+
+
+def _close_list(lst):
+    # type: (dict) -> None
+    """Any non-list block ends the markdown list, exactly as the blank line the
+    joiner puts before it does when rendered.
+
+    The NUMBER counters deliberately survive: Word does not restart a procedure
+    because a paragraph got in the way, so neither may we. That asymmetry — columns
+    reset, counters kept — is the whole of defect 1b."""
+    del lst["cols"][:]
+    lst["open"].clear()
+
+
 def _esc_lead(text):
     # type: (str) -> str
     """Escape LINE-LEADING constructs too (list/heading/blockquote markers), for
@@ -344,18 +433,241 @@ def _md_cell(text):
     return _WS.sub(" ", (text or "")).replace("|", "\\|").strip()
 
 
-def _gfm_table(rows):
+# --------------------------------------------------------------- run formatting
+#
+# Bold, italic, strikethrough and monospace are CONTENT, not decoration:
+# end-goal.md §1 says "structure IS content". They carry no tokens, though, so the
+# losslessness gate is blind to losing them — which is exactly why they were lost
+# for so long. The structure_fidelity gate is what grades them now.
+#
+# Marks are applied outermost-first in this fixed order so the output is
+# deterministic and a comparison against the source is meaningful.
+_MARK_ORDER = ("code", "strong", "em", "strike")
+_MARKERS = {"strong": "**", "em": "*", "strike": "~~"}
+_OFF = ("0", "false", "off")
+
+# Word's toggle properties. bCs/iCs are the complex-script twins; a document that
+# sets only those (common in mixed-script text) still means bold/italic.
+_BOLD_LOCALS = ("b", "bCs")
+_ITALIC_LOCALS = ("i", "iCs")
+_STRIKE_LOCALS = ("strike", "dstrike")
+
+# Styles that mean "this is code". Matched on BOTH the styleId and the canonical
+# w:name, lowercased: Word localizes styleIds but the name is stabler, the same
+# argument _docx_styles makes for headings.
+_CODE_STYLE_NAMES = frozenset((
+    "html preformatted", "source code", "code", "plain text", "macro text",
+    "html code", "html typewriter", "verbatim char", "code char", "console",
+    "codeblock", "code block", "preformatted text", "hljs",
+))
+
+
+def _docx_style_records(styles_xml):
+    # type: (str) -> dict
+    """styleId -> the RAW facts of one ``w:style``, nothing resolved.
+
+    ``{"name", "based", "type", "outline", "num", "ilvl"}``. Kept unresolved and in
+    one place because THREE questions are asked of the same file — is this a
+    heading, is it monospace, does it carry numbering — and all three must follow
+    ``w:basedOn`` or they lie in the same way. A custom ``NimbusH1`` derived from
+    ``Heading1`` is a heading to Word and to LibreOffice; reading only its own
+    ``w:name`` made a two-section document one structureless blob with
+    ``status: ok``."""
+    root = _root(styles_xml)
+    records = {}
+    if root is None:
+        return records
+    for style in root:
+        if _local(style.tag) != "style":
+            continue
+        sid = _attr(style, "styleId")
+        if not sid:
+            continue
+        rec = {"name": "", "based": "", "type": _attr(style, "type"),
+               "outline": None, "num": "", "ilvl": ""}
+        for ch in style.iter():
+            loc = _local(ch.tag)
+            if loc == "name":
+                rec["name"] = _attr(ch, "val")
+            elif loc == "basedOn":
+                rec["based"] = _attr(ch, "val")
+            elif loc == "outlineLvl":
+                rec["outline"] = _num_val(_attr(ch, "val"), None)
+            elif loc == "numId":
+                rec["num"] = _attr(ch, "val")
+            elif loc == "ilvl":
+                rec["ilvl"] = _attr(ch, "val")
+        records[sid] = rec
+    return records
+
+
+def _style_chain(sid, records):
+    # type: (str, dict) -> list
+    """``[sid, its basedOn, that one's basedOn, ...]`` — nearest first.
+
+    Stops on a missing style and on a CYCLE: ``w:basedOn`` pointing back into the
+    chain is malformed but real (a template edited by two tools), and a converter
+    that recursed on it would hang on the document instead of converting it."""
+    chain, seen = [], set()
+    cur = sid
+    while cur and cur in records and cur not in seen:
+        seen.add(cur)
+        chain.append(cur)
+        cur = records[cur].get("based", "")
+    return chain
+
+
+def _docx_code_styles(styles_xml):
+    # type: (str) -> dict
+    """``{"para": {styleId}, "char": {styleId}}`` — the styles that mean monospace.
+
+    Separate from ``_docx_styles`` on purpose: that one maps styleId to an *int*
+    heading level and two call sites do arithmetic on the result, so a non-int
+    marker cannot be smuggled into it. A style DERIVED from a code style is code
+    too, and is filed under its own ``w:type``: a character style based on a
+    paragraph one is still an inline span."""
+    records = _docx_style_records(styles_xml)
+    found = {"para": set(), "char": set()}
+    for sid in records:
+        for anc in _style_chain(sid, records):
+            keys = set(k for k in (anc, records[anc]["name"]) if k)
+            if any(k.strip().lower().replace("-", " ") in _CODE_STYLE_NAMES
+                   for k in keys):
+                kind = "char" if records[sid]["type"] == "character" else "para"
+                found[kind].add(sid)
+                break
+    return found
+
+
+def _docx_style_numbering(styles_xml):
+    # type: (str) -> dict
+    """styleId -> ``(numId, ilvl)`` carried by the style's own ``w:pPr/w:numPr``.
+
+    Word's built-in ``List Number``/``List Bullet``, and any template style with
+    numbering baked into it, put ``w:numPr`` in the STYLE rather than in each
+    paragraph. Reading only the paragraph's ``w:pPr`` made such a list vanish —
+    three plain paragraphs with no markers at all — and the structural ground truth
+    was blind in exactly the same place, so no gate could object. Inherited through
+    ``w:basedOn``, nearest definition wins."""
+    records = _docx_style_records(styles_xml)
+    out = {}
+    for sid in records:
+        for anc in _style_chain(sid, records):
+            if records[anc]["num"]:
+                out[sid] = (records[anc]["num"], records[anc]["ilvl"] or "0")
+                break
+    return out
+
+
+def _toggle_on(pr):
+    # type: (object) -> bool
+    """A Word toggle property is tri-state: present means on UNLESS w:val turns it
+    off, which is how a run inside a bold style un-bolds itself."""
+    return _attr(pr, "val") not in _OFF
+
+
+def _run_marks(run, char_styles=None):
+    # type: (object, object) -> tuple
+    """Formatting marks carried by one w:r, from its DIRECT w:rPr child.
+
+    Only direct formatting is read. Bold inherited from a paragraph style or from
+    docDefaults is invisible here — resolving the full style cascade (basedOn
+    chains, docDefaults, w:pPr/w:rPr) is a different feature, and claiming it
+    without implementing it would make the fidelity gate lie in both directions."""
+    marks = set()
+    for pr in run:
+        if _local(pr.tag) != "rPr":
+            continue
+        for prop in pr:
+            loc = _local(prop.tag)
+            if loc == "rPrChange":            # the PREVIOUS formatting of a tracked
+                continue                      # change — never the live one
+            if loc in _BOLD_LOCALS and _toggle_on(prop):
+                marks.add("strong")
+            elif loc in _ITALIC_LOCALS and _toggle_on(prop):
+                marks.add("em")
+            elif loc in _STRIKE_LOCALS and _toggle_on(prop):
+                marks.add("strike")
+            elif loc == "rStyle" and char_styles and _attr(prop, "val") in char_styles:
+                marks.add("code")
+    return tuple(m for m in _MARK_ORDER if m in marks)
+
+
+def _code_span(text):
+    # type: (str) -> str
+    """Wrap text as an inline code span, widening the fence past any backticks.
+
+    CommonMark closes a code span only on a backtick string of exactly equal
+    length, and pads with one space when the content itself starts or ends with a
+    backtick — so ``kubectl get pods`` survives whatever it contains."""
+    longest = 0
+    for m in re.finditer(r"`+", text):
+        longest = max(longest, len(m.group(0)))
+    fence = "`" * (longest + 1)
+    pad = " " if (text.startswith("`") or text.endswith("`")) else ""
+    return fence + pad + text + pad + fence
+
+
+def _wrap_marks(text, marks):
+    # type: (str, tuple) -> str
+    """Apply formatting marks to one already-escaped segment.
+
+    Leading and trailing whitespace is moved OUTSIDE the markers: CommonMark's
+    right-flanking rule refuses to close ``**bold **``, which would leave the
+    asterisks as literal text in the stored bytes."""
+    if not marks or not text.strip():
+        return text
+    lead = text[:len(text) - len(text.lstrip())]
+    trail = text[len(text.rstrip()):]
+    core = text.strip()
+    if "code" in marks:
+        core = _code_span(core)
+    for mark in ("strike", "em", "strong"):       # innermost first
+        if mark in marks:
+            core = _MARKERS[mark] + core + _MARKERS[mark]
+    return lead + core + trail
+
+
+def _render_runs(segments):
     # type: (list) -> str
+    """Coalesce adjacent identically-marked segments, then apply the markers.
+
+    Coalescing is mandatory, not tidiness. Word splits one word across several
+    runs at every property boundary — a spell-check mark is enough — so wrapping
+    each run on its own emits ``**Dma****Arbiter**``, which ``markdown_to_text``'s
+    non-greedy _BOLD mis-pairs into a stray literal ``**`` in the text layer."""
+    out = []
+    i = 0
+    while i < len(segments):
+        marks, text = segments[i]
+        j = i + 1
+        while j < len(segments) and segments[j][0] == marks:
+            text += segments[j][1]
+            j += 1
+        out.append(_wrap_marks(text, marks))
+        i = j
+    return "".join(out)
+
+
+def _gfm_table(rows, min_width=0):
+    # type: (list, int) -> str
     """Rows of cell texts -> a well-formed GFM pipe table (first row = header).
 
     Every row is padded to the shared width so the column count is consistent —
     the validator's table-columns rule holds by construction. The width is the
     last column ANY row actually uses, so trailing always-empty columns (styled
-    but valueless spreadsheet cells) never render as pipe noise."""
+    but valueless spreadsheet cells) never render as pipe noise.
+
+    ``min_width`` is a floor for callers that KNOW the real grid width. A docx
+    does: ``w:tblGrid`` plus ``w:gridSpan`` give it exactly. Without the floor a
+    one-row table whose only cell spans both columns trims back to a single
+    column — the span padding looks exactly like a styled-empty column — and the
+    grid width is silently lost. A spreadsheet passes no floor, because a ragged
+    sheet has no declared grid to defend."""
     rows = [r for r in rows if any(c.strip() for c in r)]
     if not rows:
         return ""
-    width = 1
+    width = max(1, int(min_width or 0))
     for r in rows:
         for i in range(len(r) - 1, -1, -1):
             if r[i].strip():
@@ -370,17 +682,53 @@ def _gfm_table(rows):
     return "\n".join(out)
 
 
+def _fenced(lines):
+    # type: (list) -> str
+    """One fenced code block, with a fence long enough to survive its contents.
+
+    CommonMark closes a fence only on a run of at least the opening length, so a
+    body line that itself starts with ``` would truncate a three-backtick block."""
+    longest = 0
+    for line in lines:
+        for m in re.finditer(r"`+", line):
+            longest = max(longest, len(m.group(0)))
+    fence = "`" * max(3, longest + 1)
+    return fence + "\n" + "\n".join(lines) + "\n" + fence
+
+
 def _join_blocks(blocks):
     # type: (list) -> str
     """Join (kind, text) blocks: consecutive list items stack with single newlines
-    (one markdown list), everything else is blank-line separated."""
+    (one markdown list), consecutive code paragraphs fuse into ONE fenced block,
+    everything else is blank-line separated.
+
+    Code has to fuse: one w:p is one line, so a five-line shell transcript arrives
+    as five blocks, and five separate fences would be five separate programs.
+
+    ``lib`` is a list item that must NOT be glued to the item above it. CommonMark
+    lets a list interrupt a paragraph only when an ordered marker reads ``1``, so a
+    sub-list that starts at 5 written directly under its parent's text is swallowed
+    as that parent's prose. One blank line closes the parent's paragraph and the
+    sub-list survives; the items after it stack normally again."""
     parts = []  # type: list
     prev_kind = None
-    for kind, text in blocks:
+    i = 0
+    while i < len(blocks):
+        kind, text = blocks[i]
         if not text:
+            i += 1
             continue
+        if kind == "code":
+            run = []  # type: list
+            while i < len(blocks) and blocks[i][0] == "code" and blocks[i][1]:
+                run.append(blocks[i][1])
+                i += 1
+            text = _fenced(run)
+        else:
+            i += 1
         if parts:
-            parts.append("\n" if (kind == "li" and prev_kind == "li") else "\n\n")
+            parts.append("\n" if (kind == "li" and prev_kind in ("li", "lib"))
+                         else "\n\n")
         parts.append(text)
         prev_kind = kind
     return "".join(parts)
@@ -440,7 +788,7 @@ def _embedded_sections(parts, pattern_titles):
 # --------------------------------------------------------------------------- docx
 
 _HEADING_NAME = re.compile(r"^heading\s+([1-9])$")
-_DOCX_CHART = re.compile(r"^word/charts/chart\d+\.xml$")
+_DOCX_CHART = re.compile(r"^word/charts/chart(?:Ex)?\d+\.xml$")
 _DOCX_DIAGRAM = re.compile(r"^word/diagrams/data\d+\.xml$")
 
 
@@ -450,41 +798,39 @@ def _docx_styles(styles_xml):
 
     A style is a heading when its w:name is ``heading N`` (Word's canonical names
     survive localization better than styleIds) or when it carries an explicit
-    w:outlineLvl. ``Title`` maps to level 1."""
-    root = _root(styles_xml)
+    w:outlineLvl. ``Title`` maps to level 1. Both questions are asked of the whole
+    ``w:basedOn`` chain, nearest first: a custom ``NimbusH1 basedOn="Heading1"`` is
+    an ``<h1>`` to every real reader, and treating it as body prose deleted every
+    heading in the document while the report still said ``status: ok``."""
+    records = _docx_style_records(styles_xml)
     levels = {}
-    if root is None:
-        return levels
-    for style in root:
-        if _local(style.tag) != "style":
-            continue
-        sid = _attr(style, "styleId")
-        if not sid:
-            continue
-        name = ""
-        outline = None
-        for ch in style.iter():
-            loc = _local(ch.tag)
-            if loc == "name":
-                name = _attr(ch, "val")
-            elif loc == "outlineLvl":
-                try:
-                    outline = int(_attr(ch, "val"))
-                except ValueError:
-                    outline = None
-        m = _HEADING_NAME.match((name or "").strip().lower())
-        if m:
-            levels[sid] = int(m.group(1))
-        elif (name or "").strip().lower() == "title":
-            levels[sid] = 1
-        elif outline is not None and 0 <= outline <= 8:
-            levels[sid] = outline + 1
+    for sid in records:
+        for anc in _style_chain(sid, records):
+            name = (records[anc]["name"] or "").strip().lower()
+            outline = records[anc]["outline"]
+            m = _HEADING_NAME.match(name)
+            if m:
+                levels[sid] = int(m.group(1))
+            elif name == "title":
+                levels[sid] = 1
+            elif outline is not None and 0 <= outline <= 8:
+                levels[sid] = outline + 1
+            else:
+                continue
+            break
     return levels
 
 
 def _docx_numbering(numbering_xml):
     # type: (str) -> dict
-    """(numId, ilvl) -> numFmt (``bullet``/``decimal``/...), from numbering.xml."""
+    """(numId, ilvl) -> ``(numFmt, start)``, from numbering.xml.
+
+    ``start`` is the number the level's FIRST item carries: ``w:start`` on the
+    abstract level, overridden by whatever this numbering instance says in
+    ``w:lvlOverride`` (``w:startOverride``, or a replacement ``w:lvl``). Neither was
+    read anywhere until now, so a procedure declared to begin at 5 shipped beginning
+    at 1 and the prose saying "see step 5" pointed at nothing. A level with no
+    ``w:numFmt`` stays absent, so the caller's ``bullet`` default is unchanged."""
     root = _root(numbering_xml)
     fmts = {}
     if root is None:
@@ -498,9 +844,15 @@ def _docx_numbering(numbering_xml):
             if _local(lvl.tag) != "lvl":
                 continue
             ilvl = _attr(lvl, "ilvl")
+            fmt, start = "", 1
             for ch in lvl:
-                if _local(ch.tag) == "numFmt":
-                    abstract[(aid, ilvl)] = _attr(ch, "val")
+                loc = _local(ch.tag)
+                if loc == "numFmt":
+                    fmt = _attr(ch, "val")
+                elif loc == "start":
+                    start = _num_val(_attr(ch, "val"), 1)
+            if fmt:
+                abstract[(aid, ilvl)] = (fmt, start)
     for num in root:
         if _local(num.tag) != "num":
             continue
@@ -508,9 +860,29 @@ def _docx_numbering(numbering_xml):
         for ch in num:
             if _local(ch.tag) == "abstractNumId":
                 aid = _attr(ch, "val")
-                for (a, ilvl), fmt in abstract.items():
+                for (a, ilvl), pair in abstract.items():
                     if a == aid:
-                        fmts[(nid, ilvl)] = fmt
+                        fmts[(nid, ilvl)] = pair
+        # The instance's own overrides come SECOND, so they win over the abstract
+        # definition they are overriding. This is where "restart this list at 1"
+        # lives when the same abstract numbering is used twice in one document.
+        for ch in num:
+            if _local(ch.tag) != "lvlOverride":
+                continue
+            ilvl = _attr(ch, "ilvl")
+            fmt, start = fmts.get((nid, ilvl), ("bullet", 1))
+            for sub in ch:
+                loc = _local(sub.tag)
+                if loc == "startOverride":
+                    start = _num_val(_attr(sub, "val"), start)
+                elif loc == "lvl":
+                    for lv in sub:
+                        lloc = _local(lv.tag)
+                        if lloc == "numFmt":
+                            fmt = _attr(lv, "val") or fmt
+                        elif lloc == "start":
+                            start = _num_val(_attr(lv, "val"), start)
+            fmts[(nid, ilvl)] = (fmt, start)
     return fmts
 
 
@@ -561,18 +933,25 @@ def _p_style_info(p):
     return sid, num_id, ilvl, outline
 
 
-def _docx_p_text(p, links, boxes, images=None):
-    # type: (object, dict, list, object) -> str
+def _docx_p_text(p, links, boxes, images=None, char_styles=None, raw=False):
+    # type: (object, dict, list, object, object, bool) -> str
     """Markdown text of one paragraph: verbatim run joins, hyperlinks rendered
     ``[text](url)`` when the rel target is external. Text boxes anchored inside
     the paragraph are collected into ``boxes`` for rendering as their own blocks.
 
     When ``images`` is a list, embedded-picture rIds (DrawingML ``<a:blip>`` / VML
     ``<v:imagedata>``) are appended to it in reading order; the caller emits the
-    sentinels. ``None`` (the default) means the legacy text-only walk -- byte-identical."""
-    parts = []  # type: list
+    sentinels. ``None`` (the default) means the legacy text-only walk -- byte-identical.
 
-    def walk(el):
+    ``char_styles`` is the set of character styleIds that mean monospace; runs
+    carrying one become inline code spans. ``raw`` is for a paragraph that is
+    ITSELF code: its text is emitted unescaped and unmarked, because the caller
+    will put it inside a fence where backslashes would survive as literal
+    characters and destroy recall (``markdown_to_text`` keeps fenced lines verbatim
+    and never unescapes them)."""
+    segments = []  # type: list
+
+    def walk(el, marks):
         for ch in el:
             loc = _local(ch.tag)
             if loc in _SKIP_LOCALS or loc == "pPr":
@@ -590,31 +969,39 @@ def _docx_p_text(p, links, boxes, images=None):
                 if rid:
                     images.append(rid)
                 continue
+            if loc == "r" and not raw:
+                walk(ch, _run_marks(ch, char_styles) or marks)
+                continue
             if loc == "hyperlink":
-                mark = len(parts)
-                walk(ch)
-                inner = _WS.sub(" ", "".join(parts[mark:])).strip()
-                del parts[mark:]
+                mark = len(segments)
+                walk(ch, marks)
+                inner = _WS.sub(" ", _render_runs(segments[mark:])).strip()
+                del segments[mark:]
                 url = _attr(ch, "id") and links.get(_attr(ch, "id"), "") or ""
-                if inner and url.startswith(("http://", "https://")):
-                    parts.append("[%s](%s)" % (inner, url))
+                if raw:
+                    if inner:
+                        segments.append(((), inner))
+                elif inner and url.startswith(("http://", "https://")):
+                    segments.append(((), "[%s](%s)" % (inner, url)))
                 elif inner:
-                    parts.append(inner)
+                    segments.append(((), inner))
                 continue
             if loc == "t":
                 if ch.text:
-                    parts.append(_esc(ch.text))
+                    segments.append((marks, ch.text if (raw or "code" in marks)
+                                     else _esc(ch.text)))
                 continue
             if loc in _BREAK_LOCALS:
-                parts.append(" ")
+                segments.append((marks, " "))
                 continue
-            walk(ch)
-    walk(p)
-    return _WS.sub(" ", "".join(parts)).strip()
+            walk(ch, marks)
+    walk(p, ())
+    text = "".join(t for _m, t in segments) if raw else _render_runs(segments)
+    return _WS.sub(" ", text).strip()
 
 
-def _docx_cell_text(tc, links, boxes, images=None):
-    # type: (object, dict, list, object) -> str
+def _docx_cell_text(tc, links, boxes, images=None, char_styles=None):
+    # type: (object, dict, list, object, object) -> str
     """One table cell as a single GFM-safe cell text; inner paragraphs join with
     ``<br>``; NESTED table rows flatten into the cell (escaped pipes) so their
     tokens are never lost. Paragraphs wrapped in content controls (w:sdt) are
@@ -625,22 +1012,50 @@ def _docx_cell_text(tc, links, boxes, images=None):
     _find_locals(tc, ("p", "tbl"), content, stop=("tcPr",))
     for el in content:
         if _local(el.tag) == "p":
-            t = _docx_p_text(el, links, boxes, images)
+            t = _docx_p_text(el, links, boxes, images, char_styles)
             if t:
                 chunks.append(_md_cell(t))
         else:
-            for row in _docx_table_rows_md(el, links, boxes, images):
+            for row in _docx_table_rows_md(el, links, boxes, images, char_styles):
                 flat = " ".join(c for c in row if c)
                 if flat:
                     chunks.append(flat)
     return "<br>".join(chunks)
 
 
-def _docx_table_rows_md(tbl, links, boxes, images=None):
-    # type: (object, dict, list, object) -> list
-    """Rows of cell texts for one w:tbl, honoring gridSpan column geometry AND
-    vMerge forward-fill. Rows/cells wrapped in w:sdt (repeating-section controls)
-    are found through the wrappers; nested tables stay inside their owning cell.
+def _row_grid_pad(tr):
+    # type: (object) -> tuple
+    """``(before, after)`` — grid columns this row does not occupy.
+
+    ``w:trPr/w:gridBefore`` says the row starts at grid column N, not 0 (an indented
+    continuation row in a register map); ``w:gridAfter`` says it stops short of the
+    right edge. Reading the cells and ignoring these shifts every value one column
+    LEFT, which is how a register named ``0x04`` published ``RO`` as its offset —
+    a plausible table, wrong in every row, with nothing in the report to say so.
+
+    ``w:trPrChange`` holds the row properties a tracked change REPLACED and is never
+    entered, for the same reason ``w:pPrChange`` is not."""
+    before = after = 0
+    for ch in tr:
+        if _local(ch.tag) != "trPr":
+            continue
+        for pr in ch:
+            loc = _local(pr.tag)
+            if loc == "trPrChange":
+                continue
+            if loc == "gridBefore":
+                before = max(before, _num_val(_attr(pr, "val"), 0))
+            elif loc == "gridAfter":
+                after = max(after, _num_val(_attr(pr, "val"), 0))
+    return before, after
+
+
+def _docx_table_rows_md(tbl, links, boxes, images=None, char_styles=None):
+    # type: (object, dict, list, object, object) -> list
+    """Rows of cell texts for one w:tbl, honoring gridSpan column geometry,
+    gridBefore/gridAfter row offsets AND vMerge forward-fill. Rows/cells wrapped in
+    w:sdt (repeating-section controls) are found through the wrappers; nested tables
+    stay inside their owning cell.
 
     GFM tables have no rowspan, so a vertical merge (``w:vMerge``) is flattened by
     REPEATING the restart cell's value down its continuation rows — the
@@ -653,10 +1068,11 @@ def _docx_table_rows_md(tbl, links, boxes, images=None):
     _find_locals(tbl, ("tr",), trs, stop=("tc", "p", "tblPr", "tblGrid"))
     fill = {}  # type: dict  # grid-column index -> restart value for an active vMerge
     for tr in trs:
-        cells = []  # type: list
         tcs = []  # type: list
         _find_locals(tr, ("tc",), tcs, stop=("p", "tbl", "trPr"))
-        col = 0
+        before, after = _row_grid_pad(tr)
+        cells = [""] * before                  # type: list  # skipped grid columns
+        col = before
         for tc in tcs:
             span = 1
             spans = []  # type: list
@@ -668,7 +1084,7 @@ def _docx_table_rows_md(tbl, links, boxes, images=None):
                     span = 1
             vmerges = []  # type: list
             _find_locals(tc, ("vMerge",), vmerges, stop=("p", "tbl"))
-            text = _docx_cell_text(tc, links, boxes, images)
+            text = _docx_cell_text(tc, links, boxes, images, char_styles)
             if vmerges and _attr(vmerges[0], "val") != "restart":
                 if not text:                       # continuation: repeat the value above
                     text = fill.get(col, "")
@@ -679,13 +1095,47 @@ def _docx_table_rows_md(tbl, links, boxes, images=None):
             cells.append(text)
             cells.extend([""] * (span - 1))
             col += span
+        cells.extend([""] * after)
         if cells:
             rows.append(cells)
     return rows
 
 
-def _docx_blocks(el, styles, numbering, links, blocks, img=None, lst=None):
-    # type: (object, dict, dict, dict, list, object, dict) -> None
+def _lift_box(box, styles, numbering, links, blocks, img, lst, code, snum, pad):
+    # type: (object, dict, dict, dict, list, object, dict, object, dict, str) -> None
+    """Render one text box's content as its own blocks, indented into the list item
+    that anchors it whenever that is expressible.
+
+    A text box HAS to be lifted out of its anchor paragraph — a pipe table and a
+    fenced block cannot live inside a sentence. Emitted at column 0 it also closed
+    the enclosing list, splitting a procedure in two around a callout. Indenting it
+    to the item's content column makes it a list-item continuation and the steps
+    keep counting.
+
+    Two block kinds refuse the indent and are still emitted at column 0. A LIST ITEM,
+    because its nesting depth is one of the facts the structural ground truth
+    compares, and indenting it would report a level the source never had. A CODE
+    paragraph, because ``_join_blocks`` wraps the fused run in a fence written at
+    column 0, so indenting only the contents would break the block. Either way the
+    anchor is counted in ``lifted_text_boxes``, and the numbering counters survive
+    the split, so the item after the box carries its true number."""
+    sub = []  # type: list
+    # A fresh column stack and a fresh set of open lists: the box's own structure is
+    # its own. The COUNTERS are shared, because Word does not restart a procedure
+    # because a callout was anchored inside it.
+    inner = {"cols": [], "counts": lst["counts"], "open": {}}
+    _docx_blocks(box, styles, numbering, links, sub, img, inner, code, snum)
+    if pad and not any(k in ("li", "lib", "code") for k, _t in sub):
+        for kind, text in sub:
+            blocks.append((kind, "\n".join(pad + ln for ln in text.split("\n"))))
+        return
+    _close_list(lst)
+    blocks.extend(sub)
+
+
+def _docx_blocks(el, styles, numbering, links, blocks, img=None, lst=None, code=None,
+                 snum=None):
+    # type: (object, dict, dict, dict, list, object, dict, object, dict) -> None
     """Walk any element emitting (kind, markdown) blocks for each w:p / w:tbl.
 
     Recurses through wrappers (w:sdt content controls, bookmarks) so TOC fields
@@ -696,10 +1146,28 @@ def _docx_blocks(el, styles, numbering, links, blocks, img=None, lst=None):
 
     ``lst`` carries the open list's ancestor content columns across the recursion (see
     ``_list_indent``); any non-list block closes the list, exactly as a blank line does
-    in the rendered markdown, so the next item restarts at column 0."""
+    in the rendered markdown, so the next item restarts at column 0. The columns are
+    keyed on w:ilvl ALONE, never on the numbering instance: Word gives a bullet
+    sub-list inside a numbered procedure its own w:numId, and discarding the ancestor
+    columns on that change unparents the sub-list — the notes stop belonging to the
+    step they were written under. An item deeper than anything open is already
+    clamped by ``_list_indent``, which is the real defence against a list that starts
+    at ilvl 2 with no parent.
+
+    ``code`` is ``{"para": {styleId}, "char": {styleId}}`` from ``_docx_code_styles``:
+    a paragraph in a code style becomes a ``("code", ...)`` block, which
+    ``_join_blocks`` fuses with its neighbours into one fenced block.
+
+    ``snum`` is ``{styleId: (numId, ilvl)}`` from ``_docx_style_numbering`` — the
+    numbering a paragraph inherits from its STYLE when its own w:pPr carries none.
+    An explicit ``w:numId 0`` still means "not a list" and never inherits."""
     rels = img["rels"] if img is not None else None
     if lst is None:
-        lst = {"cols": [], "num": None}
+        lst = {"cols": [], "counts": {}, "open": {}}
+    if code is None:
+        code = {"para": (), "char": ()}
+    if snum is None:
+        snum = {}
     cols = lst["cols"]
     for ch in el:
         loc = _local(ch.tag)
@@ -708,41 +1176,68 @@ def _docx_blocks(el, styles, numbering, links, blocks, img=None, lst=None):
         if loc == "p":
             boxes = []  # type: list
             images = [] if rels is not None else None
-            text = _docx_p_text(ch, links, boxes, images)
+            sid, num_id, ilvl, outline = _p_style_info(ch)
+            if not num_id:
+                inherited = snum.get(sid)
+                if inherited:
+                    num_id = inherited[0]
+                    if not ilvl:
+                        ilvl = inherited[1]
+            is_code = sid in code["para"]
+            text = _docx_p_text(ch, links, boxes, images, code["char"], raw=is_code)
+            item_pad = ""            # the content column an anchored figure continues
             if text:
-                sid, num_id, ilvl, outline = _p_style_info(ch)
-                level = styles.get(sid)
-                if level is None and outline:
+                level = None if is_code else styles.get(sid)
+                if level is None and outline and not is_code:
                     try:
                         level = int(outline) + 1
                     except ValueError:
                         level = None
-                if level:
-                    del cols[:]
-                    lst["num"] = None
+                if is_code:
+                    _close_list(lst)
+                    blocks.append(("code", text))
+                elif level:
+                    _close_list(lst)
                     blocks.append(("h", "#" * min(level, 6) + " " + _esc_lead(text)))
                 elif num_id and num_id != "0":
-                    fmt = numbering.get((num_id, ilvl or "0"), "bullet")
-                    marker = "-" if fmt == "bullet" else "1."
-                    try:
-                        depth = int(ilvl or "0")
-                    except ValueError:
-                        depth = 0
-                    if lst["num"] != num_id:      # a different list: no shared ancestry
-                        del cols[:]
-                        lst["num"] = num_id
-                    blocks.append(("li", _list_indent(cols, depth, marker)
-                                   + marker + " " + text))
+                    fmt, start = numbering.get((num_id, ilvl or "0"), ("bullet", 1))
+                    depth = _num_val(ilvl, 0)
+                    if fmt == "bullet":
+                        marker = "-"
+                        restart = False
+                        _close_ordered(lst["open"], depth)
+                    else:
+                        number = _list_number(lst["counts"], num_id, depth, start)
+                        marker = _ordered_marker(lst["open"], depth, number)
+                        restart = number != 1
+                    pad = _list_indent(cols, depth, marker)
+                    # A NESTED item whose number is not 1 may not be glued to its
+                    # parent's text: CommonMark lets a list interrupt a paragraph only
+                    # when an ordered marker reads 1, so "5." written straight under
+                    # step 4 is swallowed as step 4's prose. One blank line closes that
+                    # paragraph and the sub-list survives.
+                    blocks.append((("lib" if (pad and restart) else "li"),
+                                   pad + marker + " " + text))
+                    item_pad = " " * cols[-1]
                 else:
-                    del cols[:]
-                    lst["num"] = None
+                    _close_list(lst)
                     blocks.append(("p", _esc_lead(text)))
             if images:
-                _emit_image_blocks(images, rels, blocks)
-                del cols[:]                       # a column-0 sentinel closes the list
-                lst["num"] = None
+                img_blocks = []  # type: list
+                _emit_image_blocks(images, rels, img_blocks)
+                if item_pad:
+                    # The picture sits INSIDE this step. Indented to the step's
+                    # content column it is a list-item continuation, so the steps
+                    # below keep counting; emitted at column 0 it closes the list,
+                    # which is how a screenshot in a runbook renumbered every step
+                    # after it back to 1.
+                    blocks.extend([(k, item_pad + t) for k, t in img_blocks])
+                else:
+                    blocks.extend(img_blocks)
+                    _close_list(lst)          # a column-0 sentinel closes the list
             for box in boxes:
-                _docx_blocks(box, styles, numbering, links, blocks, img, lst)
+                _lift_box(box, styles, numbering, links, blocks, img, lst, code,
+                          snum, item_pad)
         elif loc == "tbl":
             # A 1x1 table is Word LAYOUT scaffolding (a framed section), not data:
             # unwrap the lone cell into normal body blocks instead of emitting a
@@ -756,23 +1251,28 @@ def _docx_blocks(el, styles, numbering, links, blocks, img=None, lst=None):
                 if len(tcs) == 1:
                     single = tcs[0]
             if single is not None:
-                _docx_blocks(single, styles, numbering, links, blocks, img, lst)
+                _docx_blocks(single, styles, numbering, links, blocks, img, lst, code,
+                             snum)
                 continue
             boxes = []
             images = [] if rels is not None else None
-            table = _gfm_table(_docx_table_rows_md(ch, links, boxes, images))
+            rows_md = _docx_table_rows_md(ch, links, boxes, images, code["char"])
+            # The row lists are already span-padded, so their length IS the
+            # declared grid width; passing it stops a lone spanning cell from
+            # trimming the table back to one column.
+            table = _gfm_table(rows_md,
+                               min_width=max([len(r) for r in rows_md] or [0]))
             if table:
-                del cols[:]
-                lst["num"] = None
+                _close_list(lst)
                 blocks.append(("table", table))
             if images:
                 _emit_image_blocks(images, rels, blocks)
-                del cols[:]
-                lst["num"] = None
+                _close_list(lst)
             for box in boxes:
-                _docx_blocks(box, styles, numbering, links, blocks, img, lst)
+                _lift_box(box, styles, numbering, links, blocks, img, lst, code,
+                          snum, "")
         else:
-            _docx_blocks(ch, styles, numbering, links, blocks, img, lst)
+            _docx_blocks(ch, styles, numbering, links, blocks, img, lst, code, snum)
 
 
 def _docx_notes_section(xml, title):
@@ -832,8 +1332,10 @@ def docx_markdown(parts, emit_images=False):
     if emit_images:
         img = {"rels": _image_rels(parts.get("word/_rels/document.xml.rels", ""),
                                    "word/document.xml")}
+    code = _docx_code_styles(parts.get("word/styles.xml", ""))
+    snum = _docx_style_numbering(parts.get("word/styles.xml", ""))
     blocks = []  # type: list
-    _docx_blocks(root, styles, numbering, links, blocks, img)
+    _docx_blocks(root, styles, numbering, links, blocks, img, None, code, snum)
     for part, title in (("word/footnotes.xml", "Footnotes"),
                         ("word/endnotes.xml", "Endnotes"),
                         ("word/comments.xml", "Comments")):
@@ -916,7 +1418,7 @@ def furniture_drops(parts):
 _SLIDE_PART = re.compile(r"^ppt/slides/slide(\d+)\.xml$")
 _NOTES_PART = re.compile(r"^ppt/notesSlides/notesSlide(\d+)\.xml$")
 _PPTX_DIAGRAM = re.compile(r"^ppt/diagrams/data\d+\.xml$")
-_PPTX_CHART = re.compile(r"^ppt/charts/chart\d+\.xml$")
+_PPTX_CHART = re.compile(r"^ppt/charts/chart(?:Ex)?\d+\.xml$")
 # Placeholder types that are page chrome, not content (shared with ground truth).
 _CHROME_PH = ("sldNum", "dt", "ftr")
 
@@ -1182,7 +1684,7 @@ _SHEET_TARGET = re.compile(r"^(?:/xl/|xl/|\.\./|\./)*(worksheets/[^/]+\.xml)$")
 _XLSX_SHEET_PART = re.compile(r"^xl/worksheets/[^/]+\.xml$")
 _XLSX_DRAWING = re.compile(r"^xl/drawings/drawing\d+\.xml$")
 _XLSX_COMMENTS = re.compile(r"^xl/comments\d*\.xml$")
-_XLSX_CHART = re.compile(r"^xl/charts/chart\d+\.xml$")
+_XLSX_CHART = re.compile(r"^xl/charts/chart(?:Ex)?\d+\.xml$")
 
 
 def _shared_strings(xml):

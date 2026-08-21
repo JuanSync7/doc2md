@@ -10,9 +10,11 @@ from collections import OrderedDict
 import pytest
 from backend.kb import (FIELDS, PROVENANCE_KEY, SOURCE_AUTHORED, SOURCE_DERIVED,
                         SOURCE_EXTRACTED, SOURCE_GENERATED, UNKNOWN,
-                        accept_model_meta, field_names, is_authored, load_vocab,
-                        meta_coverage, order_meta, proposed_key, request_spec,
-                        revalidate_generated, set_provenance, value_sha)
+                        abstract_floor, accept_model_meta, field_names,
+                        harvested_links, is_authored, load_vocab, meta_coverage,
+                        next_review_due, order_meta, proposed_key, record_source,
+                        request_spec, revalidate_generated, set_provenance,
+                        source_url, title_floor, value_sha, value_source)
 
 pytestmark = pytest.mark.unit
 
@@ -197,14 +199,14 @@ def test_unknown_is_a_legal_answer_that_is_never_stored_and_silence_stays_pendin
         "type": "UnKnown",
         "tags": ["linux", "  Unknown  "],
         "abstract": "",
-        "short_title": None,
+        "keywords": None,
         "topics": [],
     }, vocab)
 
     assert "type" not in out["accepted"]
     assert out["accepted"]["tags"] == ["linux"]
     assert out["proposals"] == {}
-    for silent in ("abstract", "short_title", "topics"):
+    for silent in ("abstract", "keywords", "topics"):
         assert silent not in out["accepted"]
         assert silent not in out["proposals"]
         assert silent not in _reasons(out)
@@ -310,19 +312,20 @@ def test_aliases_are_canonicalised_on_the_way_in(vocab):
     # once, here, rather than at each call site that later reads the field.
     out = accept_model_meta({
         "type": "playbook",
-        "relations": [{"s": "malware", "p": "threatens", "o": "host"}],
-        "decisions": [{"id": "d-1", "status": "assumed"}],
+        "relations": [{"s": "malware", "p": "threatens", "o": "host",
+                       "ref": "#scope"}],
+        "decisions": [{"id": "d-1", "status": "assumed", "ref": "#scope"}],
     }, vocab)
 
     assert out["rejected"] == []
     assert out["accepted"]["type"] == "runbook"
     assert out["accepted"]["relations"] == [{"s": "malware", "p": "targets",
-                                             "o": "host"}]
+                                             "o": "host", "ref": "#scope"}]
     # The MADR collapse carries its qualifier onto the WRITE path, not just into
     # the report: `assumed` and `provisional` both become `accepted`, so without
     # the qualifier the two are indistinguishable the moment they are stored.
     assert dict(out["accepted"]["decisions"][0]) == {
-        "id": "d-1", "status": "accepted", "assumption": True}
+        "id": "d-1", "status": "accepted", "ref": "#scope", "assumption": True}
 
 
 def test_one_invalid_record_is_dropped_while_the_valid_ones_survive(vocab):
@@ -331,14 +334,14 @@ def test_one_invalid_record_is_dropped_while_the_valid_ones_survive(vocab):
     # its worst line — but the drop is reported, keyed by the offending subfield, so
     # the invented term is visible rather than merely absent.
     out = accept_model_meta({"relations": [
-        {"s": "a", "p": "runs_on", "o": "b"},
-        {"s": "c", "p": "helps_mitigate", "o": "d"},
-        {"s": "e", "p": "mitigates", "o": "f", "mode": "silent"},
+        {"s": "a", "p": "runs_on", "o": "b", "ref": "#scope"},
+        {"s": "c", "p": "helps_mitigate", "o": "d", "ref": "#scope"},
+        {"s": "e", "p": "mitigates", "o": "f", "mode": "silent", "ref": "#scope"},
     ]}, vocab)
 
     assert out["accepted"]["relations"] == [
-        {"s": "a", "p": "runs_on", "o": "b"},
-        {"s": "e", "p": "mitigates", "o": "f", "mode": "silent"},
+        {"s": "a", "p": "runs_on", "o": "b", "ref": "#scope"},
+        {"s": "e", "p": "mitigates", "o": "f", "mode": "silent", "ref": "#scope"},
     ]
     assert out["rejected"] == [("relations.p", "helps_mitigate", "not-in-vocabulary")]
     assert out["provenance"]["relations"]["source"] == SOURCE_GENERATED
@@ -359,7 +362,7 @@ def test_a_registry_term_becomes_a_proposal_rather_than_an_accepted_value(vocab)
     # `value_sha` fingerprints what we wrote, so a later run can tell a human's
     # correction of a generated value from the value we left there.
     assert prov_tags.pop("value_sha")
-    assert prov_tags == {"tier": 2, "source": SOURCE_GENERATED,
+    assert prov_tags == {"source": SOURCE_GENERATED,
                          "model": "m-1", "prompt_sha": "abc123"}
 
 
@@ -491,10 +494,16 @@ def test_set_provenance_names_the_model_only_for_generated_values(vocab):
     prov = meta[PROVENANCE_KEY]
     got = dict(prov["type"])
     assert got.pop("value_sha")          # fingerprint of the stored value
-    assert got == {"tier": 2, "source": SOURCE_GENERATED,
+    assert got == {"source": SOURCE_GENERATED,
                    "model": "m-1", "prompt_sha": "abc123"}
-    assert prov["title"] == {"tier": 2, "source": SOURCE_AUTHORED}
-    assert prov["slug"] == {"tier": 1, "source": SOURCE_DERIVED}
+    # An authored value is a person's, so nothing is fingerprinted; a machine value
+    # is, whatever tier wrote it, or the next run cannot see a correction.
+    assert prov["title"] == {"source": SOURCE_AUTHORED}
+    assert dict(prov["slug"])["source"] == SOURCE_DERIVED
+    assert dict(prov["slug"])["value_sha"] == value_sha(meta.get("slug"))
+    # ...and no `tier`: it is field(name).tier, recomputable for free, and was ~40%
+    # of the bytes of every provenance block in the corpus.
+    assert "tier" not in prov["title"] and "tier" not in prov["slug"]
 
     # A key outside the schema gets no provenance record — and no block is conjured
     # for it either.
@@ -591,3 +600,203 @@ def test_a_value_this_stage_rewrites_is_re_fingerprinted():
     rec = out[PROVENANCE_KEY]["type"]
     assert rec["value_sha"] == value_sha("design")
     assert is_authored(rec, out["type"]) is False       # still machine-owned
+
+
+# --------------------------------------------------------- the floor (P5.1-P5.3)
+#
+# A model is the CEILING. Everything below is what the page carries WITHOUT one,
+# taken from evidence the pipeline already measured — and the rules that stop a
+# later model answer quietly deleting it.
+
+# The two grouped vocabularies the floor and the group governance need. Kept apart
+# from VOCAB_V1 so the acceptance tests above keep grading against the vocabulary
+# they were written for.
+VOCAB_GROUPS = VOCAB_V1 + """
+entity_types:
+  governance: closed
+  values: [Host, Software]
+  group_types:
+    hosts: Host
+
+link_categories:
+  governance: closed
+  values: [internal, ecosystem]
+"""
+
+BODY = ("# 1. Scope\n\n"
+        "> quoted furniture\n\n"
+        "- a list item\n\n"
+        "The arbiter serves the read and write queues. It also refreshes the "
+        "banks on a fixed schedule. A third sentence nobody needs.\n\n"
+        "## Rollback\n\nRun the restore playbook.\n")
+
+OUTLINE = [{"title": "1. Scope", "level": 1, "line_span": [0, 8],
+            "links": [{"text": "wiki", "url": "https://x.example/w", "line": 3}],
+            "children": [{"title": "Rollback", "level": 2, "line_span": [8, 11],
+                          "links": [{"text": "runbook", "url": "run.md",
+                                     "line": 9}]}]}]
+
+ANCHORS = set(["1-scope", "rollback"])
+
+
+@pytest.fixture
+def gvocab():
+    return load_vocab(text=VOCAB_GROUPS)
+
+
+def test_a_title_from_a_document_property_is_evidence_and_one_from_a_filename_is_not():
+    # The judgement the whole floor turns on. Both values are deterministic; only
+    # one of them is something the document SAYS about itself, and that is what
+    # decides whether a model may overwrite it later.
+    assert title_floor("Memory Controller Spec", BODY, "specs/mem.docx") == (
+        "Memory Controller Spec", SOURCE_EXTRACTED)
+    assert title_floor("", BODY, "specs/mem.docx") == ("1. Scope", SOURCE_DERIVED)
+    assert title_floor("", "", "specs/mem_ctrl-v2.docx") == (
+        "Mem Ctrl V2", SOURCE_DERIVED)
+    assert title_floor("", "", "") == ("", "")
+
+
+def test_a_model_may_replace_a_guessed_title_and_may_not_replace_a_declared_one(vocab):
+    # `is_protected` is the mechanism, and the two directions are the point: the
+    # floor must not freeze a filename-derived title, and must not let a proposal
+    # contradict the document's own property.
+    guessed = {"title": "Mem Ctrl V2",
+               PROVENANCE_KEY: {"title": {"source": SOURCE_DERIVED,
+                                          "value_sha": value_sha("Mem Ctrl V2")}}}
+    out = accept_model_meta({"title": "Memory Controller Design Spec"}, vocab,
+                            guessed)
+    assert out["accepted"]["title"] == "Memory Controller Design Spec"
+
+    declared = {"title": "Memory Controller Spec",
+                PROVENANCE_KEY: {"title": {"source": SOURCE_EXTRACTED,
+                                           "value_sha": value_sha(
+                                               "Memory Controller Spec")}}}
+    out = accept_model_meta({"title": "Something Else"}, vocab, declared)
+    assert "title" not in out["accepted"]
+    assert ("title", "Something Else", "kept-extracted") in out["rejected"]
+
+
+def test_the_abstract_floor_takes_prose_and_nothing_else():
+    # Headings, quotes, lists and table rows are structure, not a summary. A floor
+    # that picked one of them would read as a broken sentence on every page.
+    text = abstract_floor(BODY, OUTLINE, max_chars=400)
+    assert text.startswith("The arbiter serves the read and write queues.")
+    assert "list item" not in text and "1. Scope" not in text
+
+    # Bounded, and cut at a sentence rather than mid-word.
+    short = abstract_floor(BODY, OUTLINE, max_chars=60)
+    assert len(short) <= 60 and short.endswith(".")
+    assert abstract_floor("", OUTLINE) == ""
+
+
+def test_every_harvested_link_is_categorised_and_carries_the_section_it_sits_in():
+    # The headline of P5: structure.json already holds these, measured at recall
+    # 1.0, and the pipeline used to throw them away and keep only what a model
+    # imagined.
+    links = harvested_links(OUTLINE, ANCHORS)
+    assert list(links) == ["ecosystem", "internal"]
+    assert links["ecosystem"][0]["url"] == "https://x.example/w"
+    assert links["ecosystem"][0]["ref"] == "#1-scope"
+    assert links["internal"][0]["ref"] == "#rollback"
+    # Each record says it is EVIDENCE, so a reader can tell it from a proposal.
+    assert all(record_source(r) == SOURCE_EXTRACTED
+               for recs in links.values() for r in recs)
+    assert value_source(links) == SOURCE_EXTRACTED
+
+    # An anchor the body does not publish is never cited: a ref that resolves to
+    # nothing is a dead link, and the linter would report it as one.
+    assert "ref" not in harvested_links(OUTLINE, set())["ecosystem"][0]
+
+
+def test_a_model_adds_links_beside_the_harvested_ones_and_cannot_replace_them(gvocab):
+    harvested = harvested_links(OUTLINE, ANCHORS)
+    existing = {"links": harvested,
+                PROVENANCE_KEY: {"links": {"source": SOURCE_EXTRACTED,
+                                           "value_sha": value_sha(harvested)}}}
+    proposed = {"links": {
+        # the same URL the harvester already has, re-categorised: dropped, because
+        # the measured record is the better-sourced one
+        "internal": [{"url": "https://x.example/w", "ref": "#rollback"}],
+        # ...and one the body does not carry, which is the model's to contribute
+        "ecosystem": [{"url": "https://y.example/z", "ref": "#rollback"}]}}
+
+    out = accept_model_meta(proposed, gvocab, existing, model="m", prompt_sha="p")
+    kept = out["accepted"]["links"]
+    urls = [r["url"] for recs in kept.values() for r in recs]
+    assert urls.count("https://x.example/w") == 1
+    assert "https://y.example/z" in urls
+    assert "run.md" in urls                        # the other harvested one survives
+    # The block is now mixed, and says so: the weakest origin in it is what the
+    # field-level record may claim.
+    assert out["provenance"]["links"]["source"] == SOURCE_GENERATED
+
+
+def test_a_record_that_cannot_say_which_section_asserts_it_is_refused(gvocab):
+    # "Which section says this?" has to be answerable or the claim cannot be
+    # checked, quoted or repaired. `{"p": "runs_on"}` used to be schema-valid.
+    out = accept_model_meta({"relations": [
+        {"p": "runs_on"},                                   # no s, no o, no ref
+        {"s": "a", "p": "runs_on", "o": "b"},               # no ref
+        {"s": "a", "p": "runs_on", "o": "b", "ref": "#nowhere"},
+        {"s": "a", "p": "runs_on", "o": "b", "ref": "#1-scope"},
+    ]}, gvocab, anchors=ANCHORS)
+
+    assert out["accepted"]["relations"] == [
+        {"s": "a", "p": "runs_on", "o": "b", "ref": "#1-scope"}]
+    reasons = [r[2] for r in out["rejected"]]
+    assert reasons == ["missing-required-s/o/ref", "missing-required-ref",
+                       "ref-not-an-anchor"]
+
+
+def test_an_unverifiable_ref_is_skipped_rather_than_passed(gvocab):
+    # No anchors supplied means the caller could not resolve them. A pointer nobody
+    # checked must not be reported as checked — but it must not be rejected either,
+    # or a caller with no body would lose every record.
+    out = accept_model_meta({"relations": [
+        {"s": "a", "p": "runs_on", "o": "b", "ref": "#anything"}]}, gvocab)
+    assert len(out["accepted"]["relations"]) == 1
+
+
+def test_an_untyped_entity_in_a_group_nobody_declared_is_refused(gvocab):
+    # P5.10. `group_types` says what an untyped member of a KNOWN group is
+    # (`hosts` -> Host). For an invented group that fallback is "", and "" used to
+    # read as "nothing to check" — so a whole ungoverned namespace walked in and was
+    # written stamped `generated`.
+    out = accept_model_meta({"entities": {
+        "hosts": [{"name": "db-1", "ref": "#1-scope"}],          # type from the group
+        "gadgets": [{"name": "thing", "ref": "#1-scope"}],       # untyped, unknown
+        "widgets": [{"name": "w", "type": "Software", "ref": "#1-scope"}],
+    }}, gvocab, anchors=ANCHORS)
+
+    kept = out["accepted"]["entities"]
+    assert sorted(kept) == ["hosts", "widgets"]        # a new group with TYPES is fine
+    assert ("entities.gadgets.type", "gadgets",
+            "untyped-member-of-unknown-group") in out["rejected"]
+
+
+def test_the_permalink_is_a_uri_reference_with_or_without_a_base():
+    # `source.uri` is a filesystem path and cannot be clicked: spaces, `#` and `?`
+    # all mean something else in a URL.
+    assert source_url("https://wiki/docs", "specs/a b#c.docx") == (
+        "https://wiki/docs/specs/a%20b%23c.docx")
+    assert source_url("https://wiki/docs/", "a.docx") == "https://wiki/docs/a.docx"
+    assert source_url("", "specs/a b.docx") == "specs/a%20b.docx"
+    assert source_url("https://wiki", "") == ""
+
+
+def test_a_review_date_is_computed_only_when_both_authored_inputs_are_there():
+    # An authored-only field MAY be derived when the derivation is arithmetic over
+    # two authored values: it restates a commitment a person made rather than making
+    # one for them. Everything else returns "" rather than inventing a deadline.
+    assert next_review_due("2026-01-31", "quarterly") == "2026-05-02"
+    assert next_review_due("2026-01-31", "annual") == "2027-01-31"
+    assert next_review_due("2026-01-31", "on_change") == ""     # names no interval
+    assert next_review_due("", "quarterly") == ""
+    assert next_review_due("not a date", "quarterly") == ""
+
+
+def test_the_spec_tells_the_model_the_shape_of_a_record_not_only_its_enums(vocab):
+    spec = request_spec(vocab)
+    assert spec["relations"]["required_keys"] == ["s", "p", "o", "ref"]
+    assert "#anchor" in spec["relations"]["ref"]
+    assert spec["links"]["required_keys"] == ["url", "ref"]

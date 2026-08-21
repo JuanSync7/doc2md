@@ -19,12 +19,12 @@ file fails the build. The source of truth is
 *why* each field is governed the way it is lives in
 [`document-metadata.md`](../design/document-metadata.md).
 
-Vocabulary revision: **v1** (`vocab_version` in every written block).
+Vocabulary revision: **v2** (`vocab_version` in every written block).
 
 ## The three governance regimes
 
 - **closed** — an unknown value is a hard failure. Changing this list is a schema change.
-  Vocabularies: `confidentiality`, `decision_status`, `document_status`, `document_types`, `entity_types`, `failure_modes`, `impact`, `lang`, `link_categories`, `relation_predicates`, `requirement_level`, `review_cadence`
+  Vocabularies: `confidentiality`, `decision_status`, `document_status`, `document_types`, `entity_types`, `failure_modes`, `impact`, `lang`, `link_categories`, `relation_predicates`, `review_cadence`
 - **registry** — an unknown value lands in `<field>_proposed` and is promoted once it appears on `promote_at` documents.
   Vocabularies: `audience`, `keywords`, `subtype`, `tags`, `topics`
 - **ref** — no term list; validated by referential integrity instead.
@@ -47,17 +47,16 @@ authored-only.
 |---|---|---|---|---|---|---|---|---|
 | schema_version | 0 | scalar |  |  |  | `document.md` | local | which revision of this inventory wrote the block |
 | vocab_version | 0 | scalar |  |  |  | `document.md` | local | which revision of the term list the values were checked against |
-| uid | 0 | scalar |  |  |  | `document.md` | dcterms:identifier | stable machine identity, namespaced from the source path |
+| id | 0 | scalar |  |  |  | `document.md` | dcterms:identifier | THE canonical identity: the source path, slugified per segment, unique by construction; authored wins so a rename can keep it |
+| uid | 0 | scalar |  |  |  | `document.md` | dcterms:identifier | DEPRECATED alias of `id`, always exactly equal to it; kept so a consumer written against v2 keeps resolving |
 | version | 0 | scalar |  |  |  | `document.md` | local | the source document's own revision, when it declares one |
-| source | 0 | map |  |  |  | `document.md` | dcterms:source | uri/publisher/authored_by/supersedes/is_derivative |
+| source | 0 | map |  |  |  | `document.md` | dcterms:source | uri/url/publisher/authored_by/supersedes/is_derivative |
 | extraction | 0 | map |  |  |  | `document.md` | prov:Activity | run_at/schema/extractor — prov:generatedAtTime + prov:SoftwareAgent |
-| id | 1 | scalar |  |  |  | `document.md` | dcterms:identifier | human-stable slug; authored wins, derived from title otherwise |
 | slug | 1 | scalar |  |  |  | `document.md` | local | url form of the title |
 | word_count | 1 | scalar |  |  |  | `document.md` | local |  |
 | reading_time_minutes | 1 | scalar |  |  |  | `document.md` | local |  |
-| title | 2 | scalar |  |  |  | `document.md` | dcterms:title | extracted when the source has a real one; the junk-title path is exactly where a model should propose from the first heading |
-| short_title | 2 | scalar |  |  |  | `document.md` | local | compression judgement |
-| abstract | 2 | scalar |  |  |  | `document.md` | dcterms:abstract |  |
+| title | 2 | scalar |  |  |  | `document.md` | dcterms:title | a deterministic floor always fills this (source property, else first heading, else filename); a model may only improve a floor value that was a GUESS, never one read from a document property |
+| abstract | 2 | scalar |  |  |  | `document.md` | dcterms:abstract | a derived floor (the lede paragraph, sentence-truncated) fills this with no model; a model may improve it, a person outranks both |
 | type | 2 | scalar |  | `document_types` | closed | `document.md` | dcterms:type |  |
 | subtype | 2 | list |  | `subtype` | registry | `document.md` | dcterms:type |  |
 | lang | 2 | scalar |  | `lang` | closed | `document.md` | dcterms:language |  |
@@ -65,24 +64,20 @@ authored-only.
 | keywords | 2 | list |  | `keywords` | registry | `document.md` | skos:Concept |  |
 | topics | 2 | list |  | `topics` | registry | `document.md` | dcterms:subject |  |
 | audience | 2 | list |  | `audience` | registry | `document.md` | dcterms:audience |  |
-| aliases | 2 | list |  |  |  | `document.md` | skos:altLabel |  |
 | entities | 2 | groups |  | `entity_types` | closed | `knowledge.json` | schema:Thing |  |
 | relations | 2 | records |  | `relation_predicates` | closed | `knowledge.json` | local |  |
 | decisions | 2 | records |  | `decision_status` | closed | `knowledge.json` | madr:status |  |
 | risks | 2 | records |  | `impact` | closed | `knowledge.json` | iso31000 |  |
 | open_questions | 2 | records |  |  |  | `knowledge.json` | local |  |
-| links | 2 | groups |  | `link_categories` | closed | `knowledge.json` | dcterms:references |  |
+| links | 2 | groups |  | `link_categories` | closed | `knowledge.json` | dcterms:references | every outbound URL the body carries is HARVESTED at tier 0 from the outline; a model may categorise and add, never delete or contradict |
 | see_also | 2 | list |  |  |  | `document.md` | dcterms:references |  |
-| prerequisites | 2 | list |  |  |  | `document.md` | dcterms:requires |  |
-| out_of_scope | 2 | list |  |  |  | `document.md` | local |  |
 | status | 2 | scalar | yes | `document_status` | closed | `document.md` | local |  |
 | confidentiality | 2 | scalar | yes | `confidentiality` | closed | `document.md` | dcterms:accessRights | a field whose entire purpose is a safety boundary cannot have a model as its author |
-| classification | 2 | scalar | yes |  |  | `document.md` | local | the human-facing wording of confidentiality |
 | owner | 2 | scalar | yes |  |  | `document.md` | prov:wasAttributedTo |  |
 | accountable_roles | 2 | records | yes |  |  | `document.md` | prov:wasAttributedTo |  |
 | review_cadence | 2 | scalar | yes | `review_cadence` | closed | `document.md` | local |  |
 | last_reviewed | 2 | scalar | yes |  |  | `document.md` | dcterms:modified |  |
-| next_review_due | 2 | scalar | yes |  |  | `document.md` | local |  |
+| next_review_due | 2 | scalar | yes |  |  | `document.md` | local | authored-only, but DERIVABLE: last_reviewed + review_cadence is arithmetic over two authored values, so computing it restates a person's commitment rather than making one for them |
 | validated_against_version | 2 | scalar | yes |  |  | `document.md` | local | the product/tool version the document's claims were checked against |
 
 ## Record and group sub-keys
@@ -333,16 +328,6 @@ Qualifiers (where the nuance lives, so the term list can stay small):
 | mode | ref -> `failure_modes` |  |
 | negated | bool | collapses does_not_* / cannot_* variants |
 
-
-### `requirement_level`
-
-Governance: **closed** — an unknown value is a hard failure. Changing this list is a schema change.
-
-Maps to: `local`
-
-Governs: _nothing yet — declared, unbound_
-
-Values: `mandatory`, `recommended`, `conditional`, `optional`, `excluded`
 
 ### `review_cadence`
 

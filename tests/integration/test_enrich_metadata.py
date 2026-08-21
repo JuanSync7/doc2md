@@ -34,10 +34,13 @@ WRITABLE = [f.name for f in FIELDS if model_writable(f.name)]
 # never leave PENDING — which is exactly why "nothing outstanding" needs a seeded one.
 REG = ["reference_architecture", "platform_engineering", "ddr", "memory-controller"]
 
-# One valid answer per model-writable field, against the seeded vocabulary.
+# One valid answer per model-writable field, against the seeded vocabulary. Every
+# knowledge record cites a section of BODY: "which section says this?" is now part of
+# the contract, and a record that cannot answer it is discarded on arrival.
+REF = "#rollback"
+
 FULL_REPLY = [
     ("title", "Memory Controller Design Spec"),
-    ("short_title", "Mem Ctrl Spec"),
     ("abstract", "How the arbiter serves the read and write queues."),
     ("type", "design"),
     ("subtype", ["reference_architecture"]),
@@ -46,18 +49,18 @@ FULL_REPLY = [
     ("keywords", ["ddr"]),
     ("topics", ["platform_engineering"]),
     ("audience", ["platform_engineering"]),
-    ("aliases", ["mem ctrl spec"]),
-    ("entities", {"hosts": [{"name": "ddr-node-1"}]}),
+    ("entities", {"hosts": [{"name": "ddr-node-1", "ref": REF}]}),
     ("relations", [{"s": "arbiter", "p": "requires", "o": "ddr-phy",
-                    "mode": "silent"}]),
-    ("decisions", [{"id": "d1", "status": "accepted", "text": "Round robin."}]),
+                    "mode": "silent", "ref": REF}]),
+    ("decisions", [{"id": "d1", "status": "accepted", "text": "Round robin.",
+                    "ref": REF}]),
     ("risks", [{"id": "r1", "impact": "high", "mode": "delayed",
-                "text": "Refresh starvation."}]),
-    ("open_questions", [{"id": "q1", "text": "What is the refresh budget?"}]),
-    ("links", {"internal": [{"title": "Runbook", "url": "runbook.md"}]}),
+                "text": "Refresh starvation.", "ref": REF}]),
+    ("open_questions", [{"id": "q1", "text": "What is the refresh budget?",
+                         "ref": REF}]),
+    ("links", {"internal": [{"title": "Runbook", "url": "runbook.md",
+                             "ref": REF}]}),
     ("see_also", ["ddr-phy-guide"]),
-    ("prerequisites", ["ddr-phy-guide"]),
-    ("out_of_scope", ["power sequencing"]),
 ]
 
 
@@ -200,20 +203,31 @@ def test_the_deterministic_tiers_are_written_with_no_model_and_tier2_stays_pendi
     for name in ("uid", "id", "slug", "word_count", "reading_time_minutes",
                  "source", "extraction"):
         assert name in meta, name
-    assert meta["uid"] == "specs/aaa"                            # namespaced from the path
-    assert meta["id"] == meta["slug"] == "memory-controller-design-spec"
+    # ONE identity, from the path, so it cannot collide with another document's and
+    # cannot move when somebody retitles this one. `uid` is now its alias, not a peer.
+    assert meta["id"] == meta["uid"] == "specs/aaa.docx"
+    assert meta["slug"] == "memory-controller-design-spec"        # the title's URL form
     assert meta["word_count"] > 0 and meta["reading_time_minutes"] >= 1
     assert meta["source"]["uri"] == "specs/aaa.docx"
+    assert meta["source"]["url"] == "specs/aaa.docx"             # a URI reference home
     assert meta["source"]["is_derivative"] is True               # every bundle is converted
     assert meta["extraction"]["run_at"] == "R1"
     assert meta[PROVENANCE_KEY]["uid"]["source"] == "derived"
 
-    # not one tier-2 field invented, and the gate says the model tier never ran
-    assert [n for n in WRITABLE if n in meta] == []
+    # THE FLOOR: a no-model run is not a blank page. `title` comes off the docx core
+    # property, so it is EXTRACTED evidence; `abstract` is cut from the lede, so it is
+    # DERIVED and a model may still improve it. Nothing else is invented.
+    assert meta["title"] == "Memory Controller Design Spec"
+    assert meta[PROVENANCE_KEY]["title"]["source"] == "extracted"
+    assert meta["abstract"].startswith("The arbiter serves the read and write queues")
+    assert meta[PROVENANCE_KEY]["abstract"]["source"] == "derived"
+    assert sorted(n for n in WRITABLE if n in meta) == ["abstract", "title"]
+
     gate = _report(d)["doc_meta"]
     assert gate["gate"] == "disabled" and gate["enabled"] is False
-    assert gate["expected"] == len(WRITABLE) == gate["pending"]
-    assert gate["filled"] == 0 and gate["invalid"] == 0
+    assert gate["expected"] == len(WRITABLE)
+    assert gate["filled"] == 2 and gate["invalid"] == 0
+    assert gate["pending"] == len(WRITABLE) - 2
 
 
 def test_the_body_survives_byte_for_byte_and_the_pipeline_front_matter_is_untouched(tmp_path):
@@ -251,7 +265,7 @@ def test_accepted_values_carry_generated_provenance_naming_the_model_and_the_pro
     assert meta["risks"][0]["impact"] == "high"
 
     prov = meta[PROVENANCE_KEY]["type"]
-    assert prov["source"] == "generated" and prov["tier"] == 2
+    assert prov["source"] == "generated" and "tier" not in prov
     assert prov["model"] == "stub-lm"
     assert len(prov["prompt_sha"]) == 12                          # the request's identity
     # one request, so every generated field cites the same prompt; the report agrees
@@ -357,12 +371,19 @@ def test_a_model_outage_leaves_the_fields_pending_and_the_run_re_runnable(tmp_pa
 
     assert rc == 0 and down.calls == 1   # an outage leaves PENDING, not a failure
     _fm, meta, body = _meta(d)
-    assert [n for n in WRITABLE if n in meta] == []               # nothing invented
-    assert meta["uid"] == "specs/aaa"                             # tiers 0/1 still written
+    # Nothing INVENTED — but the deterministic floor is not the model's work and does
+    # not go missing when the model does. What is absent is every field that needs
+    # judgement, and it is absent rather than empty.
+    assert sorted(n for n in WRITABLE if n in meta) == ["abstract", "title"]
+    assert meta["uid"] == "specs/aaa.docx"                             # tiers 0/1 still written
     assert body == BODY
     gate = _report(d)["doc_meta"]
-    assert gate["enabled"] is True and gate["gate"] == "pending"
-    assert gate["filled"] == 0 and gate["pending"] == len(WRITABLE)
+    # `incomplete`, not `pending`: the gate reads `pending` only while NOTHING has
+    # been filled, and the floor has filled two fields without a model. That is the
+    # same way an authored title has always read, and the number that decides whether
+    # to re-run is `pending`, which is still the whole model tier.
+    assert gate["enabled"] is True and gate["gate"] == "incomplete"
+    assert gate["filled"] == 2 and gate["pending"] == len(WRITABLE) - 2
     assert _coverage(root)[-1]["status"] == "model-unavailable"
     # a failed answer is never cached, so the re-run really re-asks
     assert not os.path.exists(os.path.join(root, "_kb_meta.jsonl"))
@@ -491,9 +512,12 @@ def test_a_source_with_no_title_stays_idempotent_once_the_model_supplies_one(tmp
     assert snaps[0][1]["prompt_sha"], "the request stamp must survive a no-op re-run"
 
     # And the tier-1 derivation that depends on a tier-2 parent still lands: with no
-    # source_title, id/slug come from the title the model supplied.
+    # source_title, `slug` comes from the title the floor or the model supplied. `id`
+    # does not — an identity that moved when somebody retitled a page would orphan
+    # every see_also pointing at it, so it comes from the path and stays put.
     _fm, meta, _body = _meta(doc)
-    assert meta["id"] == meta["slug"] == "memory-controller-design-spec"
+    assert meta["slug"] == "memory-controller-design-spec"
+    assert meta["id"] == meta["uid"] == "specs/aaa.docx"
     assert meta[PROVENANCE_KEY]["id"]["source"] == "derived"
 
 
@@ -651,9 +675,9 @@ def test_a_v1_bundle_migrates_to_the_two_file_layout_with_no_model_and_no_loss(
     # `schema_version: 1` makes the migration undetectable and the stamp a lie —
     # and a block with no provenance is otherwise treated as authored, so the prior
     # value would win.
-    assert front["schema_version"] == 2
-    assert front["extraction"]["schema"].endswith("/v2")
-    assert front["extraction"]["extractor"].endswith("/2")
+    assert front["schema_version"] == 3
+    assert front["extraction"]["schema"].endswith("/v3")
+    assert front["extraction"]["extractor"].endswith("/3")
 
     # ... and migrating an already-migrated bundle changes nothing.
     before = (_read(d), json.dumps(_knowledge(d), sort_keys=True))
@@ -686,3 +710,217 @@ def test_an_authored_descriptor_with_no_provenance_still_wins(tmp_path):
     front = split_front_matter(_read(d))[0][META_KEY]
     assert front["id"] == "hand-picked-id"
     assert front["title"] == "Hand Title"
+
+
+# --------------------------------------------------- run provenance (blocker 6)
+
+def _manifest(root):
+    return _jsonl(os.path.join(root, "manifest.jsonl"))
+
+
+def _runs(root):
+    return _jsonl(os.path.join(root, "runs.jsonl"))
+
+
+def test_the_switches_that_decided_the_identity_and_the_permalink_are_recorded(
+        tmp_path):
+    """Enrichment used to record NOTHING, and it is not a read-only stage.
+
+    Running it with `--namespace` and `--source-base-url` changes `meta.id`,
+    `meta.uid` and `meta.source.url` — rubric rows D2/D3/D4 — and `report.json`,
+    `runs.jsonl` and `manifest.jsonl` came out byte-identical. The switches that
+    produced the corpus you are holding were recoverable from no artifact at all.
+    """
+    em = _mod("enrich_metadata")
+    root, d = _bundles(tmp_path)
+    argv = ["--bundles", root, "--run-id", "E1", "--namespace", "acme.internal",
+            "--source-base-url", "https://wiki.example.com/docs/"]
+    assert em.main(list(argv)) == 0
+
+    # the output really did move
+    _fm, meta, _body = _meta(d)
+    assert meta["id"] == meta["uid"] == "acme-internal/specs/aaa.docx"
+    assert meta["source"]["url"] == "https://wiki.example.com/docs/specs/aaa.docx"
+
+    # ...and every one of the four artifacts now says why
+    row = [r for r in _runs(root) if r["entrypoint"] == "enrich_metadata"][-1]
+    assert row["run_id"] == "E1"
+    assert row["argv"] == ["--bundles", "<src>", "--run-id", "E1",
+                           "--namespace", "acme.internal",
+                           "--source-base-url", "https://wiki.example.com/docs/"]
+    assert row["config"]["cli.namespace"] == {"value": "acme.internal",
+                                              "from": "flag"}
+    assert row["config"]["cli.source_base_url"]["from"] == "flag"
+    assert row["counts"]["deferred"] == 0 and row["documents"] == 1
+    assert row["code"]["name"] == "doc2md" and row["host"]["python"]
+    assert row["started_at"] and row["finished_at"]
+
+    rows = [m for m in _manifest(root) if m["stage"] == "enrich_metadata"]
+    assert len(rows) == 1
+    assert rows[0]["run_id"] == "E1" and rows[0]["action"] == "enriched"
+    assert rows[0]["doc_id"] == "aaa" and rows[0]["source_relpath"] == "specs/aaa.docx"
+
+    rep = _report(d)
+    mine = [x for x in rep["decisions"] if x["stage"] == "enrich_metadata"]
+    chose = dict((x["code"], x["chose"]) for x in mine)
+    assert chose["identity_namespace"] == "acme.internal"
+    assert chose["permalink_base"] == "absolute"
+    assert chose["metadata_tier"] == "deterministic"
+    assert chose["vocabulary_selected"].startswith("v")
+    assert all(x["reason"] for x in mine)
+
+    staged = [r for r in rep["runs"] if r["entrypoint"] == "enrich_metadata"]
+    assert len(staged) == 1
+    assert staged[0]["config_ref"] == "runs.jsonl#E1"
+
+
+def test_a_run_with_no_switches_is_distinguishable_from_one_with_them(tmp_path):
+    # The point of recording is that two runs read differently. Same corpus, one
+    # switch apart, and the artifacts have to say so.
+    em = _mod("enrich_metadata")
+    root, d = _bundles(tmp_path)
+    assert em.main(["--bundles", root, "--run-id", "E1"]) == 0
+    plain = json.dumps(_report(d), sort_keys=True)
+    assert em.main(["--bundles", root, "--run-id", "E2",
+                    "--namespace", "acme.internal", "--force"]) == 0
+    assert json.dumps(_report(d), sort_keys=True) != plain
+
+    rows = [r for r in _runs(root) if r["entrypoint"] == "enrich_metadata"]
+    assert [r["config"]["cli.namespace"]["value"] for r in rows] == \
+        ["", "acme.internal"]
+
+
+def test_a_permalink_base_taken_from_the_environment_is_still_recorded(tmp_path,
+                                                                      monkeypatch):
+    # The case `argv` structurally cannot answer: the base never appears on the
+    # command line, and a run re-established without it publishes a corpus of
+    # different links with nothing saying why.
+    monkeypatch.setenv("DOC2MD_SOURCE_BASE_URL", "https://intranet/docs")
+    em = _mod("enrich_metadata")
+    root, d = _bundles(tmp_path)
+    assert em.main(["--bundles", root, "--run-id", "E1"]) == 0
+
+    _fm, meta, _body = _meta(d)
+    assert meta["source"]["url"] == "https://intranet/docs/specs/aaa.docx"
+    row = [r for r in _runs(root) if r["entrypoint"] == "enrich_metadata"][-1]
+    rec = row["config"]["cli.source_base_url"]
+    assert rec == {"value": "https://intranet/docs", "from": "env",
+                   "env": "DOC2MD_SOURCE_BASE_URL"}
+
+
+def test_the_writers_provenance_is_never_overwritten_by_the_enrichers(tmp_path):
+    # `run{}` is the run that produced the MARKDOWN. A later stage recording its own
+    # there would trade the conversion's provenance for its own, and the report is a
+    # failed document's only artifact.
+    em = _mod("enrich_metadata")
+    root, d = _bundles(tmp_path)
+    rp = os.path.join(d, "report.json")
+    report = json.load(open(rp, encoding="utf-8"))
+    report["run"] = {"entrypoint": "build_bundle", "run_id": "B1",
+                     "config_ref": "runs.jsonl#B1"}
+    report["runs"] = [dict(report["run"])]
+    report["decisions"] = [{"code": "lane_selected", "stage": "build_bundle",
+                            "chose": "ooxml", "reason": "by extension"}]
+    with open(rp, "w", encoding="utf-8") as fh:
+        json.dump(report, fh)
+
+    assert em.main(["--bundles", root, "--run-id", "E1"]) == 0
+    after = _report(d)
+    assert after["run"] == {"entrypoint": "build_bundle", "run_id": "B1",
+                            "config_ref": "runs.jsonl#B1"}
+    assert [r["entrypoint"] for r in after["runs"]] == ["build_bundle",
+                                                        "enrich_metadata"]
+    assert [x["code"] for x in after["decisions"]][0] == "lane_selected"
+
+
+def test_a_re_run_replaces_its_own_records_instead_of_piling_them_up(tmp_path):
+    em = _mod("enrich_metadata")
+    root, d = _bundles(tmp_path)
+    for run_id in ("E1", "E2", "E3"):
+        assert em.main(["--bundles", root, "--run-id", run_id]) == 0
+    rep = _report(d)
+    mine = [x for x in rep["decisions"] if x["stage"] == "enrich_metadata"]
+    assert len(mine) == len(set(x["code"] for x in mine))     # no accumulation
+    assert [r["entrypoint"] for r in rep["runs"]] == ["enrich_metadata"]
+    assert rep["runs"][0]["run_id"] == "E3"                   # the latest, once
+
+    # the run LOG, however, keeps every run: that is what makes it a log
+    rows = [m for m in _manifest(root) if m["stage"] == "enrich_metadata"]
+    assert [m["run_id"] for m in rows] == ["E1", "E2", "E3"]
+    # ...and a converged re-run says it changed nothing rather than claiming a write
+    assert [m["action"] for m in rows] == ["enriched", "unchanged", "unchanged"]
+
+
+def test_a_deferred_document_still_gets_a_row_so_the_log_has_no_holes(tmp_path):
+    em = _mod("enrich_metadata")
+    root, _d = _bundles(tmp_path)
+    _bundle(root, doc_id="bbb")
+    assert em.main(["--bundles", root, "--run-id", "E1", "--limit", "1"]) == 0
+    rows = dict((m["doc_id"], m["action"])
+                for m in _manifest(root) if m["stage"] == "enrich_metadata")
+    assert rows == {"aaa": "enriched", "bbb": "deferred"}
+    row = [r for r in _runs(root) if r["entrypoint"] == "enrich_metadata"][-1]
+    assert row["counts"]["deferred"] == 1
+
+
+def test_an_unreadable_bundle_is_logged_as_failed_rather_than_omitted(tmp_path):
+    em = _mod("enrich_metadata")
+    root, d = _bundles(tmp_path)
+    with open(os.path.join(d, KNOWLEDGE_FILE), "w", encoding="utf-8") as fh:
+        fh.write("{ not json")
+    assert em.main(["--bundles", root, "--run-id", "E1"]) == 1
+    rows = [m for m in _manifest(root) if m["stage"] == "enrich_metadata"]
+    assert len(rows) == 1 and rows[0]["action"] == "failed" and rows[0]["error"]
+
+
+def test_no_enrichment_artifact_carries_an_absolute_host_path(tmp_path):
+    # Same rule as the writers, and this stage's `--bundles` default IS an absolute
+    # path under the repo root, so its config table is a live leak vector.
+    em = _mod("enrich_metadata")
+    root, _d = _bundles(tmp_path)
+    assert em.main(["--bundles", root, "--run-id", "E1"]) == 0
+    leaked = []
+    for name in os.listdir(root):
+        path = os.path.join(root, name)
+        if not os.path.isfile(path) or not name.endswith((".json", ".jsonl")):
+            continue
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+        for needle in (str(tmp_path), REPO):
+            if needle in text:
+                leaked.append("%s -> %s" % (name, needle))
+    assert not leaked, "absolute host paths leaked: %s" % leaked
+
+
+def test_a_hand_edited_value_survives_even_under_a_machine_stamp(tmp_path):
+    """`unique_id`'s docstring promises a hand-written `id` "outranks this forever".
+
+    It did not. The deterministic merge decided inheritance on the provenance
+    LABEL alone, so a correction made to a field the pipeline had already written —
+    which is every field, in every bundle it has ever produced — was reverted on
+    the next run, with exit 0 and no warning. That silently orphaned every
+    `see_also` pointing at the corrected id, which is the one thing the documented
+    remedy for an id collision was supposed to prevent.
+    """
+    import re
+
+    em = _mod("enrich_metadata")
+    root, d = _bundles(tmp_path)
+    assert em.main(["--bundles", root, "--run-id", "R1"]) == 0
+
+    md_path = os.path.join(d, "document.md")
+    with open(md_path, encoding="utf-8") as fh:
+        before = fh.read()
+    assert '\n  id: "' in before
+    picked = "kestrel-hand-picked-identity"
+    edited = re.sub(r'\n  id: "[^"]*"', '\n  id: "%s"' % picked, before, count=1)
+    assert edited != before
+    with open(md_path, "w", encoding="utf-8") as fh:
+        fh.write(edited)
+
+    assert em.main(["--bundles", root, "--run-id", "R2"]) == 0
+    with open(md_path, encoding="utf-8") as fh:
+        after = fh.read()
+    assert '\n  id: "%s"' % picked in after, (
+        "the hand-picked id was reverted; the documented remedy for a collision "
+        "is only a remedy if it survives the next run")

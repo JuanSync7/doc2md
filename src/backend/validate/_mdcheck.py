@@ -19,9 +19,11 @@ from collections import Counter, OrderedDict, namedtuple
 
 from backend.ingest import coverage, markdown_to_text
 
+from ._mdstructure import md_structure
+
 __all__ = ["validate_markdown", "conversion_report", "build_report",
            "image_report", "caption_report", "outline_report", "savings_report",
-           "MdIssue"]
+           "structure_fidelity_report", "MdIssue"]
 
 MdIssue = namedtuple("MdIssue", ["line", "code", "severity", "message"])
 
@@ -273,9 +275,73 @@ def _content_metrics(md, token_count=None):
     }
 
 
+# The facts the fidelity gate compares. Named explicitly rather than "every key
+# both sides happen to produce", so widening the gate is a deliberate edit with a
+# test behind it — never a silent consequence of adding a field.
+_FIDELITY_FACTS = ("headings", "list_items", "ordered_items", "bullet_items",
+                   "ordered_numbers",
+                   "strong", "em", "strike", "code_spans", "code_blocks",
+                   "links", "tables", "list_item_words")
+
+
+def structure_fidelity_report(emitted, source, lane="office"):
+    # type: (dict, dict, str) -> dict
+    """Grade the emitted markdown's STRUCTURE against the source's.
+
+    ``emitted`` comes from ``md_structure`` (what a renderer sees), ``source`` from
+    the converter-blind ``docx_source_structure``. Every disagreement is published
+    as a delta, because a gate that reports only pass/fail teaches nobody anything.
+
+    The lane asymmetry is the same one losslessness has, for the same reason: a PDF
+    has no ground-truth semantic tree, so it cannot claim a provable pass. A caller
+    that supplies no source facts gets ``unmeasured`` — never a free pass.
+
+    ``ordered_numbers`` compares what the two sides say the reader SEES on each
+    step, not the digits that were written. Counts and depths cannot see a list
+    broken in two — a screenshot dropped between step 2 and step 3 leaves the item
+    count, the depth histogram and the token multiset all untouched while the
+    renderer prints 1, 2, 1, 2 — and they cannot see a declared start of 5 being
+    ignored either."""
+    out = OrderedDict()
+    out["method"] = "ooxml-structure-ground-truth" if source else "unmeasured"
+    deltas = []
+    for fact in _FIDELITY_FACTS:
+        if fact not in source:
+            continue
+        want, got = source.get(fact), emitted.get(fact)
+        if fact == "tables":
+            # Geometry AND placement. Rows x columns alone cannot see a
+            # transposition: swap two values between rows and the dimensions, the
+            # counts and the token multiset are all unchanged, while an escalation
+            # table now pages the wrong rota.
+            want = [(t.get("rows"), t.get("cols"), t.get("cells"))
+                    for t in want or []]
+            got = [(t.get("rows"), t.get("cols"), t.get("cells"))
+                   for t in got or []]
+        elif isinstance(want, dict):
+            # Normalise away the difference between "absent" and "zero" so a
+            # delta always means a real disagreement.
+            keys = set(want) | set(got or {})
+            want = dict((k, want.get(k, 0)) for k in keys if want.get(k, 0))
+            got = dict((k, (got or {}).get(k, 0)) for k in keys if (got or {}).get(k, 0))
+        if want != got:
+            deltas.append(OrderedDict([("fact", fact), ("source", want),
+                                       ("markdown", got)]))
+    out["compared"] = sum(1 for f in _FIDELITY_FACTS if f in source)
+    out["deltas"] = deltas
+    if not source:
+        out["gate"] = "unmeasured"
+    elif lane != "office":
+        out["gate"] = "best-effort"
+    else:
+        out["gate"] = "pass" if not deltas else "fail"
+    return out
+
+
 def build_report(source_text, md, lane="office", losslessness=None,
-                 token_count=None, content_min=_CONTENT_GATE):
-    # type: (str, str, str, dict, object, float) -> dict
+                 token_count=None, content_min=_CONTENT_GATE,
+                 source_structure=None):
+    # type: (str, str, str, dict, object, float, dict) -> dict
     """Assemble the validator's verdict for ``report.json`` — pure, no disk, no LLM.
 
     This is the machine-checkable core of the bundle report: the losslessness block,
@@ -323,7 +389,13 @@ def build_report(source_text, md, lane="office", losslessness=None,
         if loss.get("gate") in (None, "pass"):
             loss["gate"] = "best-effort"
 
-    if loss.get("gate") == "fail" or n_err > 0:
+    # The second hard gate. A ratchet beside token recall, never a replacement:
+    # emphasis, list nesting and table geometry are not tokens, so recall == 1.0
+    # can be — and was — true of a procedure whose steps had been renumbered.
+    fidelity = structure_fidelity_report(md_structure(md), source_structure or {},
+                                         lane=lane)
+
+    if loss.get("gate") == "fail" or fidelity["gate"] == "fail" or n_err > 0:
         status = "failed"
     elif n_warn > 0:
         status = "degraded"
@@ -334,6 +406,7 @@ def build_report(source_text, md, lane="office", losslessness=None,
         "markdown_sha256": hashlib.sha256((md or "").encode("utf-8")).hexdigest(),
         "status": status,
         "losslessness": loss,
+        "structure_fidelity": fidelity,
         "content": _content_metrics(md, token_count=token_count),
         "structural_errors": n_err,
         "structural_warnings": n_warn,

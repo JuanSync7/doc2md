@@ -179,28 +179,36 @@ byte-identical files.
 
 ```console
 $ python3 scripts/enrich_metadata.py --bundles ./bundles
-kb-enrich documents=1  model=none  vocab=v1
-kb-enrich: ok=0 incomplete=1 fields-pending=20
+kb-enrich documents=1  model=none  vocab=v2
+kb-enrich: ok=0 incomplete=1 fields-pending=13
 ```
 
-**Ten fields fill**, all tier 0 and 1: `schema_version`, `vocab_version`, `uid`,
-`version`, `source{}`, `extraction{}`, `id`, `slug`, `word_count`,
-`reading_time_minutes` — each with a `_provenance` entry recording its tier and
-source.
+**Nine fields fill from the bundle**, tier 0 and 1: `schema_version`,
+`vocab_version`, `id`, `uid`, `version`, `source{}`, `extraction{}`, `slug`,
+`word_count`, `reading_time_minutes` — each with a `_provenance` entry recording
+where it came from.
 
-**Twenty stay `pending`**: `title`, `abstract`, `type`, `subtype`, `lang`, `tags`,
-`keywords`, `topics`, `audience`, `aliases`, `entities`, `relations`, `decisions`,
-`risks`, `open_questions`, `links`, `see_also`, `prerequisites`, `out_of_scope`,
-`short_title`. Plus the nine `authored_only` fields, which no run may ever fill.
+**Three more fill from evidence the pipeline already has** — the floor, and the
+reason a no-model page is not a blank one:
 
-No `knowledge.json` is written — the payload is empty, so there is no sidecar.
+| Field | Comes from | Recorded as | May a model replace it? |
+|---|---|---|---|
+| `title` | the source's own title property | `extracted` | **No** — it is what the document declares |
+| `title` (no such property) | the first heading, else the filename | `derived` | Yes: both are inferences, and either can be junk |
+| `abstract` | the lede paragraph, sentence-truncated | `derived` | Yes |
+| `links` | every outbound URL in the body, harvested into `structure.json` at recall 1.0, grouped `internal`/`ecosystem` and carrying the `#anchor` of the section it sits in | `extracted`, per record | It may **add**, never delete or contradict |
+
+**Thirteen stay `pending`**: `type`, `subtype`, `lang`, `tags`, `keywords`,
+`topics`, `audience`, `entities`, `relations`, `decisions`, `risks`,
+`open_questions`, `see_also`. Plus the eight `authored_only` fields, which no run
+may ever fill — except `next_review_due`, which is computed when
+`last_reviewed` and `review_cadence` are both there, because adding a cadence to a
+date is arithmetic over two authored values rather than a machine making a
+commitment on somebody's behalf.
+
+`knowledge.json` IS written now, holding the harvested `links`.
 `doc_meta.gate` reads `disabled`, not `failed`: **a lossless document must not
 look degraded because nobody has classified it yet.**
-
-> Today the deterministic tier leaves more on the table than it should — `title`
-> is sitting in `source_title` and never written, the lede paragraph is spanned in
-> `structure.json` and never becomes `abstract`, and verified outbound links are
-> harvested and then discarded. `quality-plan.md` P5.1–P5.3 fix all three.
 
 ### With
 
@@ -256,8 +264,44 @@ withheld**. 544/544 corpus documents.
 
 A corollary worth stating plainly: this measures *tokens*. List indentation,
 emphasis and code fences are not tokens, so `lossless: "true"` is a token claim,
-not a formatting one. Widening the gate to cover structure is
-[`quality-plan.md`](quality-plan.md) P3.
+not a formatting one — which is why there is a second gate.
+
+### The second hard gate — does it still mean the same thing?
+
+Token recall asks *"is every word still here?"*. `structure_fidelity` asks *"does
+it still mean the same thing?"*, and they are different questions. A nested
+numbered procedure once came out **renumbered** — step 3 rendering as step 4 —
+with `token_recall: 1.0`, `structural_errors: 0` and every gate green, because
+indentation carries no tokens. An operator working an outage from that document
+would have run the wrong action for every step after the first sub-step.
+
+So a third independent implementation reads the *emitted markdown* the way a
+CommonMark renderer would — never the way the converter meant it, which is the
+whole trick: a reader that trusted the emitter's intent would have agreed the
+procedure was nested and confirmed the bug. Its facts are compared against a
+fourth, converter-blind walk of the source XML:
+
+| Compared | Catches |
+|---|---|
+| list items by nesting **depth** | the renumbering bug above |
+| headings by level | a heading demoted to prose |
+| strong / em / strike runs | formatting silently dropped |
+| inline-code and fenced blocks | a command indistinguishable from narration |
+| link count | a hyperlink flattened to its text |
+| table rows × columns | a table flattened into a paragraph |
+
+A mismatch is a **hard fail on the office lane**, the markdown is withheld, and
+the report names the delta rather than just failing. Formats with no second
+implementation yet (pptx, xlsx) report `unmeasured` — not `pass`.
+
+You can run the whole quality rubric yourself:
+
+```
+python3 scripts/grade_output.py
+```
+
+It builds a deliberately adversarial document, converts it, enriches it with no
+model, and prints a letter per output dimension with the evidence behind every row.
 
 ### The other gates
 
@@ -269,8 +313,14 @@ not a formatting one. Widening the gate to cover structure is
   Body images are HTML-comment sentinels the text gate cannot see, so without this
   a dropped figure would be an invisible loss.
 - **Named drops.** Every deliberate exclusion emits a warning code with a count —
-  `dropped_headers_footers` carries the parts and the characters. Page furniture is
-  correctly dropped; "dropped" must never read the same as "absent".
+  `dropped_headers_footers` carries the parts and the characters,
+  `flattened_table_spans` the horizontal and vertical merges GFM cannot express,
+  `tracked_changes_resolved` the revision marks that were resolved to the final
+  view. Page furniture is correctly dropped; "dropped" must never read the same as
+  "absent". The vocabulary is closed in **both** directions — a documented code
+  with no emitter fails CI, and so does an emitted code nobody documented, because
+  `dropped_headers_footers` itself spent months documented-and-unemitted while a
+  live run silently discarded a `Confidential` banner.
 
 ### The PDF lane cannot claim a pass, and does not
 

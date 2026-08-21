@@ -7,7 +7,8 @@ summary: A run records what was asked for and what it chose, without ever publis
 import pytest
 
 from backend.provenance import (config_provenance, corpus_id, decision, path_id,
-                                redact_argv, run_block, DECISION_CODES)
+                                redact_argv, run_block, safe_value, stamp_stage,
+                                DECISION_CODES)
 
 
 # ------------------------------------------------------------------ redaction
@@ -18,6 +19,37 @@ def test_path_values_are_replaced_but_every_switch_survives():
     out = redact_argv(argv, {"--src": "<src>", "--out": "<out>"})
     assert out == ["--src", "<src>", "--out", "<out>",
                    "--tokenizer", "tiktoken:cl100k_base", "--force"]
+
+
+def test_an_abbreviated_flag_is_redacted_because_argparse_accepts_prefixes():
+    # `--sr` IS `--src` to argparse, so a redaction keyed on the exact flag name
+    # never fired and the operator's directory sailed into every report.json.
+    out = redact_argv(["--sr", "/home/someone/docs", "--ou", "/mnt/bundles"],
+                      {"--src": "<src>", "--out": "<out>"})
+    assert out == ["--sr", "<src>", "--ou", "<out>"]
+
+
+def test_a_path_leaks_through_no_flag_because_the_value_is_what_is_tested():
+    # `--only` and `--tokenizer` were in no redaction list and both take values
+    # that are routinely paths. Nothing about the flag decides this any more.
+    assert redact_argv(["--only", "/vols/corpus/radar spec.docx"]) == [
+        "--only", "<path:%s>" % path_id("/vols/corpus/radar spec.docx")]
+    assert redact_argv(["--tokenizer", "char:/home/me/models/tok"]) == [
+        "--tokenizer", "char:<path:%s>" % path_id("/home/me/models/tok")]
+
+
+def test_a_path_buried_inside_a_command_value_is_still_redacted():
+    out = redact_argv(["--stage", "python3 /repo/scripts/worker.py --shard 1"])
+    assert "/repo" not in out[1] and out[1].startswith("python3 <path:")
+    assert out[1].endswith("--shard 1")
+
+
+def test_a_url_is_not_a_host_path_and_survives_verbatim():
+    # `--source-base-url` decides `meta.source.url` for the whole corpus. Redacting
+    # it would delete the switch that produced every permalink in the bundle.
+    argv = ["--source-base-url", "https://wiki.example.com/docs/",
+            "--namespace", "acme.internal"]
+    assert redact_argv(argv) == argv
 
 
 def test_equals_form_is_redacted_too():
@@ -35,6 +67,37 @@ def test_an_unnamed_path_flag_still_never_leaks():
 def test_no_absolute_path_survives_redaction():
     argv = ["--bundles", "/vols/x/y", "--json", "/tmp/r.json", "--limit", "5"]
     assert not [a for a in redact_argv(argv) if a.startswith("/")]
+
+
+@pytest.mark.parametrize("argv", [
+    ["--sr", "/vols/private/docs"],                       # abbreviated
+    ["--ou=/vols/private/out"],                           # abbreviated, = form
+    ["--only", "/vols/private/docs/spec.docx"],           # unlisted flag
+    ["--tokenizer", "char:/vols/private/models/tok"],     # path inside a value
+    ["--expectations", "/vols/private/e.json"],           # listed flag
+    ["--anything-at-all", "/vols/private/x"],             # a flag nobody listed
+])
+def test_no_flag_spelling_can_carry_an_absolute_path_out(argv):
+    # The one invariant: whatever the switch, whatever its abbreviation, the VALUE
+    # decides. Anything else is a list somebody has to remember to extend.
+    out = " ".join(redact_argv(argv, {"--src": "<src>", "--out": "<out>"}))
+    assert "/vols/private" not in out
+
+
+# ----------------------------------------------------------------- safe_value
+
+def test_safe_value_hides_a_path_but_keeps_it_comparable():
+    a, b = safe_value("/vols/one"), safe_value("/vols/one")
+    assert a == b and "/vols" not in a                    # two runs still agree
+    assert safe_value("/vols/two") != a
+    assert safe_value(["/vols/one", 7, "cl100k_base"])[1:] == [7, "cl100k_base"]
+    assert safe_value("data/bundles") == "data/bundles"   # relative discloses nothing
+
+
+def test_decision_evidence_can_never_publish_a_host_path():
+    d = decision("vocabulary_selected", "/etc/doc2md/vocab.yaml", "resolved",
+                 {"path": "/etc/doc2md/vocab.yaml"})
+    assert "/etc" not in d["chose"] and "/etc" not in d["evidence"]["path"]
 
 
 def test_path_id_identifies_without_disclosing():
@@ -76,6 +139,31 @@ def test_an_unknown_decision_code_is_refused_not_silently_recorded():
 
 def test_every_decision_code_is_unique():
     assert len(set(DECISION_CODES)) == len(DECISION_CODES)
+
+
+def test_the_enrichment_stage_has_names_for_the_branches_that_move_graded_fields():
+    # meta.id / meta.uid / meta.source.url are rubric rows D2-D4, and the switches
+    # that decide them used to be recorded in no artifact at all.
+    for code in ("metadata_tier", "vocabulary_selected", "identity_namespace",
+                 "permalink_base"):
+        assert code in DECISION_CODES
+
+
+def test_a_stage_stamp_says_which_run_took_the_branch():
+    records = [decision("lane_selected", "ooxml", "by extension", {"ext": "docx"}),
+               decision("metadata_tier", "deterministic", "no model")]
+    out = stamp_stage(records, "enrich_metadata")
+    assert [d["stage"] for d in out] == ["enrich_metadata", "enrich_metadata"]
+    # right after `code`, so the record reads "this branch, taken by this stage"
+    assert list(out[0])[:2] == ["code", "stage"]
+    assert out[0]["evidence"]["ext"] == "docx"        # nothing else is disturbed
+    assert "stage" not in records[0]                  # pure: the input is untouched
+
+
+def test_stamping_twice_does_not_grow_the_record():
+    once = stamp_stage([decision("cache_hit", "stored", "reused")], "a")
+    twice = stamp_stage(once, "b")
+    assert twice[0]["stage"] == "b" and list(twice[0]) == list(once[0])
 
 
 # ------------------------------------------------------- config provenance

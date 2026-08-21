@@ -232,8 +232,9 @@ beside it (see [where each field is stored](#where-each-field-is-stored)).
 
 ```yaml
 meta:
-  schema_version: 2          # tier 0 — which revision of the field inventory wrote this
-  uid: "aion/it/runbooks/claude-code-rocky8"
+  schema_version: 3          # tier 0 — which revision of the field inventory wrote this
+  id: "aion/it/runbooks/claude-code-rocky8"    # tier 0 — THE identity, from the path
+  uid: "aion/it/runbooks/claude-code-rocky8"   # deprecated alias of `id`, always equal
   word_count: 14932          # tier 1
   reading_time_minutes: 60
   source: {...}              # tier 0 — dcterms:source

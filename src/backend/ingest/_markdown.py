@@ -19,6 +19,13 @@ __all__ = ["markdown_to_text", "collapse_table_padding"]
 
 # (?<!\\): a converter-escaped literal "\<!-- ... -->" is prose, not a comment.
 _COMMENT = re.compile(r"(?<!\\)<!--.*?-->", re.S)
+# The ONE inline HTML tag this project emits: _docx_cell_text joins a multi-paragraph
+# table cell with <br>, because a GFM cell cannot hold a newline. Left alone it
+# reaches the text layer as the literal token "br" — harmless to the recall gate,
+# which is recall and forgives extra target tokens, but it lands in the body an
+# embedder and a BM25 index actually read. The (?<!\\) exempts a converter-escaped
+# "\<br>", which is prose ABOUT the tag rather than the tag.
+_BR = re.compile(r"(?<!\\)<br\s*/?>", re.I)
 _FENCE = re.compile(r"^\s*(```+|~~~+)")
 _HR = re.compile(r"^\s*([-*_])(?:\s*\1){2,}\s*$")
 _SETEXT = re.compile(r"^\s*(=+|-+)\s*$")
@@ -59,17 +66,39 @@ def _split_cells(line):
     return " ".join(c.strip() for c in cells if c.strip())
 
 
+_CODE_SLOT = re.compile("\x01([0-9]+)\x01")
+
+
 def _inline(text):
     # type: (str) -> str
+    """Resolve inline markdown to its visible text.
+
+    ORDER IS LOAD-BEARING, and it follows CommonMark's precedence rather than
+    convenience. A code span binds TIGHTER than a link or an emphasis run:
+    ``\u0060[d](e)\u0060`` renders the literal characters ``[d](e)``, it is not a link
+    to ``e``. So code-span contents are lifted out and protected FIRST, exactly as
+    backslash-escaped punctuation is, and put back at the end.
+
+    Stripping links first (as this did) silently deleted the target of any link
+    pattern that happened to sit inside a code span — which is how a perfectly
+    faithful ``\u0060kubectl apply -f [env](prod).yaml\u0060`` lost a token and failed the
+    recall gate. The converter was right and the stripper was wrong."""
     text = _ESCAPED_PUNCT.sub(lambda m: "\x00%02x" % ord(m.group(1)), text)
+    stash = []  # type: list
+
+    def _protect(m):
+        stash.append(m.group(1))
+        return "\x01%d\x01" % (len(stash) - 1)
+
+    text = _INLINE_CODE.sub(_protect, text)
     text = _IMG.sub(lambda m: m.group(1), text)
     text = _LINK.sub(lambda m: m.group(1), text)
     text = _REF_LINK.sub(lambda m: m.group(1), text)
     text = _AUTOLINK.sub(lambda m: m.group(1), text)
-    text = _INLINE_CODE.sub(lambda m: m.group(1), text)
     text = _BOLD.sub(lambda m: m.group(2), text)
     text = _STRIKE.sub(lambda m: m.group(1), text)
     text = _ITALIC.sub(lambda m: m.group(2), text)
+    text = _CODE_SLOT.sub(lambda m: stash[int(m.group(1))], text)
     return _PLACEHOLDER.sub(lambda m: chr(int(m.group(1), 16)), text)
 
 
@@ -138,10 +167,11 @@ def markdown_to_text(md):
     """
     if not md:
         return ""
-    # NULs are never legitimate markdown; strip them up front so they cannot
-    # collide with the internal \x00-escape placeholders below.
-    md = md.replace("\x00", "")
+    # C0 controls are never legitimate markdown; strip them up front so they cannot
+    # collide with the internal \x00 / \x01 placeholders below.
+    md = md.replace("\x00", "").replace("\x01", "")
     md = _COMMENT.sub(" ", md)
+    md = _BR.sub(" ", md)
     out = []
     in_code = False
     for raw in md.split("\n"):

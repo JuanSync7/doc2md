@@ -14,7 +14,13 @@
 # This file is parsed by backend.ingest.parse_block (a strict stdlib YAML SUBSET —
 # no anchors, no flow maps, no multi-document streams). Keep it inside that subset.
 
-version: 1
+# v2 removed `requirement_level`: it governed nothing. It was declared RESERVED for
+# body-level (RFC 2119) extraction that never landed, so for two schema revisions it
+# was a term list no field could take a value from and no reader could consult — and
+# it still cost a section in the published reference. The block below said "delete it
+# if body-level extraction never lands". It did not land. Deleted; if statement-level
+# extraction is ever built it can be reintroduced with the field that binds it.
+version: 2
 
 # Prefixes used by every `maps_to` value below.
 standards:
@@ -146,21 +152,14 @@ decision_status:
     provisional:
       review_required: true
 
-requirement_level:
-  governance: closed
-  maps_to: local
-  # RESERVED: no document field binds to this vocabulary yet. It governs the force
-  # of a STATEMENT inside a document body (RFC 2119-shaped), which is body-level
-  # extraction and out of scope for the document-level block. Kept declared rather
-  # than deleted so the term list is decided once; delete it if body-level
-  # extraction never lands.
-  # NB values are quoted: bare no/yes/on/off are coerced to booleans by YAML 1.1.
-  # Always quote enum values that a 1.1 reader would retype.
-  values: ["mandatory", "recommended", "conditional", "optional", "excluded"]
-
 link_categories:
   governance: closed
   maps_to: dcterms:references
+  # `internal` and `ecosystem` are the two a harvested link can be assigned with no
+  # judgement at all — a URL either has an http(s) authority or it does not — so they
+  # are what backend.kb.link_category emits for every link taken out of a body. The
+  # other four say what the target IS, which the URL does not, and stay a model's
+  # call. NB values are quoted where a YAML 1.1 reader would retype them.
   values: [product_docs, vendor_and_legal, platform, ecosystem, internal, standards]
 
 document_types:

@@ -11,8 +11,9 @@ summary: What a run was — code identity, resolved configuration with the sourc
 # and must stay disk-free) and from `validate` (which measures the CONVERSION, not
 # the RUN).
 from ._code import code_identity, host_identity, git_commit, package_version
-from ._run import (run_block, decision, config_provenance, redact_argv, path_id,
-                   corpus_id, compact_run, DECISION_CODES)
+from ._run import (run_block, decision, stamp_stage, config_provenance,
+                   redact_argv, safe_value, path_id, corpus_id, compact_run,
+                   DECISION_CODES)
 
 __all__ = [
     "code_identity",
@@ -21,8 +22,10 @@ __all__ = [
     "package_version",
     "run_block",
     "decision",
+    "stamp_stage",
     "config_provenance",
     "redact_argv",
+    "safe_value",
     "path_id",
     "corpus_id",
     "compact_run",

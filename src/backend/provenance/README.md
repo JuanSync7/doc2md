@@ -44,9 +44,16 @@ It is separate from its neighbours on purpose:
 **`decisions[]` — the choices.** Which lane, which fallback, cache hit or miss.
 
 ```jsonc
-{"code": "ocr_routed", "chose": "ocr", "reason": "no usable text layer",
- "evidence": {"text_chars": 12, "pages": 9}}
+{"code": "ocr_routed", "stage": "build_pdf_bundle", "chose": "ocr",
+ "reason": "no usable text layer", "evidence": {"text_chars": 12, "pages": 9}}
 ```
+
+`stage` is the `entrypoint` of the run that took the branch, applied in one place
+per writer by `stamp_stage`. A bundle is written by more than one stage — the
+converter, then `enrich_metadata` re-deriving `meta.id` and the permalink — and
+they share one `decisions[]`. Without the attribution a record can say neither
+which run chose it nor which records a re-running stage may replace, so a re-run
+either grows the list forever or deletes another stage's choices.
 
 `warnings[]` already carries **problems**. A choice is not a problem, and mixing
 the two means neither can be aggregated — "how many documents took the text-layer
@@ -75,7 +82,18 @@ omitting `savings` for a lane whose source side was never measured.
 The root `CLAUDE.md` forbids absolute host paths in any artifact, and a bundle is
 published output. So `redact_argv` keeps every switch and replaces path *values*
 with `<src>` / `<out>` placeholders, and `path_id` hashes a location into something
-that answers "was this the same tree?" without saying where it is. `corpus_id`
+that answers "was this the same tree?" without saying where it is.
+
+**The test is on the VALUE, never on the flag name.** Matching flag names was
+unsound twice over. argparse accepts unambiguous *prefixes*, so a set keyed on
+`--src` never fired for `--sr /tmp/x`; and switches nobody had listed take paths
+routinely — `--only /abs/spec.docx`, `--tokenizer "char:/home/me/models/tok"`.
+Anything shaped like an absolute path is now redacted to `<path:sha16>` whatever
+carried it, including inside a compound value and inside a whole command line in
+one argv element. A URL is not a host path and survives verbatim: it is a switch
+that decided the output. `safe_value` applies the same shape test to any value on
+its way into an artifact — config entries, `chose`, `evidence` — so no two callers
+can end up disagreeing about what a path looks like. `corpus_id`
 does the stronger version from the manifest rows — `sha256` over sorted
 `doc_id:source_sha256` pairs, so two runs over the same documents agree and one
 changed byte does not.
@@ -87,9 +105,11 @@ changed byte does not.
   with no `git` binary, in a linked worktree, and on a detached HEAD.
 - `host_identity()` — interpreter and platform. Never `platform.node()`: a hostname
   is neither needed to repeat a run nor safe beside de-identified source paths.
-- `run_block(...)`, `decision(code, chose, reason, evidence=None)`, `DECISION_CODES`.
+- `run_block(...)`, `decision(code, chose, reason, evidence=None)`,
+  `stamp_stage(decisions, stage)`, `DECISION_CODES`.
 - `config_provenance(now, without_env, without_file, env_names=())`.
-- `redact_argv(argv, paths=None)`, `path_id(path)`, `corpus_id(rows)`.
+- `redact_argv(argv, paths=None)`, `safe_value(value)`, `path_id(path)`,
+  `corpus_id(rows)`.
 
 See [`docs/reference/output-schema.md`](../../../docs/reference/output-schema.md)
 for the keys as shipped, and [`docs/quality-plan.md`](../../../docs/quality-plan.md)

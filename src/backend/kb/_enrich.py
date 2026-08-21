@@ -19,20 +19,50 @@ summary: Build the enum-constrained request, validate a model's answer against t
 #      stays PENDING and visibly backfillable; it never silently reads as done.
 #   3. AUTHORED ALWAYS WINS. A generated value fills a gap. It never overwrites
 #      what a person wrote, and it may never touch an authored-only field at all.
+#   4. EVIDENCE OUTRANKS A GUESS. Anything the pipeline read out of the source
+#      bytes — a title from the core properties, a URL harvested from the body at
+#      recall 1.0 — is a fact, and a model does not get to overwrite a fact with a
+#      proposal. This is what the FLOOR functions below exist for: they fill from
+#      evidence the pipeline already has, so a no-model run produces a titled,
+#      summarised, linked page instead of twenty PENDING fields.
+import datetime
 import hashlib
+import re
 from collections import OrderedDict
+from urllib.parse import quote
 
+from backend.ingest import markdown_to_text
+
+from ._derive import derive_uid, heading_anchor, slugify
 from ._schema import (FIELDS, PROVENANCE_KEY, SCHEMA_VERSION, field, field_names,
-                      group_vocab, model_writable, proposed_key, record_vocab,
+                      group_required, group_vocab, model_writable, proposed_key,
+                      record_required, record_vocab,
                       SOURCE_AUTHORED, SOURCE_DERIVED, SOURCE_EXTRACTED,
                       SOURCE_GENERATED)
 
-__all__ = ["request_spec", "accept_model_meta", "is_authored", "meta_coverage",
-           "order_meta", "set_provenance", "revalidate_generated", "value_sha",
-           "UNKNOWN"]
+__all__ = ["request_spec", "accept_model_meta", "is_authored", "is_protected",
+           "meta_coverage", "order_meta", "set_provenance", "revalidate_generated",
+           "value_sha", "abstract_floor", "harvested_links", "link_category",
+           "merge_group_evidence", "next_review_due", "record_source",
+           "source_url", "title_floor", "unique_id", "value_source",
+           "EVIDENCE_KEY", "REVIEW_INTERVAL_DAYS", "UNKNOWN"]
 
 # The escape hatch. A model that cannot tell must be able to say so.
 UNKNOWN = "unknown"
+
+# Where a RECORD carries its own origin. `_provenance` is per FIELD, and per-field is
+# the wrong grain for a list: once harvested links and model-proposed links live in
+# one `links` block, a single `source: extracted` on the field would vouch for the
+# guesses too. So each record says where it came from, using the same four terms
+# `_provenance.source` uses — one vocabulary for one question.
+EVIDENCE_KEY = "source"
+
+# What `ref` means, told to the model in its own words. The anchors themselves are
+# per-document, so the request carries the list separately; this is the rule.
+REF_SPEC = ("the section that ASSERTS this record, as `#anchor` chosen from the "
+            "SECTION ANCHORS list supplied with the document. A record whose ref "
+            "is missing, invented, or points at a section that does not say this "
+            "is discarded — an unciteable claim is worse than no claim.")
 
 
 def _stable_repr(value):
@@ -73,9 +103,14 @@ def is_authored(entry, current):
 
     The load-bearing case is the one tier 2 is DEFINED by: a human CORRECTS a
     value a previous run generated. The provenance entry still says
-    ``generated``, so source alone cannot tell the difference — which is why a
-    generated value is fingerprinted when it is written. A current value whose
-    fingerprint no longer matches has been edited by somebody, and is authored.
+    ``generated``, so source alone cannot tell the difference — which is why
+    every machine-written value is fingerprinted when it is written. A current
+    value whose fingerprint no longer matches has been edited by somebody, and is
+    authored. (The fingerprint is checked for EVERY machine source, not only
+    ``generated``: a hand-curated link a run had harvested is exactly as much a
+    person's work as a hand-corrected classification, and losing it costs the same
+    trust. A record written before fingerprinting simply has none, and falls back
+    to the source label.)
     """
     if _empty(current):
         return False                       # nothing to protect
@@ -84,11 +119,33 @@ def is_authored(entry, current):
     source = entry.get("source")
     if source not in _MACHINE_SOURCES:
         return True
-    if source == SOURCE_GENERATED:
-        recorded = entry.get("value_sha")
-        if recorded and recorded != value_sha(current):
-            return True                    # edited since we wrote it
+    recorded = entry.get("value_sha")
+    if recorded and recorded != value_sha(current):
+        return True                        # edited since we wrote it
     return False
+
+
+def is_protected(entry, current):
+    # type: (dict, object) -> bool
+    """Must this existing value survive a model's proposal?
+
+    Two different reasons, one predicate:
+
+      * A PERSON wrote it (``is_authored``) — rule 3, absolute.
+      * The PIPELINE READ IT out of the source (``extracted``) — rule 4. A title
+        the docx core properties declare, or a URL harvested from the body, is
+        evidence measured at recall 1.0 and zero cost. A model that proposes a
+        different one is not improving the value, it is contradicting the document.
+
+    ``derived`` is deliberately NOT protected: a value computed by a fixed rule (a
+    title inferred from the filename, an abstract cut from the lede) is a floor, and
+    the whole point of a floor is that something better may land on top of it.
+    """
+    if is_authored(entry, current):
+        return True
+    if _empty(current) or not isinstance(entry, dict):
+        return False
+    return entry.get("source") == SOURCE_EXTRACTED
 
 
 def request_spec(vocab, wanted=None):
@@ -99,6 +156,13 @@ def request_spec(vocab, wanted=None):
     it — the exact terms it may choose from. ``closed`` fields list every allowed
     value; ``registry`` fields list the current terms and say that a new one is
     allowed but will be recorded as a proposal rather than used directly.
+
+    It also states the SHAPE of a record, which it used not to: with only
+    ``kind: records`` and a ``p`` enum to go on, ``{"p": "runs_on"}`` was a
+    schema-valid relation — no subject, no object, and no way to answer "which
+    section says this?". Every required sub-key is now listed, ``ref`` among them,
+    so the constraint is visible at GENERATION time and not only in the rejection
+    log afterwards (rule 1: constrain at generation, not only at validation).
 
     This doubles as the JSON-schema source for a server that supports constrained
     decoding, and as the prose enum list for one that does not.
@@ -133,6 +197,11 @@ def request_spec(vocab, wanted=None):
             entry["record_fields"] = OrderedDict(
                 (k, list(vocab.values(v)) + [UNKNOWN]) for k, v in sub.items()
                 if vocab.has(v))
+        required = record_required(name) or group_required(name)
+        if required:
+            entry["required_keys"] = list(required)
+            if "ref" in required:
+                entry["ref"] = REF_SPEC
         spec[name] = entry
     return spec
 
@@ -187,8 +256,50 @@ def _validate_scalar(vocab, vname, value):
 _REASON = {"rejected": "not-in-vocabulary", "declined": "declined-unknown"}
 
 
-def _accept_groups(name, groups, vocab, rejected):
-    # type: (str, dict, object, list) -> OrderedDict
+def _missing_required(name, rec):
+    # type: (str, dict) -> list
+    """Required sub-keys this record does not carry (empty values count as absent)."""
+    required = record_required(name) or group_required(name)
+    return [k for k in required if _empty(rec.get(k))]
+
+
+def _bad_ref(rec, anchors):
+    # type: (dict, set) -> str
+    """``""`` when the record's ``ref`` points at a real section, else the reason.
+
+    Skipped entirely when the caller supplies no anchors: an unverifiable pointer
+    must not be reported as verified, and this package never invents the body.
+    """
+    if anchors is None:
+        return ""
+    ref = rec.get("ref")
+    if not isinstance(ref, str) or not ref.startswith("#"):
+        return "ref-not-a-fragment"
+    return "" if ref[1:] in anchors else "ref-not-an-anchor"
+
+
+def _accept_records(name, records, rejected, anchors=None):
+    # type: (str, list, list, set) -> list
+    """Every member of a record LIST, validated: shape, then required keys, then ref."""
+    kept = []  # type: list
+    for rec in records or []:
+        if not isinstance(rec, dict):
+            rejected.append((name, rec, "wrong-kind-expected-mapping"))
+            continue
+        missing = _missing_required(name, rec)
+        if missing:
+            rejected.append((name, rec, "missing-required-%s" % "/".join(missing)))
+            continue
+        bad = _bad_ref(rec, anchors)
+        if bad:
+            rejected.append(("%s.ref" % name, rec.get("ref"), bad))
+            continue
+        kept.append(rec)
+    return kept
+
+
+def _accept_groups(name, groups, vocab, rejected, anchors=None):
+    # type: (str, dict, object, list, set) -> OrderedDict
     """Validate a grouped field (``entities``, ``links``) on ACCEPT, not later.
 
     The linter re-checks these downstream, but by then the block has already been
@@ -224,40 +335,67 @@ def _accept_groups(name, groups, vocab, rejected):
             if kept_map:
                 out[gname] = kept_map
             continue
-        if gv.get("member_type") and isinstance(members, list):
-            implied = vocab.group_type(gname)
-            keep = []
-            for member in members:
-                if not isinstance(member, dict):
-                    rejected.append(("%s.%s" % (name, gname), member,
-                                     "wrong-kind-expected-mapping"))
-                    continue
-                etype = member.get("type") or implied
-                if etype:
-                    status, canonical, _q = _validate_scalar(
-                        vocab, gv["member_type"], etype)
-                    if status != "ok":
-                        rejected.append(("%s.%s.type" % (name, gname), etype,
-                                         _REASON.get(status, "not-in-vocabulary")))
-                        continue
-                    if member.get("type"):
-                        member = OrderedDict(member)
-                        member["type"] = canonical
-                keep.append(member)
-            if keep:
-                out[gname] = keep
+        if not isinstance(members, list):
+            rejected.append(("%s.%s" % (name, gname), members,
+                             "wrong-kind-expected-list"))
             continue
-        out[gname] = members
+        # AN INVENTED GROUP IS NOT A LICENCE TO SKIP THE TYPE CHECK. `group_types`
+        # maps a KNOWN group to the type its members take when they omit one
+        # (`hosts` -> Host). For a group nobody declared, that fallback is "" — and
+        # the old code read "" as "nothing to check", so `gadgets: [{name: x}]`
+        # walked in untyped and got stamped `generated`. A new group is fine; a new
+        # group whose members are also untyped is a whole ungoverned namespace, and
+        # the type vocabulary is the only governance a group name has.
+        implied = vocab.group_type(gname) if gv.get("member_type") else ""
+        keep = []
+        for member in members:
+            if not isinstance(member, dict):
+                rejected.append(("%s.%s" % (name, gname), member,
+                                 "wrong-kind-expected-mapping"))
+                continue
+            missing = _missing_required(name, member)
+            if missing:
+                rejected.append(("%s.%s" % (name, gname), member,
+                                 "missing-required-%s" % "/".join(missing)))
+                continue
+            bad = _bad_ref(member, anchors)
+            if bad:
+                rejected.append(("%s.%s.ref" % (name, gname), member.get("ref"), bad))
+                continue
+            if gv.get("member_type"):
+                etype = member.get("type") or implied
+                if not etype:
+                    rejected.append(("%s.%s.type" % (name, gname), gname,
+                                     "untyped-member-of-unknown-group"))
+                    continue
+                status, canonical, _q = _validate_scalar(
+                    vocab, gv["member_type"], etype)
+                if status != "ok":
+                    rejected.append(("%s.%s.type" % (name, gname), etype,
+                                     _REASON.get(status, "not-in-vocabulary")))
+                    continue
+                if member.get("type"):
+                    member = OrderedDict(member)
+                    member["type"] = canonical
+            keep.append(member)
+        if keep:
+            out[gname] = keep
     return out
 
 
-def accept_model_meta(proposed, vocab, existing=None, model="", prompt_sha=""):
-    # type: (dict, object, dict, str, str) -> dict
+def accept_model_meta(proposed, vocab, existing=None, model="", prompt_sha="",
+                      anchors=None):
+    # type: (dict, object, dict, str, str, set) -> dict
     """Decide what a model's answer is allowed to contribute.
 
     Returns ``{"accepted": {...}, "proposals": {field: [value]}, "rejected":
     [(field, value, reason)], "provenance": {field: {...}}}``. Nothing here mutates
     ``existing`` — the caller merges, so a dry run costs nothing.
+
+    ``anchors`` is the set of section anchors the document publishes. Supply it and
+    every knowledge record must cite one; omit it and the ref check is SKIPPED rather
+    than passed, because this package never sees the body and must not pretend to
+    have verified a pointer it could not resolve.
 
     Rejection reasons are kept verbatim rather than counted, because the useful
     question after a run is never "how many were wrong" but "which term did it keep
@@ -292,8 +430,17 @@ def accept_model_meta(proposed, vocab, existing=None, model="", prompt_sha=""):
         if not _kind_ok(f.kind, value):
             rejected.append((name, value, "wrong-kind-expected-%s" % f.kind))
             continue
-        if is_authored(prov_existing.get(name), existing.get(name)):
+        prov_entry, current = prov_existing.get(name), existing.get(name)
+        if is_authored(prov_entry, current):
             rejected.append((name, value, "kept-authored"))
+            continue
+        if is_protected(prov_entry, current) and f.kind != "groups":
+            # Evidence the pipeline READ beats a proposal, and for a scalar or a list
+            # "accept" means "replace", so the only way to keep the evidence is to
+            # refuse. A `groups` field is the exception: its unit is the record, so
+            # the model's records join the harvested ones instead of displacing them
+            # (see merge_group_evidence below).
+            rejected.append((name, value, "kept-extracted"))
             continue
 
         if f.vocab and vocab.has(f.vocab) and f.kind in ("scalar", "list"):
@@ -319,13 +466,14 @@ def accept_model_meta(proposed, vocab, existing=None, model="", prompt_sha=""):
                 if keep:
                     accepted[name] = keep
         elif f.kind == "groups":
-            kept = _accept_groups(name, value, vocab, rejected)
+            kept = merge_group_evidence(
+                current, _accept_groups(name, value, vocab, rejected, anchors))
             if kept:
                 accepted[name] = kept
         elif f.kind == "records":
             kept = []
             rv = record_vocab(name)
-            for rec in value:
+            for rec in _accept_records(name, value, rejected, anchors):
                 bad = False
                 new = OrderedDict(rec)
                 for sub, vname in rv.items():
@@ -354,11 +502,435 @@ def accept_model_meta(proposed, vocab, existing=None, model="", prompt_sha=""):
             accepted[name] = value
 
         if name in accepted:
-            provenance[name] = _prov(SOURCE_GENERATED, field(name).tier,
-                                     model, prompt_sha, accepted[name])
+            # A merged grouped field is not wholly generated, and must not say it is:
+            # `value_source` reports the weakest origin actually in the block.
+            src = (value_source(accepted[name], SOURCE_GENERATED)
+                   if f.kind == "groups" else SOURCE_GENERATED)
+            provenance[name] = _prov(src, model, prompt_sha, accepted[name])
 
     return {"accepted": accepted, "proposals": proposals, "rejected": rejected,
             "provenance": provenance}
+
+
+# =============================================================== THE FLOOR ====
+#
+# Everything below fills a field from evidence the pipeline ALREADY HAS. None of it
+# needs a model, a network or a second parse of the source: the title is in the core
+# properties the converter already read, the lede is in the body, and the links were
+# harvested into `structure.json` at recall 1.0 while the outline was being built.
+#
+# Before this existed, a no-model run wrote 10 fields and left 20 PENDING — including
+# `title`, on documents whose docx declared one, and `links`, on documents whose
+# outbound URLs were sitting in a sibling file. The pipeline threw away its verified
+# edges and kept only the ones a model imagined later. That is the failure these
+# functions close.
+
+_ATX = re.compile(r"^ {0,3}(#{1,6})[ \t]+(.+?)[ \t]*#*[ \t]*$")
+_FENCE = re.compile(r"^ {0,3}(```|~~~)")
+# Lines that are structure rather than prose: list bullets, ordered items, table
+# rows and separators, block quotes, HTML/comment sentinels, link/image-only lines.
+_NOT_PROSE = re.compile(r"^ {0,3}([-*+>|]|\d+[.)]\s|<!--|<[a-zA-Z/]|!\[)")
+_WS = re.compile(r"\s+")
+_SENTENCE_END = re.compile(r"[.!?][\"')\]]?(\s|$)")
+
+# How long an interval each `review_cadence` term names, in days. `on_change` and
+# `none` are absent ON PURPOSE: they are cadences that do not imply a date, and
+# inventing one for them would put a deadline in a document nobody agreed to.
+# Must cover every term the vocabulary lists — tests/unit/backend/test_field_inventory.py
+# binds this table to config/vocab.yaml so the two cannot drift.
+REVIEW_INTERVAL_DAYS = OrderedDict([
+    ("monthly", 30), ("quarterly", 91), ("biannual", 182), ("annual", 365)])
+
+
+def unique_id(source_relpath, namespace=""):
+    # type: (str, str) -> str
+    """The canonical document identity: unique BY CONSTRUCTION, not by checking.
+
+    The old ``slugify(title)`` collided the moment two documents were both called
+    "Overview", and a collision was an ERROR a person had to hand-fix. Uniqueness is
+    designed in instead:
+
+      * The value is a function of THE SOURCE PATH ALONE. Two documents in one corpus
+        cannot share a path, so they cannot share an id.
+      * ...and of nothing else. Not of the corpus (so a document gets the same id
+        whether or not its neighbours are present), not of iteration order (so a
+        re-run, a `--only` run and a fresh import all agree), not of a counter (which
+        would fail all three at once).
+      * Slugification is lossy — ``Kestrel Spec.docx`` and ``kestrel-spec.docx`` both
+        reduce to ``kestrel-spec`` — so a path whose slug is not a faithful lowercase
+        rendering of itself carries an 8-hex fingerprint OF THE EXACT PATH. The two
+        cases can then never meet, and a corpus whose filenames are already slug-clean
+        (the common case) keeps ids a human can read.
+
+    A rename changes the path and therefore the id. That is what the AUTHORED `id`
+    field is for: write one by hand and it outranks this forever.
+    """
+    parts = [p for p in (source_relpath or "").replace("\\", "/").split("/") if p]
+    if not parts:
+        return derive_uid(source_relpath, namespace)
+    # THE EXTENSION IS PART OF THE IDENTITY. Dropping it before comparing was how
+    # spec.docx, spec.pptx and spec.xlsx — three different documents that a real
+    # corpus really does contain side by side — all became `specs/spec`, with both
+    # writing scripts exiting 0. It is kept with its dot rather than slugified into
+    # the stem, so the readable form of an already-clean path IS the path.
+    stem, dot, ext = parts[-1].rpartition(".")
+    if not dot:
+        stem, ext = parts[-1], ""
+    segs = [slugify(p) for p in parts[:-1]] + [slugify(stem)]
+    tail = "/".join(s for s in segs if s)
+    if ext:
+        tail = "%s.%s" % (tail, ext.lower())
+    ns = slugify(namespace) if namespace else ""
+    ident = ("%s/%s" % (ns, tail)) if ns else tail
+    if not ident:
+        return derive_uid(source_relpath, namespace)
+    # Slugification is lossy, so it is only safe to stop here when the readable
+    # form IS the path, CHARACTER FOR CHARACTER. Comparing against the lowercased
+    # path is not enough: on a case-sensitive filesystem `spec.docx` and
+    # `Spec.docx` are two documents, and both would have rendered to `spec.docx`
+    # and both been called faithful. Exact equality means two faithful paths that
+    # render the same ARE the same path; everything else carries an 8-hex
+    # fingerprint of the exact path, so the two cases can never meet.
+    if tail == "/".join(parts):
+        return ident
+    digest = hashlib.sha1(("/".join(parts)).encode("utf-8")).hexdigest()[:8]
+    return "%s-%s" % (ident, digest)
+
+
+def _outline_nodes(outline):
+    # type: (list) -> list
+    """Every outline node, depth-first, parents before children."""
+    out = []  # type: list
+    stack = list(reversed(outline or []))
+    while stack:
+        node = stack.pop()
+        if not isinstance(node, dict):
+            continue
+        out.append(node)
+        for kid in reversed(node.get("children") or []):
+            stack.append(kid)
+    return out
+
+
+def _first_heading(body_md, outline=None):
+    # type: (str, list) -> str
+    """The document's own opening heading — from the outline when there is one."""
+    for node in _outline_nodes(outline):
+        title = (node.get("title") or "").strip()
+        if title:
+            return title
+    for line in (body_md or "").split("\n"):
+        m = _ATX.match(line)
+        if m and m.group(2).strip():
+            return m.group(2).strip()
+    return ""
+
+
+def _from_filename(source_relpath):
+    # type: (str) -> str
+    """``specs/kestrel-clock-spec.docx`` -> ``Kestrel Clock Spec``."""
+    base = (source_relpath or "").replace("\\", "/").rsplit("/", 1)[-1]
+    stem = base.rsplit(".", 1)[0]
+    words = [w for w in re.split(r"[-_\s]+", stem) if w]
+    # Capitalise only what is entirely lowercase, so IEEE and v2 survive as written.
+    return " ".join(w.capitalize() if w.islower() else w for w in words)
+
+
+def title_floor(source_title, body_md, source_relpath="", outline=None):
+    # type: (str, str, str, list) -> tuple
+    """``(title, provenance_source)`` — never empty for a document with a name.
+
+    THE TIER QUESTION, decided deliberately. `title` stays a TIER-2 field: choosing
+    what a document should be called is judgement, and a model reading the whole body
+    can beat any rule. What changes is that the field is never left PENDING, because
+    a floor and a ceiling are different things.
+
+    Which floor value a model may replace is decided by WHERE THE FLOOR CAME FROM,
+    not by the fact that a floor exists:
+
+      * ``source_title`` is EXTRACTED — the author of the docx typed it into the
+        document's own properties. That is evidence, and `is_protected` stops a model
+        overwriting it. A proposal that contradicts the document is not an
+        improvement.
+      * The first heading and the filename are DERIVED — both are inferences that
+        this text names the document, and either can be junk (`1. Introduction`,
+        `Copy of report FINAL v3`). A model that has read the body should be allowed
+        to do better, so they are left overwritable.
+
+    A person outranks all of it either way: `is_authored` sees a hand-edited value
+    whatever the source label says.
+    """
+    text = (source_title or "").strip()
+    if text:
+        return (text, SOURCE_EXTRACTED)
+    head = _first_heading(body_md, outline)
+    if head:
+        return (head, SOURCE_DERIVED)
+    stem = _from_filename(source_relpath)
+    return (stem, SOURCE_DERIVED) if stem else ("", "")
+
+
+def _lede_lines(body_md, outline=None):
+    # type: (str, list) -> list
+    """The first run of PROSE lines in the body — no heading, list, table or code.
+
+    When the outline is available the scan starts at the first node's span, which is
+    how table-of-contents furniture (already detected and excluded from the outline)
+    stops being mistaken for the lede.
+    """
+    lines = (body_md or "").split("\n")
+    start = 0
+    for node in _outline_nodes(outline):
+        span = node.get("line_span")
+        if isinstance(span, (list, tuple)) and span and isinstance(span[0], int):
+            start = max(0, min(span[0], len(lines)))
+            break
+    out = []  # type: list
+    in_code = False
+    for line in lines[start:]:
+        if _FENCE.match(line):
+            in_code = not in_code
+            continue
+        if in_code:
+            continue
+        stripped = line.strip()
+        if not stripped:
+            if out:
+                break                      # blank line ends the paragraph
+            continue
+        if _ATX.match(line) or _NOT_PROSE.match(line):
+            if out:
+                break
+            continue
+        out.append(stripped)
+    return out
+
+
+def _truncate_sentence(text, max_chars):
+    # type: (str, int) -> str
+    """At most ``max_chars``, cut at a sentence end when there is one."""
+    if len(text) <= max_chars:
+        return text
+    window = text[:max_chars]
+    cut = -1
+    for m in _SENTENCE_END.finditer(window):
+        cut = m.end(0)
+    if cut > 0:
+        return window[:cut].strip()
+    space = window.rfind(" ")
+    return (window[:space] if space > 0 else window).rstrip() + "…"
+
+
+def abstract_floor(body_md, outline=None, max_chars=320):
+    # type: (str, list, int) -> str
+    """A bounded summary of the document, with no model in the loop.
+
+    The lede paragraph is not a summary a writer composed, so this is a FLOOR and
+    tier 1: it is what the document opens with, truncated at a sentence boundary so
+    it reads as prose rather than as a value that was cut off. A model may replace
+    it (see `title_floor` for why a derived floor stays overwritable) and a person
+    outranks both.
+
+    Markdown is stripped through the shared `markdown_to_text`, so a lede full of
+    links and emphasis reads as sentences instead of syntax.
+    """
+    lines = _lede_lines(body_md, outline)
+    if not lines:
+        return ""
+    text = _WS.sub(" ", markdown_to_text(" ".join(lines))).strip()
+    return _truncate_sentence(text, max_chars) if text else ""
+
+
+def link_category(url):
+    # type: (str) -> str
+    """The `link_categories` term a URL can be assigned WITHOUT judgement.
+
+    Two of the six are measurable from the URL itself: a link with an http(s)
+    authority leaves the corpus, and everything else (a relative path, a `#fragment`,
+    a `mailto:`) stays inside it. The other four — `product_docs`,
+    `vendor_and_legal`, `platform`, `standards` — need to know what the target IS,
+    which a URL does not say, so the harvester never claims one. That is a model's
+    job, and its answer arrives as a separate record rather than as a rewrite of
+    this one.
+    """
+    text = (url or "").strip().lower()
+    return "ecosystem" if text.startswith(("http://", "https://")) else "internal"
+
+
+def harvested_links(outline, anchors=None):
+    # type: (list, set) -> OrderedDict
+    """Every outbound URL the body carries, grouped by category — tier 0.
+
+    ``structure.json`` publishes `{text, url, line}` per outline node, harvested from
+    the source at recall 1.0 while the tree was built. This turns them into `links`
+    records that carry the section that contains them, so a reader can go from an
+    edge back to the sentence that asserts it.
+
+    First occurrence wins: a URL cited in three sections is one edge with one home,
+    not three. Deterministic, so a re-run reproduces it byte for byte.
+    """
+    out = OrderedDict()
+    seen = set()
+    for node in _outline_nodes(outline):
+        anchor = heading_anchor(node.get("title") or "")
+        if anchors is not None and anchor not in anchors:
+            anchor = ""
+        for link in node.get("links") or []:
+            if not isinstance(link, dict):
+                continue
+            url = link.get("url")
+            if not isinstance(url, str) or not url.strip():
+                continue
+            url = url.strip()
+            if url.lower() in seen:
+                continue
+            seen.add(url.lower())
+            rec = OrderedDict()
+            text = (link.get("text") or "").strip()
+            if text:
+                rec["title"] = text
+            rec["url"] = url
+            if isinstance(link.get("line"), int):
+                rec["line"] = link["line"]
+            if anchor:
+                rec["ref"] = "#%s" % anchor
+            rec[EVIDENCE_KEY] = SOURCE_EXTRACTED
+            out.setdefault(link_category(url), []).append(rec)
+    return out
+
+
+def record_source(rec):
+    # type: (object) -> str
+    """The per-record origin, or ``""`` when the record does not declare one."""
+    if not isinstance(rec, dict):
+        return ""
+    src = rec.get(EVIDENCE_KEY)
+    return src if src in (SOURCE_EXTRACTED, SOURCE_DERIVED, SOURCE_GENERATED,
+                          SOURCE_AUTHORED) else ""
+
+
+def _record_identity(rec):
+    # type: (dict) -> str
+    """What makes two records the same thing — a URL, a name, an id, or the bytes."""
+    for key in ("url", "name", "id", "s"):
+        val = rec.get(key)
+        if isinstance(val, str) and val.strip():
+            return "%s=%s" % (key, val.strip().lower())
+    return _stable_repr(rec)
+
+
+def merge_group_evidence(existing, incoming):
+    # type: (dict, dict) -> OrderedDict
+    """Model records join the harvested ones; they never replace them.
+
+    A `groups` field is the one place where "authored/evidence wins" cannot be a
+    whole-field verdict: rejecting the model's answer outright would lose its
+    categories, and accepting it outright would delete edges that were MEASURED.
+    So the unit of the decision is the record — evidence first, in its own
+    category, and a proposal naming a URL we already harvested is dropped as a
+    duplicate of a better-sourced record.
+    """
+    evidence = OrderedDict()
+    known = set()
+    for gname, members in (existing or {}).items():
+        if not isinstance(members, list):
+            continue
+        keep = [m for m in members
+                if isinstance(m, dict) and record_source(m) == SOURCE_EXTRACTED]
+        if keep:
+            evidence[gname] = keep
+            known |= set(_record_identity(m) for m in keep)
+    if not evidence:
+        return OrderedDict(incoming or {})
+    out = OrderedDict((g, list(m)) for g, m in evidence.items())
+    for gname, members in (incoming or {}).items():
+        if isinstance(members, dict):
+            out.setdefault(gname, members)
+            continue
+        for member in members or []:
+            if isinstance(member, dict) and _record_identity(member) in known:
+                continue
+            out.setdefault(gname, [])
+            if isinstance(out[gname], list):
+                out[gname].append(member)
+    return out
+
+
+def value_source(value, default=SOURCE_GENERATED):
+    # type: (object, str) -> str
+    """The origin a MIXED grouped value may honestly claim: the weakest one in it.
+
+    A block holding one harvested link and one proposed link is not "extracted". If
+    the field-level record said it was, a reader would take the model's guess for a
+    measurement — which is the exact confusion the per-record `source` exists to
+    prevent, so the summary must not undo it.
+    """
+    sources = set()
+    groups = value if isinstance(value, dict) else {}
+    for members in groups.values():
+        for member in (members if isinstance(members, list) else []):
+            sources.add(record_source(member) or default)
+    if not sources:
+        return default
+    for weakest in (SOURCE_GENERATED, SOURCE_DERIVED, SOURCE_EXTRACTED,
+                    SOURCE_AUTHORED):
+        if weakest in sources:
+            return weakest
+    return default
+
+
+def source_url(base_url, source_relpath):
+    # type: (str, str) -> str
+    """A resolvable URI reference for the source document — the page's way home.
+
+    ``source.uri`` is a filesystem RELPATH: it may hold spaces, ``#`` and ``?``, all
+    of which mean something else in a URL, so it cannot be pasted into a link. This
+    is always a valid URI reference — absolute when a base is configured
+    (``--source-base-url``), and a relative one otherwise, which resolves correctly
+    for any consumer that publishes the corpus alongside the sources it came from.
+    A base is never invented: doc2md does not know where anybody serves their files.
+    """
+    rel = (source_relpath or "").replace("\\", "/").lstrip("/")
+    if not rel:
+        return ""
+    ref = quote(rel)
+    base = (base_url or "").strip()
+    return (base.rstrip("/") + "/" + ref) if base else ref
+
+
+def _as_date(value):
+    # type: (object) -> object
+    if isinstance(value, datetime.date):
+        return value
+    text = ("%s" % (value or "")).strip()[:10]
+    try:
+        return datetime.datetime.strptime(text, "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+
+def next_review_due(last_reviewed, review_cadence):
+    # type: (object, str) -> str
+    """``last_reviewed + review_cadence``, or ``""`` when that is not a date.
+
+    WHY AN AUTHORED-ONLY FIELD MAY BE DERIVED. `authored_only` means no tier-2
+    machinery may write the field: a model must not GUESS when a document was last
+    reviewed or how secret it is, because the value's whole worth is that a person
+    stood behind it. This is not a guess. Both inputs are authored, the rule is
+    arithmetic, and the output makes no claim the person did not already make — it
+    restates their commitment in the form a reminder can read. Nothing is written
+    when either input is missing, and a value already present is never touched.
+    """
+    days = REVIEW_INTERVAL_DAYS.get(("%s" % (review_cadence or "")).strip().lower())
+    if not days:
+        return ""                        # `on_change` / `none` name no interval
+    day = _as_date(last_reviewed)
+    if day is None:
+        return ""
+    return (day + datetime.timedelta(days=days)).strftime("%Y-%m-%d")
+
+
+# ==============================================================================
 
 
 def order_meta(meta):
@@ -527,16 +1099,23 @@ def revalidate_generated(meta, vocab):
     return (meta, moved)
 
 
-def _prov(source, tier, model="", prompt_sha="", value=None):
-    # type: (str, int, str, str, object) -> OrderedDict
+def _prov(source, model="", prompt_sha="", value=None):
+    # type: (str, str, str, object) -> OrderedDict
+    """One field's origin record.
+
+    NO ``tier``. It was a pure function of the field name (``field(name).tier``),
+    duplicated into every record for every field of every document — about 40% of
+    the metadata bytes — and nothing ever read it back. A number that can be
+    recomputed for free is not a fact worth storing; it is a fact worth drifting.
+    """
     rec = OrderedDict()
-    rec["tier"] = tier
     rec["source"] = source
     if source == SOURCE_GENERATED:
         rec["model"] = model or ""
         rec["prompt_sha"] = prompt_sha or ""
+    if source in _MACHINE_SOURCES:
         # The fingerprint of what WE wrote. Without it a human correction to a
-        # generated value is invisible to the next run, which reverts it.
+        # machine value is invisible to the next run, which reverts it.
         rec["value_sha"] = value_sha(value)
     return rec
 
@@ -552,7 +1131,7 @@ def set_provenance(meta, name, source, model="", prompt_sha="", value=None):
     if name not in field_names():
         return
     prov = meta.setdefault(PROVENANCE_KEY, OrderedDict())
-    prov[name] = _prov(source, field(name).tier, model, prompt_sha,
+    prov[name] = _prov(source, model, prompt_sha,
                        meta.get(name) if value is None else value)
 
 

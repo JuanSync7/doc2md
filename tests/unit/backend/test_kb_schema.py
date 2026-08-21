@@ -61,7 +61,7 @@ def test_model_writable_is_true_only_for_tier_two_that_is_not_an_accountability_
     # author. Retiering `owner` or `confidentiality` to something a model may
     # write would still satisfy the generic rule below while destroying the
     # guarantee, so the boundary list is pinned by name.
-    for name in ("owner", "confidentiality", "status", "classification",
+    for name in ("owner", "confidentiality", "status",
                  "accountable_roles", "review_cadence", "last_reviewed",
                  "next_review_due", "validated_against_version"):
         assert field(name).authored_only is True, name
@@ -71,7 +71,7 @@ def test_model_writable_is_true_only_for_tier_two_that_is_not_an_accountability_
         assert model_writable(name) is True, name
 
     # Deterministic and derived fields are nobody's guess either.
-    for name in ("uid", "source", "slug", "word_count"):
+    for name in ("id", "uid", "source", "slug", "word_count"):
         assert model_writable(name) is False, name
 
     # ...and the generic rule holds across the whole inventory.

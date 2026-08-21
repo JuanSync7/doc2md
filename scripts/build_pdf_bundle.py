@@ -60,7 +60,7 @@ sys.path.insert(0, _HERE)                        # import the sibling lane scrip
 
 import docling_convert as dc                     # noqa: E402  (converters + measurement)
 import build_bundle as bb                        # noqa: E402  (shared writer helpers)
-from backend.provenance import compact_run, decision   # noqa: E402
+from backend.provenance import compact_run, decision, stamp_stage  # noqa: E402
 from backend.bundle import assemble_bundle       # noqa: E402  (pure assembler)
 from backend.ingest import (doc_id, tokenize,    # noqa: E402
                             image_markdown, inline_image_captions,
@@ -70,6 +70,10 @@ from backend.ingest import (doc_id, tokenize,    # noqa: E402
                             pdf_info_meta, load_ingest_config, load_source_root,
                             normalize_accept)
 from backend.validate import image_report, caption_report   # noqa: E402  (report policy)
+
+# This lane's name in `run.entrypoint`, in every `decisions[].stage` and in
+# every manifest row it appends — one string for one thing (see build_bundle).
+ENTRYPOINT = "build_pdf_bundle"
 
 # Derived, never a literal (see build_bundle._converter_id): two builds from
 # different code must never be able to claim the same converter stamp.
@@ -219,9 +223,9 @@ def _failure_report(row, lane, error, warnings, run_id="", run=None, decisions=N
     rep["losslessness"] = {"method": "pdf-text-coverage", "gate": "best-effort",
                            "error": error}
     rep["warnings"] = list(warnings or [])
-    rep["decisions"] = list(decisions or [])
+    rep["decisions"] = stamp_stage(decisions, ENTRYPOINT)
     if run:
-        rep["run"] = run
+        bb.record_stage_run(rep, run, writer=True)
     return rep
 
 
@@ -402,9 +406,9 @@ def build_one(row, conv, ocr_conv, ocr_mode, out_root, run_id, cfg,
                               "no ground-truth semantic tree exists for this lane, "
                               "so a pass is not claimable",
                               {"method": rep["losslessness"].get("method", "")}))
-    rep["decisions"] = decisions
+    rep["decisions"] = stamp_stage(decisions, ENTRYPOINT)
     if run:
-        rep["run"] = run
+        bb.record_stage_run(rep, run, writer=True)
 
     bb._write_json(os.path.join(doc_dir, "report.json"), rep)
     bb._write_atomic(os.path.join(doc_dir, "document.md"), bundle["document_md"])
@@ -473,7 +477,7 @@ def main(argv=None):
     if not todo:
         # Nothing to convert, but a run that did nothing still happened: log the
         # skips and the run row, or the number of runs is unrecoverable from disk.
-        run = bb._run_context("build_pdf_bundle", args, raw_argv, run_id)
+        run = bb._run_context(ENTRYPOINT, args, raw_argv, run_id)
         rows_written = []
         with open(os.path.join(args.out, bb.MANIFEST), "a", encoding="utf-8") as mf:
             for r in rows:
@@ -482,7 +486,8 @@ def main(argv=None):
                      "status": done.get(r["id"], ""), "markdown_sha256": "",
                      "source_sha256": "", "error": "", "run_id": run_id,
                      "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                     "action": "skipped" if r["id"] in done else "deferred"}
+                     "action": "skipped" if r["id"] in done else "deferred",
+                     "stage": ENTRYPOINT}
                 mf.write(json.dumps(m) + "\n")
                 rows_written.append(m)
         bb._append_run(args.out, run, rows_written,
@@ -503,7 +508,7 @@ def main(argv=None):
         return state["ocr"]
 
     started = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    run = bb._run_context("build_pdf_bundle", args, raw_argv, run_id,
+    run = bb._run_context(ENTRYPOINT, args, raw_argv, run_id,
                           {"docling": _toolchain_warning("pdf").get("detail", "")})
     run_doc = compact_run(run, "%s#%s" % (bb.RUNS, run_id))
 
@@ -517,6 +522,7 @@ def main(argv=None):
             m["run_id"] = run_id
             m["ts"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
             m["action"] = action
+            m["stage"] = ENTRYPOINT
             mf.write(json.dumps(m) + "\n")
             mf.flush()
             rows_written.append(m)

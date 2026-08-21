@@ -124,6 +124,30 @@ class Checker(object):
 
 # ----------------------------------------------------------- expectation kinds
 
+# Every expectation key any checker actually reads. A key outside this set is a
+# TYPO that would otherwise sit in expectations.json looking like a check and
+# proving nothing — the same vacuous pass the report's `n_source_tokens` exists to
+# prevent. Adding a probe means adding its key here, in the same change.
+_KNOWN_KEYS = frozenset((
+    "kind", "requires", "lane", "status",
+    "losslessness_gate", "losslessness_method", "token_recall_min",
+    "structure_fidelity_gate",
+    "coverage_gate", "toc_lines_min", "has_toc", "max_depth",
+    "savings_ratio_min", "content_links_min",
+    "images_gate", "images_referenced",
+    "warning_codes", "warning_codes_absent",
+    "md_contains", "md_not_contains", "md_min_count",
+    "outline_titles", "outline_probe", "structure_links_contains",
+))
+
+
+def unknown_keys(exp):
+    # type: (dict) -> list
+    """Expectation keys no checker reads. Underscore-prefixed keys are notes."""
+    return sorted(k for k in exp
+                  if not k.startswith("_") and k not in _KNOWN_KEYS)
+
+
 def check_bundle(rel, exp, bundles_dir):
     # type: (str, dict, str) -> list
     """Checks for an office/pdf BUNDLE expectation; returns failure strings."""
@@ -176,6 +200,14 @@ def check_bundle(rel, exp, bundles_dir):
         c.check(isinstance(got, int) and got >= exp["content_links_min"],
                 "content.links: got %r, want >= %d"
                 % (got, exp["content_links_min"]))
+    if "structure_fidelity_gate" in exp:
+        # The SECOND hard gate. Pinned separately from losslessness because they
+        # answer different questions and can disagree: a renumbered procedure is
+        # token-lossless and structurally wrong.
+        fid = rep.get("structure_fidelity", {})
+        c.eq(fid.get("gate"), exp["structure_fidelity_gate"], "structure_fidelity.gate")
+        if fid.get("deltas"):
+            c.check(False, "structure_fidelity.deltas: %r" % (fid["deltas"],))
     if "images_gate" in exp:
         c.eq(rep.get("images", {}).get("gate"), exp["images_gate"], "images.gate")
     if "images_referenced" in exp:
@@ -422,6 +454,11 @@ def main(argv=None):
             continue
         if exp.get("requires") == "pdf-lane" and not pdf_ran:
             results.append(("SKIP", rel, "pdf lane did not run"))
+            continue
+        stray = unknown_keys(exp)
+        if stray:
+            results.append(("FAIL", rel, "expectation keys no checker reads "
+                                         "(typo?): %s" % ", ".join(stray)))
             continue
         if kind == "bundle":
             fails = check_bundle(rel, exp, args.bundles)
