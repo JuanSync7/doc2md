@@ -1,0 +1,298 @@
+# doc2md — controlled vocabularies for document metadata.
+#
+# Governance differs by field. Three regimes:
+#   closed   — hard fail on unknown value. Structural; changing it is a schema change.
+#   registry — unknown values land in <field>_proposed, promoted on frequency.
+#   ref      — no vocabulary; validated by referential integrity instead.
+#
+# REUSE BEFORE INVENTING. Every field and every value that has an established
+# equivalent carries `maps_to`. We borrow the standard's TERM as the vocabulary
+# value and keep YAML as the serialisation: alignment plus a mechanical RDF export
+# path later, without adopting a triplestore or OWL tooling today. `local` means no
+# standard models it — that layer is ours and is deliberately kept small.
+#
+# This file is parsed by backend.ingest.parse_block (a strict stdlib YAML SUBSET —
+# no anchors, no flow maps, no multi-document streams). Keep it inside that subset.
+
+version: 1
+
+# Prefixes used by every `maps_to` value below.
+standards:
+  dcterms: http://purl.org/dc/terms/
+  prov: http://www.w3.org/ns/prov#
+  skos: http://www.w3.org/2004/02/skos/core#
+  schema: https://schema.org/
+  stix: https://docs.oasis-open.org/cti/stix/v2.1/
+  madr: https://adr.github.io/madr/
+  iso31000: https://www.iso.org/standard/65694.html
+  local: doc2md
+
+# Thresholds for the cardinality / registry-health gates. A facet whose values are
+# nearly all distinct is documentation, not a facet.
+lint:
+  facet_warn: 0.45
+  facet_fail: 0.75
+  # A distinct/used ratio says nothing until there are enough values to ratio.
+  # One relation is 1.00 distinct and means nothing; a facet is only graded once
+  # the sample can carry the verdict.
+  facet_min_uses: 8
+  promote_at: 3
+  singleton_rate_max: 0.40
+  # --- corpus-wide gates (scripts/kb_lint.py, backend.kb.corpus_findings) ---
+  # Two strings this similar are probably one term spelled two ways. Tuned against
+  # the shipped vocabularies: 0.78 clears every deliberate pair in this file except
+  # annual/biannual, which is recorded below rather than suppressed by loosening it.
+  synonym_similarity: 0.78
+  # Below this many documents a corpus ratio is a sample of noise, so coverage,
+  # orphan and dead-term reporting is emitted but not graded.
+  corpus_min_docs: 5
+  # A model-written field populated on less than this share of documents is either
+  # conditional by design or an extractor that quietly stopped working.
+  coverage_thin: 0.25
+  # Similar-looking pairs that are DELIBERATE. A similarity finding is a question,
+  # so the answer has to be recordable or it gets asked forever. `field:a|b`.
+  similar_ok:
+    - review_cadence:annual|biannual
+
+relation_predicates:
+  governance: closed
+  maps_to: local
+  rationale: >
+    Edge types are what queries traverse. An open predicate set produces
+    mitigates / mitigate / helps_mitigate / reduces_risk_of as four distinct
+    edges. Keep this list small and force qualifiers to carry nuance.
+  values: [runs_on, installed_via, requires, governs, controls, overrides,
+           constrains, enforces, mitigates, targets, bypasses, produces,
+           covers, discloses, designates, alternative_to, ordered_after]
+  value_maps_to:
+    requires: dcterms:requires
+    mitigates: stix:mitigates
+    targets: stix:targets
+  aliases:
+    threatens: targets
+  qualifiers:
+    negated:
+      type: bool
+      note: collapses does_not_* / cannot_* variants
+    mode:
+      ref: failure_modes
+    exclusive:
+      type: bool
+      note: is the ONLY source for
+    conditional:
+      type: bool
+      note: holds only under a stated future change
+
+entity_types:
+  governance: closed
+  maps_to: schema:Thing
+  values: [Organization, Person, Role, Software, OperatingSystem, Package,
+           Host, Path, Script, Hook, Setting, Identifier, Standard, Metric]
+  value_maps_to:
+    Organization: schema:Organization
+    Person: schema:Person
+    Role: schema:Role
+    Software: schema:SoftwareApplication
+    OperatingSystem: schema:SoftwareApplication
+    Package: schema:SoftwareSourceCode
+    Standard: schema:CreativeWork
+  # Entity groups whose members carry no explicit `type` take it from the group.
+  # Without this every host and script entry is untyped and silently unchecked.
+  group_types:
+    organisations: Organization
+    people: Person
+    software: Software
+    hosts: Host
+    paths: Path
+    scripts: Script
+    hooks: Hook
+    settings: Setting
+    identifiers: Identifier
+    standards: Standard
+    metrics: Metric
+
+failure_modes:
+  governance: closed
+  maps_to: local
+  rationale: >
+    Was 10 values at ratio 0.67, including one-offs like invisible_to_intune and
+    presents_as_auth_failure. Those are descriptions, not categories — they belong
+    in `note`. What is actually worth querying is HOW LATE you find out. This is
+    FMEA's detectability dimension (Severity x Occurrence x Detection).
+  values: [silent, delayed, overt, adversarial]
+
+impact:
+  governance: closed
+  maps_to: iso31000
+  rationale: >
+    A standard qualitative severity scale (ISO 31000 / NIST SP 800-30 style).
+  values: [critical, high, medium, low]
+
+decision_status:
+  governance: closed
+  maps_to: madr:status
+  rationale: >
+    MADR's status vocabulary is the de-facto standard for decision records. Nuance
+    moves into qualifier fields; the status itself stays a five-value enum.
+  values: [proposed, rejected, accepted, deprecated, superseded]
+  aliases:
+    recommended: proposed
+    standing_rule: accepted
+    assumed: accepted
+    provisional: accepted
+  alias_qualifiers:
+    assumed:
+      assumption: true
+    provisional:
+      review_required: true
+
+requirement_level:
+  governance: closed
+  maps_to: local
+  # RESERVED: no document field binds to this vocabulary yet. It governs the force
+  # of a STATEMENT inside a document body (RFC 2119-shaped), which is body-level
+  # extraction and out of scope for the document-level block. Kept declared rather
+  # than deleted so the term list is decided once; delete it if body-level
+  # extraction never lands.
+  # NB values are quoted: bare no/yes/on/off are coerced to booleans by YAML 1.1.
+  # Always quote enum values that a 1.1 reader would retype.
+  values: ["mandatory", "recommended", "conditional", "optional", "excluded"]
+
+link_categories:
+  governance: closed
+  maps_to: dcterms:references
+  values: [product_docs, vendor_and_legal, platform, ecosystem, internal, standards]
+
+document_types:
+  governance: closed
+  maps_to: dcterms:type
+  values: [runbook, policy, design, report, guide, reference, meeting_note,
+           contract, spec]
+  value_maps_to:
+    runbook: schema:TechArticle
+    guide: schema:TechArticle
+    reference: schema:TechArticle
+    report: schema:Report
+    policy: schema:DigitalDocument
+    contract: schema:DigitalDocument
+
+document_status:
+  governance: closed
+  maps_to: local
+  rationale: >
+    The document's own lifecycle, distinct from decision_status. No DCMI term
+    exists for it, so it stays local — but closed, because it routes retrieval.
+  values: [draft, review, approved, deprecated, superseded]
+
+confidentiality:
+  governance: closed
+  maps_to: dcterms:accessRights
+  rationale: >
+    A safety boundary: it exists so a confidential document is never surfaced to
+    the wrong audience. Authority-owned — a model may never author this field.
+  values: [public, internal, confidential, restricted]
+
+review_cadence:
+  governance: closed
+  maps_to: local
+  values: [monthly, quarterly, biannual, annual, on_change, none]
+
+lang:
+  governance: closed
+  maps_to: dcterms:language
+  rationale: >
+    BCP 47 tags, closed to the set this corpus actually uses so en-GB and en_GB
+    and english cannot coexist.
+  values: [en-GB, en-US, fr-FR, de-DE, zh-CN, ja-JP]
+
+# The registry fields below start EMPTY on purpose. A registry admits a term by
+# promotion (>= promote_at documents), so seeding one here would be guessing the
+# corpus shape at document zero — the exact failure the registry regime exists to
+# avoid. Until a term is promoted every value lands in `<field>_proposed`, which is
+# where `scripts/kb_lint.py` reads the promotion candidates from.
+
+subtype:
+  governance: registry
+  maps_to: dcterms:type
+  values: []
+  note: Secondary document facets; corpus-shaped, so proposed then promoted.
+
+audience:
+  governance: registry
+  maps_to: dcterms:audience
+  values: []
+  note: Who the document is written for. Registry — the role vocabulary is org-shaped.
+
+topics:
+  governance: registry
+  maps_to: dcterms:subject
+  values: []
+  note: Broad subject areas. Registry so the corpus decides the granularity.
+
+tags:
+  governance: registry
+  maps_to: skos:Concept
+  values: []
+  rationale: >
+    Hard-closing tags at document 1 means guessing the corpus shape. Leaving them
+    open means 35 tags x 400 docs of singletons, which is the same as no tags.
+    So: propose, then promote.
+  rules:
+    - Extractor may only emit tags already in the registry.
+    - Unknown tags go to `tags_proposed`, never to `tags`.
+    - A proposal is promoted when it appears on >= 3 documents.
+    - Promotion writes an alias entry for every variant seen.
+  health_metric:
+    singleton_rate: share of registry tags used on exactly 1 document
+    threshold: "> 0.40 means the vocabulary is failing; run a merge pass"
+  # skos:altLabel — variant spellings that normalise to the canonical concept.
+  aliases:
+    rhel-8: rhel8
+    redhat-8: rhel8
+    rocky8: rocky-linux-8
+    rocky-linux: rocky-linux-8
+    ec2: aws-ec2
+    otel: opentelemetry
+  # skos:broader — a search for the broader concept returns the narrower ones
+  # without anyone tagging a document twice.
+  broader:
+    rocky-linux-8: rhel8
+    rhel8: linux
+    aws-ec2: aws
+    opentelemetry: observability
+
+keywords:
+  governance: registry
+  maps_to: skos:Concept
+  values: []
+  note: >
+    Seeded from tier-0 keyword candidates (code spans, camelCase, SCREAMING_SNAKE).
+    A corpus-wide registry catches settings keys renamed between product versions.
+
+# Fields governed by referential integrity, not vocabulary.
+refs:
+  governance: ref
+  maps_to: dcterms:references
+  fields: [ref, backs, see_also, control, protects]
+  rules:
+    - "`ref`/`backs` must resolve to an anchor in the same document."
+    - "`see_also` must resolve to an existing page id; unresolved -> see_also_unresolved."
+    - >
+      `control`/`protects` must resolve to an id in this document's registers OR to
+      a named entity in it — a control is usually a thing (a hook script, a settings
+      key, a sandbox), not a decision. Measured on the worked example: 11 of 12
+      controls named an entity and exactly one named a decision id.
+    - >
+      A pointer that cannot be checked is SKIPPED, never passed: `see_also` is only
+      resolved when the caller supplies the corpus id set.
+
+# Fields deleted, not governed.
+demoted:
+  entities.role:
+    ratio_observed: 1.0
+    action: >
+      delete; every value was unique. Replace with free-text `note` (unindexed)
+      or a per-type closed subrole where one genuinely exists.
+    principle: >
+      A field whose values are all distinct is documentation, not a facet. Do not
+      index it, and do not let a model believe it is choosing from a set.

@@ -64,6 +64,12 @@ python3 scripts/setup_libreoffice.py --rpms /path/to/libreoffice/rpms
 
 # Optional VLM figure captions (separate overlay stage, cache-keyed):
 python3 scripts/caption_bundles.py --bundles /path/to/bundles --vlm-url http://127.0.0.1:8000
+
+# Document metadata: descriptors into document.md, the graph payload into
+# knowledge.json; deterministic tiers always, model tier when one is reachable:
+python3 scripts/enrich_metadata.py --bundles /path/to/bundles
+# Lint per document AND corpus-wide (identity, synonymy, entities, graph, skew):
+python3 scripts/kb_lint.py --bundles /path/to/bundles --strict
 ```
 
 Both writers share the same output root and `manifest.jsonl`; re-runs skip
@@ -73,11 +79,29 @@ completed bundles (`--force` rebuilds).
 
 - `src/backend/` — the domain: `ingest` (routing, conversion, repair),
   `sections` (outline), `validate` (independent fidelity checks), `bundle`
-  (report assembly). `ingest`/`validate` are Python 3.6 + stdlib only.
+  (report assembly), `kb` (metadata tiers + controlled vocabulary). All of these
+  are Python 3.6 + stdlib only.
 - `scripts/` — entrypoints (converters, writers, validators); no domain logic.
 - `tests/` — `unit/` mirrors `src/`, `integration`/`e2e` by scenario.
 - `vendor/` — self-contained LibreOffice (build artifact, not committed).
-- `docs/design/` — the output contract and lane designs.
+- `config/vocab.yaml` — the controlled vocabularies governing document metadata.
+- `docs/design/` — the output contract, the metadata contract, and lane designs.
+
+## Documentation
+
+| Read this | For |
+|---|---|
+| [`docs/guide.md`](docs/guide.md) | **Start here** — what the pipeline produces, how it runs with and without a model, and how every claim is measured, with a real worked example |
+| [`docs/reference/configuration.md`](docs/reference/configuration.md) | Every switch and env var, and what it changes in the output |
+| [`docs/reference/output-schema.md`](docs/reference/output-schema.md) | Every key of every artifact |
+| [`docs/reference/vocabulary.md`](docs/reference/vocabulary.md) | Every governed metadata field and term (generated) |
+| [`docs/design/`](docs/design/) | The binding contracts: output shape, metadata, the lanes |
+| [`docs/end-goal.md`](docs/end-goal.md) | The charter — what "lossless" means here |
+| [`docs/quality-plan.md`](docs/quality-plan.md) | The honest current grade per output dimension, and the plan to A |
+| [`docs/roadmap.md`](docs/roadmap.md) | PDF fidelity, the SDK, keel compliance |
+
+The three reference files are **drift-tested**: adding a flag, an env var, a
+report key or a vocabulary term fails CI until the reference is updated.
 
 See [`CONVENTIONS.md`](CONVENTIONS.md) for the repo taxonomy and
 `CLAUDE.md` files for per-directory agent rules.

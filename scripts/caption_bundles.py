@@ -23,8 +23,8 @@ the ONE remaining piece: a VLM-generated, search-indexable caption per image. It
     re-run re-captions nothing while a prompt change (domain/context) correctly re-captions;
     a VLM outage leaves an image PENDING (caption stays null) for a later run.
 
-The prompt is TUNABLE so its quality can be measured, not assumed: ``--domain`` prepends
-domain grounding, ``--prompt-file`` replaces the base instruction, ``--no-context`` drops the
+The prompt is TUNABLE so its quality can be measured, not assumed: ``--domain`` (or ``--domain-file``)
+prepends domain grounding, ``--prompt-file`` replaces the base instruction, ``--no-context`` drops the
 per-figure document context, ``--context-radius`` sizes the surrounding-text window. Every
 run writes ``_caption_coverage.jsonl`` and prints a useful/furniture/pending pass-rate — the
 feedback loop for iterating the prompt (add ``--no-cache`` to force fresh captions).

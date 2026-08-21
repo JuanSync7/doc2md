@@ -305,6 +305,12 @@ def build_report(source_text, md, lane="office", losslessness=None,
             "method": "ooxml-ground-truth",
             "token_recall": rep["recall"],
             "content_recall": rep["content_recall"],
+            # The DENOMINATOR, so a recall of 1.0 is never claimable over nothing.
+            # The PDF block has carried n_source_tokens all along; without it here a
+            # zero-byte upload reported `token_recall: 1.0, gate: pass, lossless:
+            # true, warnings: []` in exactly the vocabulary of a real conversion, and
+            # the only tell was recognising e3b0c442... as the sha of no bytes.
+            "n_source_tokens": rep["n_source"],
             "missing_tokens": rep["missing_top"] if not rep["valid"] else [],
             "gate": "pass" if rep["valid"] else "fail",
         }
@@ -334,8 +340,9 @@ def build_report(source_text, md, lane="office", losslessness=None,
     }
 
 
-def image_report(referenced, extracted, unique_files, missing, orphans, verified):
-    # type: (int, int, int, int, int, int) -> dict
+def image_report(referenced, extracted, unique_files, missing, orphans, verified,
+                 orphans_removed=0):
+    # type: (int, int, int, int, int, int, int) -> dict
     """The deterministic image-extraction integrity block for ``report.json``.
 
     This is the office text gate's twin, for pixels. Body images are HTML-comment
@@ -348,7 +355,14 @@ def image_report(referenced, extracted, unique_files, missing, orphans, verified
         unless bytes were missing)
       * ``unique_files`` — distinct content-addressed files expected under ``images/``
       * ``missing``      — referenced pictures whose bytes were ABSENT in the package
-      * ``orphans``      — files on disk with no body reference (0 after GC)
+      * ``orphans``      — files on disk with no body reference REMAINING after the
+        sweep, so a non-zero value means the GC itself failed and the gate must say so
+      * ``orphans_removed`` — how many the sweep took out. Separate from ``orphans``
+        on purpose: the gate needs "are there orphans now", a dashboard asking "how
+        much churn is this corpus seeing" needs "how many were there", and folding
+        both into one number loses whichever question you did not ask first. Before
+        this the removed count existed only inside a prose ``detail`` string, so
+        aggregating it corpus-wide was impossible.
       * ``verified``     — files whose on-disk ``sha256[:16]`` matches their filename
         (content-addressed integrity: the bytes actually landed intact)
 
@@ -364,6 +378,7 @@ def image_report(referenced, extracted, unique_files, missing, orphans, verified
     b["extracted"] = extracted
     b["missing"] = missing
     b["orphans"] = orphans
+    b["orphans_removed"] = orphans_removed
     b["verified"] = verified
     b["gate"] = "pass" if intact else "degraded"
     return b
@@ -464,6 +479,62 @@ def caption_report(enabled, expected, captioned, furniture, useless, pending,
     if not enabled:
         b["gate"] = "disabled"
     elif expected == 0 or pending == 0:
+        b["gate"] = "complete"
+    elif attempted == 0:
+        b["gate"] = "pending"
+    else:
+        b["gate"] = "incomplete"
+    return b
+
+
+def doc_meta_report(enabled, expected, filled, authored, invalid, pending,
+                    schema_version=0, vocab_version=0, model="", prompt_sha=""):
+    # type: (bool, int, int, int, int, int, int, int, str, str) -> dict
+    """The document-metadata block for ``report.json`` — the same shape, and the same
+    deliberate separation from ``status``, as ``caption_report``.
+
+    Metadata enrichment is the second re-runnable overlay on a lossless build, and it
+    must not be able to make a lossless document read as degraded because no model has
+    classified it yet. So it carries its own verdict:
+
+      * ``expected`` — model-writable fields in the schema (tier 2, not authored-only)
+      * ``filled``   — fields carrying a value the vocabulary accepts
+      * ``authored`` — fields a PERSON wrote; counted separately because a generated
+                       value must never overwrite one, so they are not "model coverage"
+      * ``invalid``  — fields present but carrying a value the vocabulary rejects
+      * ``pending``  — model-writable fields still empty (never run / model outage)
+
+    ``gate``: ``disabled`` when enrichment is off; ``pending`` before the first run;
+    ``complete`` when nothing is outstanding; ``incomplete`` when a run left fields
+    unfilled or invalid. NOTE ``invalid`` keeps the gate off ``complete`` — a value
+    outside the closed vocabulary is worse than an absent one, because it silently
+    becomes a new term for every consumer that groups by that field.
+
+    The two versions are recorded because they invalidate DIFFERENT work: a schema
+    bump means the field inventory moved, a vocab bump means the allowed values did
+    and only the classified fields need revisiting.
+    """
+    attempted = filled + invalid
+    b = OrderedDict()
+    b["enabled"] = bool(enabled)
+    b["schema_version"] = int(schema_version or 0)
+    b["vocab_version"] = int(vocab_version or 0)
+    b["expected"] = expected
+    b["filled"] = filled
+    b["authored"] = authored
+    b["invalid"] = invalid
+    b["pending"] = pending
+    b["model"] = model or ""
+    b["prompt_sha"] = prompt_sha or ""
+    if not enabled:
+        b["gate"] = "disabled"
+    elif invalid == 0 and (expected == 0 or pending == 0):
+        # `invalid` gates independently of BOTH other counts. A run can fill every
+        # model-writable field and still leave one holding a value the vocabulary
+        # rejects: pending reaches 0 while invalid does not, and the earlier form
+        # (`expected == 0 or pending == 0`) called that complete. Guarding on
+        # `invalid` first also keeps the `expected == 0` short-circuit honest for any
+        # caller that counts invalid fields outside the model-writable set.
         b["gate"] = "complete"
     elif attempted == 0:
         b["gate"] = "pending"

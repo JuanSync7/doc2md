@@ -10,7 +10,7 @@ summary: docx/pptx/xlsx parts convert to structured markdown that passes the los
 # exhaustive ground truth, exactly as office_convert.py will grade it.
 from backend.ingest import (docx_markdown, pptx_markdown, xlsx_markdown,
                             docx_source_text, pptx_source_text, xlsx_source_text,
-                            ooxml_markdown, ooxml_source_text)
+                            ooxml_markdown, ooxml_source_text, furniture_drops)
 from backend.validate import conversion_report
 
 W = 'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"'
@@ -62,6 +62,21 @@ NUMBERING = ('<w:numbering %s>'
              '<w:num w:numId="2"><w:abstractNumId w:val="20"/></w:num>'
              '</w:numbering>' % W)
 
+# A decimal list that nests -- the shape of every real procedure/runbook.
+NUMBERING_DEC = ('<w:numbering %s>'
+                 '<w:abstractNum w:abstractNumId="30">'
+                 '<w:lvl w:ilvl="0"><w:numFmt w:val="decimal"/></w:lvl>'
+                 '<w:lvl w:ilvl="1"><w:numFmt w:val="decimal"/></w:lvl>'
+                 '<w:lvl w:ilvl="2"><w:numFmt w:val="decimal"/></w:lvl>'
+                 '</w:abstractNum>'
+                 '<w:abstractNum w:abstractNumId="40">'
+                 '<w:lvl w:ilvl="0"><w:numFmt w:val="bullet"/></w:lvl>'
+                 '<w:lvl w:ilvl="1"><w:numFmt w:val="decimal"/></w:lvl>'
+                 '</w:abstractNum>'
+                 '<w:num w:numId="3"><w:abstractNumId w:val="30"/></w:num>'
+                 '<w:num w:numId="4"><w:abstractNumId w:val="40"/></w:num>'
+                 '</w:numbering>' % W)
+
 
 def _wcell(*paras):
     return "<w:tc>%s" % "".join("<w:p><w:r><w:t>%s</w:t></w:r></w:p>" % t
@@ -94,6 +109,48 @@ def test_docx_bullet_and_numbered_lists_with_nesting():
     md = docx_markdown({"word/document.xml": doc, "word/numbering.xml": NUMBERING})
     assert "- first bullet\n  - nested bullet" in md
     assert "1. step one" in md
+
+
+def test_nested_ordered_list_indents_to_the_parents_content_column():
+    # CommonMark nests a child item only at its parent's CONTENT column -- 3 for
+    # "1. ", not 2. At 2 the parent item CLOSES and the child renders as its SIBLING,
+    # so a procedure with one sub-step renumbers every step after it: an operator
+    # working an outage from the converted runbook performs the wrong action. Not a
+    # single token moves, so neither the recall gate nor outline coverage can object.
+    doc = _wdoc(_wp("acknowledge the page", num="3")
+                + _wp("check pod health", num="3")
+                + _wp("inspect the gateway log", num="3", ilvl=1)
+                + _wp("drain the unhealthy pod", num="3"))
+    md = docx_markdown({"word/document.xml": doc, "word/numbering.xml": NUMBERING_DEC})
+    assert ("1. check pod health\n"
+            "   1. inspect the gateway log\n"
+            "1. drain the unhealthy pod") in md
+
+
+def test_nested_ordered_list_indents_compound_at_depth_two():
+    doc = _wdoc(_wp("one", num="3") + _wp("two", num="3", ilvl=1)
+                + _wp("three", num="3", ilvl=2))
+    md = docx_markdown({"word/document.xml": doc, "word/numbering.xml": NUMBERING_DEC})
+    # columns accumulate: 0 -> 3 -> 6, never a flat 2 per level.
+    assert "1. one\n   1. two\n      1. three" in md
+
+
+def test_ordered_child_of_a_bullet_parent_uses_the_bullet_content_column():
+    # "- " is 2 wide, so the child indents by 2 here and by 3 under "1. ". A constant
+    # is wrong in one direction or the other; the marker width is the rule.
+    doc = _wdoc(_wp("prerequisite", num="4") + _wp("sub step", num="4", ilvl=1))
+    md = docx_markdown({"word/document.xml": doc, "word/numbering.xml": NUMBERING_DEC})
+    assert "- prerequisite\n  1. sub step" in md
+
+
+def test_a_paragraph_closes_the_list_so_the_next_item_restarts_at_column_zero():
+    # A column-0 paragraph ends the list in the rendered markdown; carrying the old
+    # ancestor columns across it would indent the next item into a code block.
+    doc = _wdoc(_wp("one", num="3") + _wp("two", num="3", ilvl=1)
+                + _wp("Interlude prose.") + _wp("three", num="3", ilvl=1))
+    md = docx_markdown({"word/document.xml": doc, "word/numbering.xml": NUMBERING_DEC})
+    assert "\n1. three" in md
+    assert "    1. three" not in md
 
 
 def test_docx_numid_zero_is_not_a_list():
@@ -595,7 +652,12 @@ def test_xlsx_sheet_names_are_markdown_escaped_in_headings():
     parts = {"xl/workbook.xml": wb, "xl/_rels/workbook.xml.rels": WB_RELS,
              "xl/worksheets/sheet1.xml": _sheet('<row><c><v>1</v></c></row>')}
     md = xlsx_markdown(parts)
-    assert "## Assignment\\_list\\_ecc" in md
+    # Single underscores flanked by word characters can neither open nor close
+    # emphasis (CommonMark's flanking rule), so the sheet name is stored VERBATIM —
+    # `## Assignment\_list\_ecc` rendered the same but put backslashes into the bytes
+    # a BM25 index and a human grep actually search.
+    assert "## Assignment_list_ecc" in md
+    assert "\\_" not in md
     rep = conversion_report(xlsx_source_text(parts), md)
     assert rep["valid"] is True, rep
 
@@ -672,14 +734,70 @@ def test_pptx_comments_render_legacy_and_modern():
 # --------------------------------------------------------------- markdown escaping
 
 def test_underscore_paths_survive_rendering_and_the_gate():
-    # `__` is BOLD in GFM: unescaped, a renderer (and markdown_to_text) eats the
-    # underscores and glues "dv3__dv3_tests" into "dv3dv3_tests" — token loss.
+    # `__x__` is BOLD in GFM: unescaped, a renderer (and markdown_to_text's _BOLD,
+    # which carries no flanking guard) eats the underscores and glues
+    # "dv3__dv3_tests__ecc" into "dv3dv3_testsecc" — real token loss. So a RUN of two
+    # or more stays escaped. A SINGLE underscore between word characters cannot mean
+    # anything to either, so escaping it would only corrupt the stored identifier.
     doc = _wdoc(_wp("run regression_results/dv3__dv3_tests__ecc_disable now"))
     parts = {"word/document.xml": doc}
     md = docx_markdown(parts)
-    assert "dv3\\_\\_dv3\\_tests" in md
+    assert "dv3\\_\\_dv3_tests\\_\\_ecc_disable" in md
+    assert "regression_results" in md              # grep-able, byte for byte
     rep = conversion_report(docx_source_text(parts), md)
     assert rep["valid"] is True, rep
+
+
+def test_screaming_snake_identifiers_are_stored_verbatim():
+    # The stored bytes are what an embedder and a BM25 index see. `DB\_MAX\_CONN\_LIMIT`
+    # renders correctly and matches nothing a person would ever search for.
+    doc = _wdoc(_wp("set DB_MAX_CONN_LIMIT=64 and pass --dry_run=true"))
+    parts = {"word/document.xml": doc}
+    md = docx_markdown(parts)
+    assert "DB_MAX_CONN_LIMIT=64" in md
+    assert "--dry_run=true" in md
+    assert "\\_" not in md
+    rep = conversion_report(docx_source_text(parts), md)
+    assert rep["valid"] is True, rep
+
+
+def test_underscore_that_could_open_emphasis_is_still_escaped():
+    # Not word-flanked -> a real emphasis delimiter -> must stay escaped, or the
+    # renderer and markdown_to_text both swallow the span between the pair.
+    doc = _wdoc(_wp("use _lead and trail_ markers"))
+    parts = {"word/document.xml": doc}
+    md = docx_markdown(parts)
+    assert "\\_lead" in md and "trail\\_" in md
+    rep = conversion_report(docx_source_text(parts), md)
+    assert rep["valid"] is True, rep
+
+
+# -------------------------------------------------- deliberate drops are NAMED
+
+def test_dropped_headers_and_footers_are_named_and_measured():
+    # end-goal.md permits dropping page furniture, but only when the drop is
+    # "deliberate and visible". Before this, a Confidential banner vanished into a
+    # report that said warnings: [] -- indistinguishable from a document with no
+    # header at all.
+    furn = {"word/header1.xml": _wdoc(_wp("Nimbus Confidential -- Project Kestrel")),
+            "word/footer1.xml": _wdoc(_wp("Page 1 of 9"))}
+    warns = furniture_drops(furn)
+    assert len(warns) == 1
+    w = warns[0]
+    assert w["code"] == "dropped_headers_footers"
+    assert w["parts"] == 2 and w["chars"] > 0
+    assert "header1.xml" in w["detail"] and "footer1.xml" in w["detail"]
+
+
+def test_an_empty_header_dropped_nothing_and_is_not_reported():
+    assert furniture_drops({"word/header1.xml": _wdoc(_wp(""))}) == []
+    assert furniture_drops({}) == []
+
+
+def test_furniture_drops_ignores_body_parts():
+    # Only page furniture is claimed; a body part reaching this function would mean
+    # the reader is misrouting content into the "dropped" bucket.
+    assert furniture_drops({"word/document.xml": _wdoc(_wp("real body text"))}) == []
 
 
 def test_angle_bracket_signals_survive_in_cells():

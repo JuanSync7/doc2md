@@ -30,7 +30,7 @@ _REPO = os.path.dirname(_HERE)
 sys.path.insert(0, os.path.join(_REPO, "src"))
 
 from backend.ingest import (  # noqa: E402
-    doc_id, route_format, ext_of, summarize_routes, normalize_accept, ROUTE_OOXML,
+    doc_id, route_format, ext_of, summarize_routes, ROUTE_OOXML,
     sniff_image_format, caption_cache_key, resolve_media_refs, is_body_part,
     load_source_root, load_ingest_config)
 
@@ -183,7 +183,8 @@ def _office_sources(src_root, accept):
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Second-pass figure validator: measure figure "
                                              "losslessness/correctness from the ORIGINAL sources.")
-    ap.add_argument("--src", default=load_source_root(), help="source documents root (required)")
+    ap.add_argument("--src", default=load_source_root(),
+                    help="source documents root (default $DOC2MD_SRC / [paths].source_docs)")
     ap.add_argument("--out", default=os.path.join(_REPO, "data", "markdown"),
                     help="markdown dir holding <doc_id>.md")
     ap.add_argument("--assets", default=os.path.join(_REPO, "data", "assets"),
@@ -193,7 +194,7 @@ def main(argv=None):
     if not args.src or not os.path.isdir(args.src):
         ap.error("source root not found (%r): pass --src or set $DOC2MD_SRC" % (args.src,))
 
-    accept = (normalize_accept("") if False else (load_ingest_config().accept_formats or None))
+    accept = load_ingest_config().accept_formats or None
     by_doc = _load_records(args.assets)
     audits = []
     all_fails = []

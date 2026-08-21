@@ -69,6 +69,27 @@ def build_chat_payload(prompt, image_data_uri, model="qwen2.5-vl-7b",
     }
 
 
+def build_text_payload(prompt, model="qwen2.5-vl-7b", max_tokens=1024,
+                       temperature=0.0, response_format=None):
+    # type: (str, str, int, float, dict) -> dict
+    """Text-only chat payload — same endpoint, one user turn, no image.
+
+    ``response_format`` is passed through when given (``{"type": "json_object"}``
+    for a server that supports constrained decoding). It stays OPTIONAL because
+    not every OpenAI-compatible server accepts it, and a caller that cannot rely
+    on it must still be able to parse the reply itself.
+    """
+    payload = {
+        "model": model,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+    if response_format:
+        payload["response_format"] = response_format
+    return payload
+
+
 def parse_chat_text(resp):
     # type: (dict) -> str
     """Extract ``choices[0].message.content`` from an OpenAI response; "" on any miss."""
@@ -176,6 +197,35 @@ class VlmClient:
                 # genuine empty reply -> retry the empty-output glitch, but we DID hear back
             except Exception:
                 pass               # transport/decode error -> keep retrying; ok stays monotonic
+        return {"text": "", "finish_reason": "", "ok": got_reply}
+
+    def text_result(self, prompt, max_tokens=0, response_format=None):
+        # type: (str, int, dict) -> dict
+        """Text-only completion -> ``{"text", "finish_reason", "ok"}``.
+
+        Same ``ok`` contract as ``caption_result``: ``ok=False`` means we never
+        heard back (transport failure or a 200 without ``choices``), so the caller
+        must record the work as PENDING and retry later rather than as a terminal
+        empty answer. Metadata enrichment depends on that distinction exactly as
+        captioning does — an outage must not be written down as "this document has
+        no type".
+        """
+        payload = build_text_payload(prompt, self.model,
+                                     max_tokens or self.max_tokens,
+                                     self.temperature, response_format)
+        got_reply = False
+        for attempt in range(self.retries + 1):
+            try:
+                resp = self._post(payload)
+                if not has_choice(resp):
+                    continue
+                got_reply = True
+                txt = parse_chat_text(resp)
+                if txt:
+                    return {"text": txt,
+                            "finish_reason": parse_finish_reason(resp), "ok": True}
+            except Exception:
+                pass
         return {"text": "", "finish_reason": "", "ok": got_reply}
 
     def healthy(self, timeout=5):

@@ -25,6 +25,8 @@ from ._coverage import (tokenize, coverage, CoverageReport, is_lossy, is_lossy_e
                         char_ngram_recall, html_to_text, strip_running_lines, words_in_bbox,
                         explain_gap, GapReport, merge_boxes)
 from ._provenance import core_properties, pdf_info_meta, front_matter
+from ._yamlblock import (YamlSubsetError, render_block, render_front_matter,
+                         parse_block, split_front_matter)
 from ._rawvocab import identifier_vocab, repair_split_tokens
 from ._route import (route_format, classify_source, summarize_routes,
                      supported_formats, normalize_accept, unknown_formats, ext_of,
@@ -33,7 +35,8 @@ from ._route import (route_format, classify_source, summarize_routes,
                      ROUTE_FENCE, ROUTE_LIBREOFFICE, ROUTE_UNSUPPORTED)
 from ._ooxml_md import (docx_markdown, pptx_markdown, xlsx_markdown,
                         docx_source_text, pptx_source_text, xlsx_source_text,
-                        ooxml_markdown, ooxml_source_text, svg_text, OOXML_MAIN_PARTS)
+                        ooxml_markdown, ooxml_source_text, svg_text, OOXML_MAIN_PARTS,
+                        furniture_drops)
 from ._recovery import (classify_failure, recovery_action,
                         plan_admission, order_todo,
                         FAIL_NONE, FAIL_OOM, FAIL_HANG, FAIL_DOCLING, FAIL_TRANSIENT,
@@ -57,6 +60,11 @@ __all__ = [
     "core_properties",
     "pdf_info_meta",
     "front_matter",
+    "YamlSubsetError",
+    "render_block",
+    "render_front_matter",
+    "parse_block",
+    "split_front_matter",
     "identifier_vocab",
     "repair_split_tokens",
     "route_format",
@@ -83,6 +91,7 @@ __all__ = [
     "xlsx_source_text",
     "ooxml_markdown",
     "ooxml_source_text",
+    "furniture_drops",
     "svg_text",
     "OOXML_MAIN_PARTS",
     "doc_id",

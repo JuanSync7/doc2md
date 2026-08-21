@@ -260,9 +260,31 @@ def _emit_image_blocks(rids, rels, blocks):
 # tag, `[x](y)` as a link, `~~x~~` as strikethrough. Silicon docs are full of these,
 # so every literal text is escaped — the source must round-trip through a GFM
 # renderer character-perfect.
-_MD_SPECIAL = re.compile(r"([*_`<\[\]~])")
+_MD_SPECIAL = re.compile(r"([*`<\[\]~])|(_+)")
 _LEAD_LIST_NUM = re.compile(r"^(\d+)([.)])(\s)")
 _LEAD_MARK = re.compile(r"^([#+*-])(\s)")
+_WORD_CH = re.compile(r"[0-9A-Za-z]")
+
+
+def _esc_special(m):
+    # type: (object) -> str
+    """Escape one markdown special — except an underscore that cannot mean anything.
+
+    A SINGLE underscore flanked by word characters can neither open nor close
+    emphasis under CommonMark's flanking rule (and ``markdown_to_text``'s ``_ITALIC``
+    already mirrors that rule), so escaping it buys no safety and corrupts the stored
+    bytes: ``DB_MAX_CONN_LIMIT`` became ``DB\\_MAX\\_CONN\\_LIMIT``, which a renderer
+    hides but a BM25 index, an embedder and a human grep do not. A run of two or more
+    stays escaped — ``__x__`` IS strong emphasis to ``markdown_to_text``'s ``_BOLD``,
+    which carries no flanking guard, so unescaping there would move the recall gate."""
+    run = m.group(2)
+    if run is None:
+        return "\\" + m.group(1)
+    s, i, j = m.string, m.start(2), m.end(2)
+    if (len(run) == 1 and i > 0 and j < len(s)
+            and _WORD_CH.match(s[i - 1]) and _WORD_CH.match(s[j])):
+        return run
+    return "\\" + "\\".join(run)
 
 
 def _esc(text):
@@ -270,7 +292,33 @@ def _esc(text):
     """Backslash-escape inline markdown specials in literal source text."""
     if not text:
         return ""
-    return _MD_SPECIAL.sub(r"\\\1", text.replace("\\", "\\\\"))
+    return _MD_SPECIAL.sub(_esc_special, text.replace("\\", "\\\\"))
+
+
+def _list_indent(cols, depth, marker):
+    # type: (list, int, str) -> str
+    """Indentation for a list item at ``depth``, tracking ancestor CONTENT columns.
+
+    CommonMark nests a child item only when it is indented to at least its parent's
+    **content column** — the column after the parent's marker and the space following
+    it. That is 2 for ``- `` but **3** for ``1. ``, so a fixed two-space indent
+    silently flattens every nested ORDERED list: the parent item closes and the child
+    renders as its sibling, RENUMBERING the procedure from that point on. A converted
+    runbook then instructs a different action for every step after the first sub-step,
+    and no gate can object — indentation is not a token.
+
+    ``cols[i]`` is the content column produced by level ``i``. A shallower item closes
+    every level below it. An item deeper than anything actually emitted — the source
+    skipped a level, or a paragraph closed the list and the next item is still marked
+    as a sub-item — is CLAMPED to the deepest open level rather than indented on
+    faith: markdown cannot express a child of a parent that is not there, and an
+    invented indent of four or more spaces would silently become a code block."""
+    if depth > len(cols):
+        depth = len(cols)
+    del cols[depth:]                              # a shallower item closes deeper levels
+    indent = cols[-1] if cols else 0
+    cols.append(indent + len(marker) + 1)
+    return " " * indent
 
 
 def _esc_lead(text):
@@ -636,16 +684,23 @@ def _docx_table_rows_md(tbl, links, boxes, images=None):
     return rows
 
 
-def _docx_blocks(el, styles, numbering, links, blocks, img=None):
-    # type: (object, dict, dict, dict, list, object) -> None
+def _docx_blocks(el, styles, numbering, links, blocks, img=None, lst=None):
+    # type: (object, dict, dict, dict, list, object, dict) -> None
     """Walk any element emitting (kind, markdown) blocks for each w:p / w:tbl.
 
     Recurses through wrappers (w:sdt content controls, bookmarks) so TOC fields
     and content-control bodies are never silently skipped. ``img`` is ``None``
     (legacy: no image emission, byte-identical) or ``{"rels": {rId: media_part}}``,
     in which case each embedded picture emits an ``("img", sentinel)`` block at its
-    position (a paragraph's images right after its text; a table's after the table)."""
+    position (a paragraph's images right after its text; a table's after the table).
+
+    ``lst`` carries the open list's ancestor content columns across the recursion (see
+    ``_list_indent``); any non-list block closes the list, exactly as a blank line does
+    in the rendered markdown, so the next item restarts at column 0."""
     rels = img["rels"] if img is not None else None
+    if lst is None:
+        lst = {"cols": [], "num": None}
+    cols = lst["cols"]
     for ch in el:
         loc = _local(ch.tag)
         if loc in _SKIP_LOCALS:
@@ -663,21 +718,31 @@ def _docx_blocks(el, styles, numbering, links, blocks, img=None):
                     except ValueError:
                         level = None
                 if level:
+                    del cols[:]
+                    lst["num"] = None
                     blocks.append(("h", "#" * min(level, 6) + " " + _esc_lead(text)))
                 elif num_id and num_id != "0":
                     fmt = numbering.get((num_id, ilvl or "0"), "bullet")
                     marker = "-" if fmt == "bullet" else "1."
                     try:
-                        indent = "  " * int(ilvl or "0")
+                        depth = int(ilvl or "0")
                     except ValueError:
-                        indent = ""
-                    blocks.append(("li", indent + marker + " " + text))
+                        depth = 0
+                    if lst["num"] != num_id:      # a different list: no shared ancestry
+                        del cols[:]
+                        lst["num"] = num_id
+                    blocks.append(("li", _list_indent(cols, depth, marker)
+                                   + marker + " " + text))
                 else:
+                    del cols[:]
+                    lst["num"] = None
                     blocks.append(("p", _esc_lead(text)))
             if images:
                 _emit_image_blocks(images, rels, blocks)
+                del cols[:]                       # a column-0 sentinel closes the list
+                lst["num"] = None
             for box in boxes:
-                _docx_blocks(box, styles, numbering, links, blocks, img)
+                _docx_blocks(box, styles, numbering, links, blocks, img, lst)
         elif loc == "tbl":
             # A 1x1 table is Word LAYOUT scaffolding (a framed section), not data:
             # unwrap the lone cell into normal body blocks instead of emitting a
@@ -691,19 +756,23 @@ def _docx_blocks(el, styles, numbering, links, blocks, img=None):
                 if len(tcs) == 1:
                     single = tcs[0]
             if single is not None:
-                _docx_blocks(single, styles, numbering, links, blocks, img)
+                _docx_blocks(single, styles, numbering, links, blocks, img, lst)
                 continue
             boxes = []
             images = [] if rels is not None else None
             table = _gfm_table(_docx_table_rows_md(ch, links, boxes, images))
             if table:
+                del cols[:]
+                lst["num"] = None
                 blocks.append(("table", table))
             if images:
                 _emit_image_blocks(images, rels, blocks)
+                del cols[:]
+                lst["num"] = None
             for box in boxes:
-                _docx_blocks(box, styles, numbering, links, blocks, img)
+                _docx_blocks(box, styles, numbering, links, blocks, img, lst)
         else:
-            _docx_blocks(ch, styles, numbering, links, blocks, img)
+            _docx_blocks(ch, styles, numbering, links, blocks, img, lst)
 
 
 def _docx_notes_section(xml, title):
@@ -796,6 +865,50 @@ def docx_source_text(parts):
         elif _DOCX_CHART.match(name):
             chunks.append(_chart_text(parts[name]))
     return _WS.sub(" ", " ".join(c for c in chunks if c)).strip()
+
+
+# Page furniture at PART granularity: word header/footer parts are the one
+# unambiguous case (see _media.py, which uses the same rule to classify chrome
+# images). pptx footer/slide-number placeholders are placeholder-scoped, not
+# part-scoped, and are therefore NOT claimed here rather than guessed at.
+_HEADER_FOOTER_PART = re.compile(r"^word/(header|footer)\d*\.xml$")
+
+
+def furniture_drops(parts):
+    # type: (dict) -> list
+    """Named, MEASURED warnings for text-bearing page furniture dropped by policy.
+
+    ``docs/end-goal.md`` §1 permits dropping running headers/footers — repeated onto
+    every page, they would pollute the markdown and any RAG index built on it — but
+    only when the drop is "deliberate and visible, never an accident". The converter
+    simply never walks these parts, so without this a dropped ``Confidential`` banner
+    is indistinguishable from a document that never had one: the report said
+    ``warnings: []``. ``output-contract.md`` has named the ``dropped_headers_footers``
+    code all along; nothing emitted it.
+
+    ``parts`` is ``{part_name: xml}`` holding furniture parts only — the converter's
+    own ``parts`` mapping never contains them. Text is measured with the same
+    ``_text_of`` walk the converter-blind ground truth uses, so ``chars`` is
+    comparable to ``content.chars``. A header with no text dropped nothing and is not
+    reported; the warning never degrades ``status``, because a policy drop is not a
+    defect."""
+    names, chars = [], 0
+    for name in sorted(parts):
+        if not _HEADER_FOOTER_PART.match(name):
+            continue
+        root = _root(parts[name])
+        if root is None:
+            continue
+        text = _text_of(root, value_locals=("t", "text"))
+        if text:
+            names.append(name.split("/")[-1])
+            chars += len(text)
+    if not names:
+        return []
+    return [{"code": "dropped_headers_footers",
+             "detail": "%d text-bearing part(s) dropped as page furniture (%s); "
+                       "%d char(s)" % (len(names), ", ".join(names), chars),
+             "parts": len(names), "chars": chars}]
 
 
 # --------------------------------------------------------------------------- pptx

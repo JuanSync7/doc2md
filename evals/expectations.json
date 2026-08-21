@@ -12,6 +12,9 @@
   "max_depth": 4,
   "images_gate": "pass",
   "images_referenced": 3,
+  "warning_codes": [
+   "dropped_headers_footers"
+  ],
   "warning_codes_absent": [
    "libreoffice_preconvert",
    "image_bytes_missing",
@@ -20,14 +23,15 @@
   "md_contains": [
    "# 1 Introduction",
    "#### 2.1.1.1 Timing budget",
-   "ClkGateCtrl\\_enable\\_sync",
+   "ClkGateCtrl_enable_sync",
    "ClkGateCtrl block (base 0x4000)",
    "DmaArbiterUnit block (base 0x5000)",
    "DmaArbiterUnit owns quality-of-service",
-   "clk\\_ref\\_sel",
-   "\\<rst\\_n>",
+   "clk_ref_sel",
+   "\\<rst_n>",
    "\\*not\\* latched during scan | test modes",
    "  - Chapter 4: clocks and resets",
+   "1. Wait for the lock counter to saturate.\n   1. Poll PllLockMon_status_q until it reads one.\n1. Release the downstream gates.",
    "1. Program the feedback divider."
   ],
   "md_min_count": {
@@ -83,7 +87,7 @@
    "## RegisterMap",
    "## PowerBudget",
    "## Notes",
-   "| ClkGateCtrl\\_enable\\_sync | 0x4000 | 32 | 0 | RW | TRUE | 2026-01-05 | 1.0 |",
+   "| ClkGateCtrl_enable_sync | 0x4000 | 32 | 0 | RW | TRUE | 2026-01-05 | 1.0 |",
    "Kestrel power budget (mW)",
    "412.5",
    "0.125",
@@ -137,7 +141,7 @@
   ],
   "md_contains": [
    "# 1 Introduction",
-   "ClkGateCtrl\\_enable\\_sync",
+   "ClkGateCtrl_enable_sync",
    "ClkGateCtrl block (base 0x4000)"
   ],
   "structure_links_contains": [
@@ -161,7 +165,7 @@
   ],
   "md_contains": [
    "# 1 Introduction",
-   "ClkGateCtrl\\_enable\\_sync"
+   "ClkGateCtrl_enable_sync"
   ]
  },
  "legacy/kestrel-clock-spec.odt": {
@@ -177,7 +181,7 @@
   ],
   "md_contains": [
    "# 1 Introduction",
-   "ClkGateCtrl\\_enable\\_sync",
+   "ClkGateCtrl_enable_sync",
    "#### 2.1.1.1 Timing budget"
   ]
  },

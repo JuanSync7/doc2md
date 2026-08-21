@@ -337,7 +337,8 @@ def main(argv=None):
     ap.add_argument("--text-out",
                     default=os.path.join(_REPO, "data", "eval_bundles_text"),
                     help="text-lane output dir (default data/eval_bundles_text)")
-    ap.add_argument("--expectations", default=EXPECTATIONS)
+    ap.add_argument("--expectations", default=EXPECTATIONS,
+                    help="expectations file (default evals/expectations.json)")
     ap.add_argument("--regen", action="store_true",
                     help="regenerate the corpus even if it exists")
     ap.add_argument("--skip-pdf", action="store_true",

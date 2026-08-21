@@ -35,6 +35,7 @@ One directory per document, keyed by a stable `doc_id`:
   document.md        # markdown + YAML frontmatter (the source ↔ markdown map)
   structure.json     # heading outline + token counts + image↔markdown map (+ captions if enriched)
   report.json        # validator-only losslessness + QA metrics (NO LLM)
+  knowledge.json     # extracted graph payload — only once enrichment has run
   images/            # extracted pixels, content-addressed by image_id (<sha16>.<ext>)
     219f951a5046d997.png
     …
@@ -51,14 +52,21 @@ a logo or diagram reused across pages is stored once and every occurrence links 
 **Both lanes emit this identical shape.** An Office bundle and a PDF bundle are
 interchangeable to a consumer; only `report.losslessness` reveals the lane.
 
-Optional corpus-level index (object-store friendly): a `manifest.jsonl`, one line
-per document `{doc_id, source_relpath, lane, status, markdown_sha256}` — an index,
-not a source of truth; every fact in it also lives in the bundle.
+Corpus-level **run log** (object-store friendly): `manifest.jsonl`, one line per
+document **per run** — `{doc_id, source_relpath, lane, status, markdown_sha256,
+source_sha256, error, run_id, ts, action}` — beside `runs.jsonl`, one line per run
+carrying the full `run{}` block, the counts and a `corpus_sha256`. Still an index,
+not a source of truth; every fact in it also lives in the bundle. It logs skips and
+deferrals too: a run that writes no row for a document it decided not to rebuild
+makes the number of runs unrecoverable from disk, which is what stopped the earlier
+manifest being a log of anything.
 
 ## `document.md` frontmatter
 
 Self-describing per file — this **is** the document↔markdown mapping (no external
-lookup needed):
+lookup needed). Note the scope: the SOURCE mapping and the descriptors are complete
+here; the extracted knowledge is not, and lives in `knowledge.json` beside it, which
+carries its own copy of the join keys for the same reason.
 
 ```yaml
 ---
@@ -74,8 +82,49 @@ structure: structure.json
 report: report.json
 images: images/
 generated_run: <run-id>             # stamped by the caller, never Date.now() in-lib
+
+# Source core properties, flattened under a `source_` prefix so they can never
+# collide with a pipeline key. Only the fields the source actually declares are
+# emitted — an absent one is omitted, never written empty.
+source_title: Kestrel Radar Spec
+source_author: N. Engineer
+source_version: "3"
+source_created: 2026-03-04T09:12:00Z
+source_modified: 2026-05-19T16:40:00Z
+source_last_modified_by: N. Engineer
+source_company: Nimbus Semiconductor
+source_app_version: "16.0000"
 ---
 ```
+
+Every value is rendered double-quoted, and the block is emitted and parsed by one
+codec (`backend.ingest.render_front_matter` / `split_front_matter`). Two invariants
+hold for anything written here: **no line is ever exactly `---`** (three separate
+strippers locate the closing fence by scanning for that line) and **no raw control
+character is emitted** (the validator raises a hard `bad-chars` error for those even
+inside front matter). Quoting every string is also what makes the block safe to read
+with a YAML 1.1 parser, which would otherwise retype an unquoted `no`, `on` or
+`0644`.
+
+### The `meta` block
+
+A converted document may additionally carry a `meta:` mapping holding the tiered
+document **descriptors** — identity, classification, tags, audience, ownership —
+governed by a controlled vocabulary. It is nested under one key precisely so the
+enrichment stage can rewrite its own block wholesale without touching a pipeline key,
+and so a `title` can never collide with `source_title`.
+
+The graph-shaped half of that metadata (entities, relations, decisions, risks,
+open_questions, links) lives in [`knowledge.json`](#knowledgejson--the-extracted-graph-payload)
+instead — see there for the seam and why it is drawn where it is.
+
+Because `markdown_sha256` covers the **body only** and every line index is
+body-relative, the `meta` block can be added, rewritten or reordered after
+conversion without invalidating a hash, a span or an image index. That is what makes
+metadata backfillable without re-converting a corpus.
+
+The tiers, the vocabulary and who may write each field are specified in
+[`document-metadata.md`](document-metadata.md).
 
 ## `structure.json` — the document outline
 
@@ -179,6 +228,8 @@ enough metrics for a dashboard to triage without opening the markdown.
   "converter": "doc2md-ooxml/0.1.0",
   "generated_run": "20260710T120000Z",   // run provenance (a failed doc's ONLY artifact
                                          //   is report.json, so it lives here too)
+  "run": { /* what this run WAS -- see below */ },
+  "decisions": [ /* what it CHOSE -- see below */ ],
   "source_sha256": "…",
   "markdown_sha256": "…",
   "status": "ok",                        // ok | degraded | failed
@@ -250,6 +301,18 @@ enough metrics for a dashboard to triage without opening the markdown.
     "model": "qwen2.5-vl-7b", "prompt_sha": "cb1255a7f554",
     "gate": "complete"                   // disabled | pending | incomplete | complete
   },
+  "doc_meta": {                          // OVERLAY coverage gate (metadata enrichment):
+    "enabled": true,                     // a model was reachable this run
+    "schema_version": 2, "vocab_version": 1,   // field inventory / term list revisions
+                                         // v2 = descriptors here, knowledge in knowledge.json
+    "expected": 20,                      // counted over the MERGED view: 6 of these
+                                         // fields live in knowledge.json, not here
+    "filled": 14,                        // fields with a valid value
+    "authored": 2, "invalid": 0,         // written by a PERSON / present but off-vocabulary
+    "pending": 6,                        // still empty — backfillable without re-converting
+    "model": "qwen2.5-vl-7b", "prompt_sha": "b4f8b3ac61a5",
+    "gate": "incomplete"                 // disabled | pending | incomplete | complete
+  },
   "timing_ms": { "convert": 812, "validate": 143 }
 }
 ```
@@ -258,7 +321,24 @@ Fields beyond the raw lossless flag, and why they earn their place:
 
 - `markdown_sha256` — determinism check + cache key; a re-run that changes it is a
   regression to investigate.
-- `converter` version — provenance/reproducibility.
+- `converter` version — provenance/reproducibility. **Derived**
+  (`doc2md-<lane>/<version>+<commit7>`, `.dirty` when the checkout had uncommitted
+  changes), never a literal: a frozen stamp meant that when a real converter bug was
+  found, nothing on disk said which bundles came from the broken code.
+- `run{}` — **what this run was**: the entrypoint, the run id, the `argv` that was
+  used (path values redacted to `<src>`/`<out>` — the root `CLAUDE.md` forbids an
+  absolute host path in published output), a `source_root_id`, the code identity, the
+  interpreter and platform, the external tool versions, and a `config_ref` naming
+  where the resolved configuration lives. The full configuration is stored once per
+  run in `runs.jsonl` rather than duplicated into every bundle; the omission is
+  named, not silent. `scripts/replay_run.py` reconstructs the command from this block
+  and reports every divergence before running anything.
+- `decisions[]` — **what this run chose**: `{code, chose, reason, evidence}` for the
+  lane, the tokenizer, an OCR route, a text-layer fallback, a cache hit, a coerced
+  gate, an empty source. `warnings[]` carries PROBLEMS; a choice is not a problem,
+  and mixing the two makes "how many documents took the fallback" a grep through
+  prose instead of a count. The code list is closed, so an unnamed decision cannot
+  quietly become a category of one.
 - `savings{}` — the measured exchange rate of the conversion: how many chars of raw
   source representation each markdown char replaced. The source side is the
   decompressed size of every XML part the converter actually parsed (returned by
@@ -300,6 +380,16 @@ Fields beyond the raw lossless flag, and why they earn their place:
   `disabled` (captioning off), `pending` (built, never run), `incomplete` (a run left
   images uncaptioned — re-run when the VLM is up), or `complete` (every expected image
   reached a terminal verdict). This is the caption-coverage analogue of the recall gate.
+- `doc_meta{}` — the same overlay shape for document-level metadata enrichment, kept
+  just as separate from `status`: a lossless document must not read as degraded merely
+  because no model has classified it yet. `expected` counts model-writable fields — the
+  denominator is the SCHEMA, not what a run attempted, so a skipped field reports as
+  pending instead of quietly shrinking the target. One deliberate difference from
+  `captions{}`: a non-zero `invalid` keeps the gate off `complete`, because a value
+  outside a closed vocabulary is worse than an absent one — it silently becomes a new
+  term for everything that groups by that field. The values themselves live in
+  `document.md`; only the gate over them lives here. See
+  [`document-metadata.md`](document-metadata.md).
 - `warnings[]` — every deliberate drop (headers/footers, tracked deletions,
   `mc:Fallback`), every fallback (LibreOffice pre-convert, OCR pages), and every image
   hygiene event (`image_bytes_missing`, `orphan_images_removed`, `images_not_in_outline`)
@@ -312,6 +402,72 @@ Fields beyond the raw lossless flag, and why they earn their place:
   under the explained-gap model; degrades status), `image_inline_bailed`
   (placeholder/picture count mismatch: positional binding unsafe, no pixels written —
   a detected, gated loss, never a mis-bound figure).
+
+## `knowledge.json` — the extracted graph payload
+
+Written by `scripts/enrich_metadata.py`, never by the bundle writer. A bundle that has
+not been enriched simply does not have one — the same way it has no captions until the
+captioning stage runs.
+
+```json
+{
+  "doc_id": "mem-spec",
+  "id": "memory-controller-design-spec",
+  "uid": "specs/mem",
+  "schema_version": 2,
+  "vocab_version": 1,
+  "markdown_sha256": "…",
+
+  "entities":       { "hosts": [ … ], "software": [ … ] },
+  "relations":      [ { "s": "arbiter", "p": "requires", "o": "ddr-phy" } ],
+  "decisions":      [ … ],
+  "risks":          [ … ],
+  "open_questions": [ … ],
+  "links":          { "internal": [ … ] },
+  "_provenance":    { "relations": { "tier": 2, "source": "generated", … } }
+}
+```
+
+**Why this is a file and not front matter.** The metadata a document carries is two
+different things wearing one name. *Descriptors* — `id`, `title`, `type`, `tags`,
+`status`, `owner` — describe the document, are small and bounded, are what retrieval
+filters on, and are what markdown tooling reads for free; they stay in
+`document.md`. *Knowledge* — entities, relations, decisions, risks, links —
+describes the world the document talks about, is unbounded, and is consumed by a
+graph loader that never wants the prose. Measured on a real enriched document, the
+knowledge payload was ~19k characters against ~3.5k of descriptors, roughly **5:1**:
+leaving it in front matter makes every consumer that only wants the body pay for a
+relation table it will discard. `structure.json` and `report.json` already set the
+precedent — in this bundle every derived, machine-consumed artefact is a sibling JSON
+file, and this was the only one that was not.
+
+**The seam is mechanical**, so it cannot drift into a matter of taste: a field lives
+in `knowledge.json` iff it is a `records`/`groups` field **and** is not
+`authored_only`. The carve-out matters — `accountable_roles` is a record list, but it
+is a statement about who stands behind the document, so it belongs with the document.
+A `<field>_proposed` slot always follows its field, so promotion evidence never ends
+up in a different file from the values it is evidence about.
+
+**Self-contained.** The header repeats `doc_id`, `id`, `uid`, the two versions and
+`markdown_sha256`, so a graph loader never has to open `document.md` at all — the same
+property `structure.json` has, and the reason the split is worth doing rather than
+merely tidier. `_provenance` splits with its fields, so neither file is a fragment
+that must be joined before it can be read.
+
+**One view for everything that reads it.** The layout is confined to
+`backend.kb._schema` (`in_knowledge`, `split_meta`, `merge_meta`,
+`knowledge_document`, `knowledge_payload`, `meta_collisions`); the scripts only do the
+disk touch. The linter and the enricher work on a single merged mapping, so no rule in
+`backend.kb` has to care. A field present in BOTH files is an ERROR (`meta_collisions`)
+rather than a silent merge — the loser would be rewritten away by the next run. `kb_lint` still tells a person
+which file a finding belongs to (`knowledge.json:relations[1].p`), because otherwise
+the split trades a token cost for a scavenger hunt.
+
+**Absent vs unreadable are different states.** No file means "not enriched yet". A
+file that exists but will not parse is an ERROR that stops the document being written
+— treating it as "no knowledge yet" would let the next run regenerate over entities
+and relations a person corrected by hand, which is exactly what *authored always wins*
+exists to prevent.
 
 ## The lane asymmetry (stated once, honestly)
 
@@ -336,6 +492,8 @@ layer is used and recorded).
 The bundle shape is identical so consumers are lane-agnostic; the *report* never
 pretends PDF conversion is provably lossless when it structurally cannot be. See
 [`ooxml-lane.md`](ooxml-lane.md) for the Office gate and
+[`document-metadata.md`](document-metadata.md) for the metadata tiers and the
+controlled vocabulary, and
 [`image-captioning.md`](image-captioning.md) for the captioning stage that
 populates `structure.json` image captions.
 
@@ -377,3 +535,12 @@ populates `structure.json` image captions.
      `build_bundle --force` rebuild **carries unchanged images' captions forward** (by
      `image_id`), so it never destroys prior enrichment; only new/changed images need the
      (cache-fast) caption pass re-run.
+4. **Document metadata (done)** — `scripts/enrich_metadata.py` writes the `meta` block
+   into each `document.md`'s front matter and the `doc_meta` gate into `report.json`, and
+   `scripts/kb_lint.py` grades a whole corpus against the controlled vocabulary. The
+   second detachable overlay, and it follows the caption stage's shape deliberately: the
+   body is never touched, a model outage leaves fields PENDING, and answers are cached on
+   content + model + prompt + vocabulary version. What it adds is **governance** — values
+   come from a closed vocabulary or a promotion-gated registry, a model may not write an
+   accountability field at all, and an authored value is never overwritten. See
+   [`document-metadata.md`](document-metadata.md).

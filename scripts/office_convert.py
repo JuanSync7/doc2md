@@ -51,7 +51,7 @@ from backend.ingest import (  # noqa: E402
     supported_formats,
     ROUTE_OOXML, ROUTE_LIBREOFFICE, ROUTE_DOCLING, ROUTE_FENCE, ROUTE_PASSTHROUGH,
     ooxml_markdown, ooxml_source_text, core_properties, front_matter,
-    OOXML_MAIN_PARTS, load_source_root, load_ingest_config)
+    OOXML_MAIN_PARTS, load_source_root, load_ingest_config, furniture_drops)
 from backend.validate import conversion_report  # noqa: E402  (the validator layer)
 
 COV_NAME = "_coverage_ooxml.jsonl"
@@ -194,8 +194,8 @@ def plan(sources, out_dir):
     return rows
 
 
-def load_parts(row, soffice="", want_media=False):
-    # type: (dict, str, bool) -> tuple
+def load_parts(row, soffice="", want_media=False, furniture_out=None):
+    # type: (dict, str, bool, dict) -> tuple
     """``(parts, media, eff_ext, error)`` for one row — the single reader both the
     convert and validate paths use.
 
@@ -205,7 +205,10 @@ def load_parts(row, soffice="", want_media=False):
     (``libreoffice-unavailable`` / ``libreoffice-convert-failed``). ``media`` is
     ``{media_part: bytes}`` when ``want_media`` (read from the SAME effective source,
     incl. a legacy temp before cleanup), else ``{}`` — so the bundle writer's image
-    extraction reads the exact bytes the converter's sentinels point at."""
+    extraction reads the exact bytes the converter's sentinels point at.
+    ``furniture_out``, when given, is filled with the dropped page-furniture parts
+    (read from that same effective source, so a soffice-produced header is measured
+    before the temp tree is removed)."""
     if row.get("lane") == ROUTE_LIBREOFFICE:
         target = _LO_TARGET.get(row["ext"])
         if not target:
@@ -217,18 +220,28 @@ def load_parts(row, soffice="", want_media=False):
             return {}, {}, "", "libreoffice-convert-failed"
         try:
             media = read_media(produced) if want_media else {}
-            return read_parts(produced, target), media, target, ""
+            return read_parts(produced, target, furniture_out), media, target, ""
         finally:
             shutil.rmtree(os.path.dirname(produced), ignore_errors=True)
     media = read_media(row["src"]) if want_media else {}
-    return read_parts(row["src"], row["ext"]), media, row["ext"], ""
+    return read_parts(row["src"], row["ext"], furniture_out), media, row["ext"], ""
 
 
-def read_parts(path, ext):
-    # type: (str, str) -> dict
+# Page-furniture parts the converter never walks. Read ONLY to measure what the
+# policy drop cost (backend.ingest.furniture_drops decides what is reportable) —
+# they are kept out of ``parts`` so neither the converter nor the converter-blind
+# ground truth can ever see them, which is what keeps the drop symmetric.
+_FURNITURE_READ = re.compile(r"^word/(header|footer)\d*\.xml$")
+
+
+def read_parts(path, ext, furniture_out=None):
+    # type: (str, str, dict) -> dict
     """The converter's input: {part_name: xml_text} for this format's main parts.
 
-    A malformed/unreadable zip returns {} (the caller records the failure)."""
+    A malformed/unreadable zip returns {} (the caller records the failure). When
+    ``furniture_out`` is a dict it is filled in place with the dropped page-furniture
+    parts, so a deliberate drop can be reported with a measured size instead of
+    silently looking like a document that never had a header."""
     pats = [re.compile(p) for p in OOXML_MAIN_PARTS.get(ext, ())]
     parts = {}
     try:
@@ -236,6 +249,8 @@ def read_parts(path, ext):
             for name in zf.namelist():
                 if any(p.match(name) for p in pats):
                     parts[name] = zf.read(name).decode("utf-8", "replace")
+                elif furniture_out is not None and _FURNITURE_READ.match(name):
+                    furniture_out[name] = zf.read(name).decode("utf-8", "replace")
     except (zipfile.BadZipFile, OSError, KeyError):
         return {}
     return parts
@@ -341,7 +356,12 @@ def bundle_inputs(row, soffice="", emit_images=False):
                     "eff_ext": row.get("ext", ""), "media": {}, "source_repr_chars": 0}
     except OSError:
         pass
-    parts, media, eff_ext, err = load_parts(row, soffice, want_media=emit_images)
+    furniture = {}                                       # type: dict
+    parts, media, eff_ext, err = load_parts(row, soffice, want_media=emit_images,
+                                            furniture_out=furniture)
+    # Every deliberate drop is NAMED (end-goal.md §1): running headers/footers are
+    # correctly excluded, but "excluded" must not read the same as "absent".
+    warnings.extend(furniture_drops(furniture))
     if row.get("lane") == ROUTE_LIBREOFFICE and not err:
         # Provenance for the one external binary in the lane: name its version.
         ver = soffice_version(soffice)
