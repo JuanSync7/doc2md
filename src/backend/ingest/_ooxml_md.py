@@ -1195,16 +1195,37 @@ def _p_style_info(p):
     return sid, num_id, ilvl, outline
 
 
+# ECMA-376 Part 1 §17.3.1.20 (w:outlineLvl) restricts the value to 0..9, and the
+# two ends of that range do not mean the same KIND of thing. 0..8 are the nine
+# outline levels a heading can sit at — "Level 1".."Level 9", rendered h1..h9 —
+# while 9 is the value Word writes for **Body Text**: the paragraph's explicit
+# statement that it is NOT in the outline at all. So the range is not a bound to
+# clamp, it is a range with a sentinel on the end, and 9 has to fall out of the
+# heading branch entirely rather than be treated as the deepest heading.
+_OUTLINE_BODY_TEXT = 9
+
+
 def _heading_level(sid, outline, levels):
     # type: (str, str, dict) -> object
     """The markdown heading level a paragraph renders at, or ``None``: its style's
-    level, else an explicit ``w:outlineLvl`` on the paragraph itself."""
+    level, else an explicit ``w:outlineLvl`` on the paragraph itself.
+
+    An unbounded ``int(outline) + 1`` turned ``w:outlineLvl w:val="9"`` — "this is
+    body text" — into a level 10, which ``_add_heading``'s ``min(level, 6)`` then
+    rendered as ``###### Ordinary body prose.``. Every paragraph in a document
+    whose author had once ticked "Body Text" became a heading, the outline in
+    ``structure.json`` reparented the sections under it, and (because the ground
+    truth read the same value the same wrong way) both sides agreed and the gate
+    stayed green. The style path has always bounded this correctly; the paragraph
+    path had the bound missing, not different."""
     level = levels.get(sid)
     if level is None and outline:
         try:
-            level = int(outline) + 1
+            declared = int(outline)
         except ValueError:
-            level = None
+            return None
+        if 0 <= declared < _OUTLINE_BODY_TEXT:
+            level = declared + 1
     return level
 
 
@@ -1439,7 +1460,12 @@ def _docx_table_rows_md(tbl, links, boxes, images=None, sty=None):
     continuation cells are empty in OOXML, so this adds no tokens the source lacks
     (recall stays 1.0) and makes each row self-contained for row-wise chunking.
     Only true merge-continuations are filled: an ordinary empty cell stays empty,
-    and a (malformed) continuation carrying its own text keeps it, never dropped."""
+    and a (malformed) continuation carrying its own text keeps it, never dropped.
+
+    ``w:tcPrChange`` is a stop for the geometry scans for the same reason
+    ``w:trPrChange`` is skipped above: it holds the cell properties a tracked change
+    REPLACED, so reading through it resurrects the grid the author already edited
+    away and shifts every value in the row into the wrong column."""
     rows = []
     trs = []  # type: list
     _find_locals(tbl, ("tr",), trs, stop=("tc", "p", "tblPr", "tblGrid"))
@@ -1453,14 +1479,14 @@ def _docx_table_rows_md(tbl, links, boxes, images=None, sty=None):
         for tc in tcs:
             span = 1
             spans = []  # type: list
-            _find_locals(tc, ("gridSpan",), spans, stop=("p", "tbl"))
+            _find_locals(tc, ("gridSpan",), spans, stop=("p", "tbl", "tcPrChange"))
             if spans:
                 try:
                     span = max(1, int(_attr(spans[0], "val")))
                 except ValueError:
                     span = 1
             vmerges = []  # type: list
-            _find_locals(tc, ("vMerge",), vmerges, stop=("p", "tbl"))
+            _find_locals(tc, ("vMerge",), vmerges, stop=("p", "tbl", "tcPrChange"))
             text = _docx_cell_text(tc, links, boxes, images, sty)
             if vmerges and _attr(vmerges[0], "val") != "restart":
                 if not text:                       # continuation: repeat the value above

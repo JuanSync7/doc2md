@@ -387,6 +387,110 @@ def test_a_nested_table_is_flattened_into_its_cell_not_counted_again():
     assert tables[0]["cells"][1][1] == ("k", "v", "x", "y")
 
 
+def test_a_nested_tables_grid_span_is_not_the_outer_cells():
+    # The property scan used to be a flat tc.iter(), which walks straight through
+    # the nested w:tbl the owning cell flattens. An ordinary 2x2 table whose last
+    # cell holds a nested table with gridSpan=3 was reported FOUR columns wide
+    # against a markdown that correctly showed two, so a faithful conversion
+    # hard-failed the fidelity gate and could not publish.
+    inner = ('<w:tbl><w:tr><w:tc><w:tcPr><w:gridSpan w:val="3"/></w:tcPr>%s</w:tc>'
+             '</w:tr></w:tbl>' % _p(_run("x")))
+    body = ('<w:tbl><w:tr><w:tc>%s</w:tc><w:tc>%s</w:tc></w:tr>'
+            '<w:tr><w:tc>%s</w:tc><w:tc>%s%s</w:tc></w:tr></w:tbl>'
+            % (_p(_run("A")), _p(_run("B")), _p(_run("C")), _p(_run("D")), inner))
+    table = docx_source_structure(_parts(body))["tables"][0]
+    assert (table["rows"], table["cols"]) == (2, 2)
+    rep, fid, md = _agrees(body)
+    assert rep["recall"] == 1.0 and fid["gate"] == "pass", (md, fid["deltas"])
+
+
+def test_a_nested_tables_vertical_merge_does_not_fill_the_outer_column():
+    # The same unbounded scan read the nested table's w:vMerge, and that is worse
+    # than a wrong width: vMerge forward-fills, so a nested continuation cell put
+    # the value from the row above into an outer cell the document leaves BLANK --
+    # the ground truth asserting content the source does not contain.
+    inner = '<w:tbl><w:tr><w:tc><w:tcPr><w:vMerge/></w:tcPr><w:p/></w:tc></w:tr></w:tbl>'
+    body = ('<w:tbl>'
+            '<w:tr><w:tc>%s</w:tc><w:tc>%s</w:tc></w:tr>'
+            '<w:tr><w:tc><w:tcPr><w:vMerge w:val="restart"/></w:tcPr>%s</w:tc>'
+            '<w:tc>%s</w:tc></w:tr>'
+            '<w:tr><w:tc>%s%s</w:tc><w:tc>%s</w:tc></w:tr></w:tbl>'
+            % (_p(_run("Tier")), _p(_run("Owner")), _p(_run("payments")),
+               _p(_run("rota")), _p(""), inner, _p(_run("standby"))))
+    cells = docx_source_structure(_parts(body))["tables"][0]["cells"]
+    assert cells[2][0] == (), "the outer cell declares no merge, so nothing repeats"
+    rep, fid, md = _agrees(body)
+    assert rep["recall"] == 1.0 and fid["gate"] == "pass", (md, fid["deltas"])
+
+
+def test_an_outer_cells_own_grid_span_and_merge_are_still_read():
+    # The boundary is a boundary, not a blindfold: a cell's own w:tcPr still
+    # carries its geometry when it also owns a nested table.
+    inner = ('<w:tbl><w:tr><w:tc>%s</w:tc></w:tr></w:tbl>' % _p(_run("note")))
+    body = ('<w:tbl>'
+            '<w:tr><w:tc><w:tcPr><w:gridSpan w:val="2"/></w:tcPr>%s%s</w:tc></w:tr>'
+            '<w:tr><w:tc>%s</w:tc><w:tc>%s</w:tc></w:tr></w:tbl>'
+            % (_p(_run("Spanning header")), inner, _p(_run("a")), _p(_run("b"))))
+    table = docx_source_structure(_parts(body))["tables"][0]
+    assert (table["rows"], table["cols"]) == (2, 2)
+    assert table["cells"][0] == (("spanning", "header", "note"), ())
+    rep, fid, md = _agrees(body)
+    assert rep["recall"] == 1.0 and fid["gate"] == "pass", (md, fid["deltas"])
+
+
+def test_the_cell_geometry_a_tracked_change_replaced_is_not_the_live_one():
+    # w:tcPrChange holds the cell properties a revision REPLACED, exactly as
+    # w:pPrChange and w:trPrChange hold theirs. Both sides read the stale
+    # w:gridSpan out of it, so the row rendered one column too wide with every
+    # value pushed right -- and, being the same mistake twice, the gate agreed.
+    stale = ('<w:tc><w:tcPr><w:tcPrChange w:id="1" w:author="a" w:date="x">'
+             '<w:tcPr><w:gridSpan w:val="2"/></w:tcPr></w:tcPrChange></w:tcPr>'
+             '%s</w:tc>' % _p(_run("CTRL")))
+    body = ('<w:tbl><w:tr><w:tc>%s</w:tc><w:tc>%s</w:tc></w:tr>'
+            '<w:tr>%s<w:tc>%s</w:tc></w:tr></w:tbl>'
+            % (_p(_run("Register")), _p(_run("Offset")), stale, _p(_run("0x04"))))
+    table = docx_source_structure(_parts(body))["tables"][0]
+    assert (table["rows"], table["cols"]) == (2, 2)
+    rep, fid, md = _agrees(body)
+    assert "| CTRL | 0x04 |" in md
+    assert rep["recall"] == 1.0 and fid["gate"] == "pass", fid["deltas"]
+
+
+# ------------------------------------ an outline level of 9 says "not a heading"
+
+def _outlined(text, level):
+    return ('<w:p><w:pPr><w:outlineLvl w:val="%s"/></w:pPr>%s</w:p>'
+            % (level, _run(text)))
+
+
+def test_an_outline_level_of_nine_is_body_text_on_both_sides():
+    # w:outlineLvl runs 0..9; 0..8 are outline levels 1..9 and 9 is Word's "Body
+    # Text", the paragraph saying it is NOT in the outline. Both sides read it as
+    # a level 10, the converter published `###### Ordinary body prose.`, and the
+    # ground truth AGREED -- so the gate was blind to prose promoted to a heading.
+    body = _outlined("Ordinary body prose.", "9") + _p(_run("Real Heading"),
+                                                       style="Heading1")
+    facts = docx_source_structure(_parts(body))
+    assert facts["headings"] == {1: 1}
+    assert facts["heading_path"] == [(1, ("real", "heading"))]
+    rep, fid, md = _agrees(body)
+    assert "###### Ordinary body prose." not in md
+    assert rep["recall"] == 1.0 and fid["gate"] == "pass", fid["deltas"]
+
+
+@pytest.mark.parametrize("val,expected", [
+    ("0", {1: 1}), ("5", {6: 1}), ("8", {6: 1}),      # 8 is level 9, clamped to h6
+    ("9", {}), ("10", {}), ("-1", {}), ("body", {}),
+])
+def test_the_outline_bound_is_the_schemas_and_the_two_sides_share_it(val, expected):
+    # The bound must not become a ban: 0..8 stay headings. Out-of-range and
+    # unparseable values are not headings either -- they are not levels at all.
+    body = _outlined("Section", val)
+    assert docx_source_structure(_parts(body))["headings"] == expected
+    md = ooxml_markdown("docx", _parts(body))
+    assert md.strip().startswith("#") is bool(expected)
+
+
 def test_a_table_inside_a_layout_wrapper_is_still_a_table():
     # A 1x1 table is scaffolding that gets unwrapped, so what it wraps is top level.
     inner = ('<w:tbl><w:tr><w:tc>%s</w:tc><w:tc>%s</w:tc></w:tr>'

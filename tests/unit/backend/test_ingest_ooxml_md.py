@@ -107,6 +107,44 @@ def test_docx_headings_from_style_names_and_outline_level():
     assert "\n\nPlain prose.\n" in md or md.endswith("Plain prose.\n")
 
 
+def test_outline_level_nine_is_body_text_and_not_a_tenth_heading():
+    # w:outlineLvl runs 0..9: 0..8 are outline levels 1..9, and 9 is Word's
+    # "Body Text" -- the paragraph stating it is NOT in the outline. Reading it as
+    # a level made level 10, which min(level, 6) then published as an h6, so every
+    # paragraph an author had ever marked Body Text became a heading and the
+    # structure.json outline reparented the real sections underneath it.
+    doc = _wdoc('<w:p><w:pPr><w:outlineLvl w:val="9"/></w:pPr>'
+                '<w:r><w:t>Ordinary body prose.</w:t></w:r></w:p>'
+                + _wp("Real Heading", style="Heading1"))
+    md = docx_markdown({"word/document.xml": doc, "word/styles.xml": STYLES})
+    assert "###### Ordinary body prose." not in md
+    assert "Ordinary body prose." in md and "\n# Real Heading" in md
+    assert md.count("#") == 1
+
+
+def test_outline_level_eight_is_still_the_ninth_heading_level():
+    # The bound is a bound, not a ban: 8 is "Level 9" and stays a heading. A fix
+    # that stopped 9 by refusing every deep outline would be worse than the bug.
+    doc = _wdoc('<w:p><w:pPr><w:outlineLvl w:val="8"/></w:pPr>'
+                '<w:r><w:t>Deepest</w:t></w:r></w:p>')
+    assert "###### Deepest" in docx_markdown({"word/document.xml": doc})
+
+
+def test_the_cell_geometry_a_tracked_change_replaced_is_not_the_live_one():
+    # w:tcPrChange holds the cell properties a revision REPLACED, exactly as
+    # w:pPrChange/w:trPrChange hold theirs. Reading the stale w:gridSpan out of it
+    # widened a two-column row to three and pushed every value one column right --
+    # a plausible table, wrong in every row.
+    stale = ('<w:tc><w:tcPr><w:tcPrChange w:id="1" w:author="a" w:date="x">'
+             '<w:tcPr><w:gridSpan w:val="2"/></w:tcPr></w:tcPrChange></w:tcPr>'
+             '<w:p><w:r><w:t>CTRL</w:t></w:r></w:p></w:tc>')
+    tbl = ("<w:tbl><w:tr>%s%s</w:tr><w:tr>%s%s</w:tr></w:tbl>"
+           % (_wcell("Register"), _wcell("Offset"), stale, _wcell("0x04")))
+    md = docx_markdown({"word/document.xml": _wdoc(tbl)})
+    assert "| CTRL | 0x04 |" in md
+    assert "| CTRL |  | 0x04 |" not in md
+
+
 def test_docx_split_runs_stay_verbatim():
     doc = _wdoc("<w:p>" + "".join("<w:r><w:t>%s</w:t></w:r>" % s
                                   for s in ("Fo", "oW", "id", "get"))

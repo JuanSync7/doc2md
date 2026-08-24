@@ -46,6 +46,19 @@ prompt, vocabulary version), so a second run makes no request; ``--force`` asks
 again even when nothing is missing, and ``--no-cache`` ignores the stored answer.
 The body is always written back byte-for-byte. Safe to run twice.
 
+Exit codes — what HAPPENED, never what is left to do:
+
+  0  the tiers this run was asked for all ran. A no-model run leaves the whole
+     model tier PENDING and still exits 0: that is a complete deterministic run,
+     and `report.json` agrees (`doc_meta.gate: "disabled"`).
+  1  a document could not be read, parsed, or written.
+  4  a model was ASKED FOR and never answered — the endpoint was unreachable, or
+     it failed on document after document. The artifacts are the same ones a
+     deterministic run writes (pending, never guessed, re-runnable); the
+     difference is that nobody chose this, so it is not a success. Re-run when
+     the endpoint is up.
+  3  with `--fail-on-pending` only: work is outstanding.
+
 Usage:
   python3 scripts/enrich_metadata.py --bundles data/bundles              # no model: tiers 0+1
   python3 scripts/enrich_metadata.py --bundles data/bundles --vlm-url http://127.0.0.1:21717/v1/chat/completions
@@ -370,6 +383,41 @@ def _blank(value):
     return value is None or value == "" or value == [] or value == {}
 
 
+def _prov_block(meta):
+    # type: (dict) -> dict
+    """The ``_provenance`` block as a MAPPING, whatever is stored under that key.
+
+    A hand-edited ``_provenance: generated`` is a state the pipeline is designed to
+    survive: ``backend.kb.split_meta``/``merge_meta`` carry it through verbatim and
+    ``kb_lint`` reports it as ``provenance-malformed``. This script is transport, so
+    it must not be the stage that CRASHES on the one document the linter merely
+    describes — that turned a reported finding into a bundle nothing could enrich.
+
+    A block that is not a mapping records no field's origin, and "no origin
+    recorded" already has a fail-safe reading here: ``is_authored`` treats an
+    unidentifiable entry as a person's work, so nothing is overwritten. The block is
+    read as empty, never repaired in place — the one write path
+    (``set_provenance``) replaces it, which is `backend.kb`'s decision, not this
+    script's. It is deliberately a local two-liner rather than an import of a
+    private ``backend.kb`` symbol: the package boundary is the rule, and the two
+    modules answer the same question separately.
+    """
+    block = meta.get(PROVENANCE_KEY)
+    return block if isinstance(block, dict) else OrderedDict()
+
+
+def _prov_entry(meta, key):
+    # type: (dict, str) -> dict
+    """One field's provenance RECORD, empty when it is not a mapping either.
+
+    ``_provenance: {title: generated}`` — a record written as a bare source string —
+    is exactly what ``kb_lint`` reports as "this field's origin is unverifiable",
+    and it crashed here one level below the block itself.
+    """
+    entry = _prov_block(meta).get(key)
+    return entry if isinstance(entry, dict) else OrderedDict()
+
+
 def apply_floor(meta, fm, body, outline, anchors):
     # type: (dict, dict, str, list, set) -> list
     """Fill from evidence the pipeline already has. Returns the field names filled.
@@ -402,7 +450,7 @@ def apply_floor(meta, fm, body, outline, anchors):
     if outline is not None:
         harvested = harvested_links(outline, anchors)
         current = meta.get("links")
-        prov = (meta.get(PROVENANCE_KEY) or {}).get("links")
+        prov = _prov_block(meta).get("links")
         if not is_authored(prov, current):
             merged = merge_group_evidence(harvested, current or {})
             if merged != current:
@@ -625,10 +673,10 @@ def enrich_one(doc_dir, vocab, client, run_id, args, cache, run_doc=None,
     for key, val in existing.items():          # authored/prior values win over derived
         if key == PROVENANCE_KEY:
             continue
-        prior_src = ((existing.get(PROVENANCE_KEY) or {}).get(key) or {}).get("source")
+        prior_src = _prov_entry(existing, key).get("source")
         if key in _ALWAYS_DERIVED:
             continue                           # a run stamp is never inherited
-        prov_entry = ((existing.get(PROVENANCE_KEY) or {}).get(key) or {})
+        prov_entry = _prov_entry(existing, key)
         # A HAND EDIT UNDER A MACHINE STAMP IS STILL A HAND EDIT. Deciding on the
         # provenance LABEL alone reverted every correction an operator made to a
         # field this pipeline had already written — which is every field, in every
@@ -644,7 +692,11 @@ def enrich_one(doc_dir, vocab, client, run_id, args, cache, run_doc=None,
             inherited_det.add(key)
         elif key not in det:
             meta[key] = val
-    meta[PROVENANCE_KEY] = OrderedDict(existing.get(PROVENANCE_KEY) or {})
+    # A malformed block is dropped rather than carried: `OrderedDict("generated")`
+    # raises, and a scalar holds no field's origin to lose. What replaces it is
+    # written below from what this run actually knows, so the next run reads real
+    # records instead of inheriting an unreadable one forever.
+    meta[PROVENANCE_KEY] = OrderedDict(_prov_block(existing))
     for name, source in det_prov.items():
         # WHERE THE STORED VALUE CAME FROM IS THE ONLY THING THAT DECIDES THIS, and
         # it is decided above: a det key is either INHERITED (a person's value won)
@@ -807,8 +859,8 @@ def enrich_one(doc_dir, vocab, client, run_id, args, cache, run_doc=None,
             # det field is re-stamped, would differ on every run and churn
             # document.md forever, which is exactly what the prior-stamp render
             # exists to prevent.
-            entry = (meta.get(PROVENANCE_KEY) or {}).get("extraction")
-            if isinstance(entry, dict) and "value_sha" in entry:
+            entry = _prov_entry(meta, "extraction")
+            if "value_sha" in entry:
                 entry["value_sha"] = value_sha(meta["extraction"])
         front_block, _know = split_meta(order_meta(meta))
         fm[META_KEY] = order_meta(front_block)
@@ -928,6 +980,12 @@ def main(argv=None, client=None):
         ap.error("vocabulary does not declare: %s" % ", ".join(missing_bindings))
     run_id = args.run_id or time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
 
+    # Was a model ASKED FOR? Not the same question as "was one used". A run with no
+    # --vlm-url is deterministic BY CHOICE and is a complete success; a run that
+    # named an endpoint and got nothing from it did not do what it was told, and the
+    # exit code has to be able to tell those two apart.
+    model_requested = bool(args.vlm_url) or client is not None
+    endpoint_down = False
     if client is None and args.vlm_url:
         import vlm_client                       # noqa: E402  (deferred: keeps --help cheap)
         cfg = load_ingest_config()
@@ -939,6 +997,7 @@ def main(argv=None, client=None):
             print("  [model] %s not reachable -> tier-2 fields stay PENDING "
                   "(re-run when up)" % args.vlm_url, file=sys.stderr)
             client = None
+            endpoint_down = True
 
     dirs = sorted(d for d in os.listdir(args.bundles)
                   if os.path.isfile(os.path.join(args.bundles, d, "document.md")))
@@ -1093,6 +1152,31 @@ def main(argv=None, client=None):
     # can opt into failing on, not a failure by default.
     if failed:
         return 1
+    # ...but "the tier ran and left work" and "the tier could not run" are different
+    # answers, and 0 could say both. A run that NAMED an endpoint and got nothing
+    # from it — unreachable at the health check, or answering `ok: false` for
+    # document after document — produced exactly the artifact a deterministic run
+    # produces, and exited 0 beside it: a scheduled backfill against a model that
+    # had been down for a week reported success every night. The artifacts are
+    # right either way (PENDING, never guessed, always re-runnable) — it is the
+    # VERDICT that was wrong, so only the exit code changes.
+    # `endpoint_down and pending` rather than `endpoint_down` alone: a corpus that
+    # is already complete needed nothing from the model, so its absence cost this
+    # run nothing and there is no gap to report. `unavailable` needs no such test —
+    # it is only ever counted for a document this run actually asked about.
+    if model_requested and (unavailable or (endpoint_down and pending)):
+        print("kb-enrich: a model was requested but %s — the tier-2 fields are "
+              "PENDING because nothing answered, not because you asked for a "
+              "deterministic run; re-run when it is up (exit 4)"
+              % ("the endpoint was not reachable" if endpoint_down
+                 else "it answered for none of %d document(s)" % unavailable
+                 if unavailable == len(results)
+                 else "it failed to answer for %d of %d document(s)"
+                      % (unavailable, len(results))), file=sys.stderr)
+        # Ahead of --fail-on-pending's 3 on purpose: when both hold, the model
+        # being down is the CAUSE of the pending fields, and the more specific
+        # answer is the useful one.
+        return 4
     if pending and args.fail_on_pending:
         return 3
     return 0

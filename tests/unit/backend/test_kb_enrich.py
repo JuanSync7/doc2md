@@ -980,3 +980,231 @@ def test_coverage_counts_a_member_that_declares_no_type_as_a_gap_not_an_error(cv
     assert meta_coverage(meta, cvocab)["invalid"] == 0
     meta["relations"] = [{"s": "a", "p": "runs_on", "o": "b", "ref": "#a"}]  # no mode
     assert meta_coverage(meta, cvocab)["invalid"] == 0
+
+
+# ------------------------------------- a malformed `_provenance` is a state, not a crash
+
+_MALFORMED_PROV = {"id": "doc-1", "title": "A Title", "tags": ["linux"],
+                   PROVENANCE_KEY: "generated"}
+
+
+def test_every_entry_point_survives_a_provenance_block_that_is_not_a_mapping(vocab):
+    # `merge_meta` and `split_meta` carry a non-mapping `_provenance` through
+    # VERBATIM on purpose, and the linter reports it as `provenance-malformed`
+    # rather than rejecting the document — so enrichment met it and aborted on the
+    # one document the linter merely describes. Five entry points, all five reading
+    # the same block.
+    meta = copy.deepcopy(_MALFORMED_PROV)
+
+    # 1. accept: nothing to prove a value is machine-written, so every existing
+    #    value is treated as a person's work. FAIL SAFE, not fail open.
+    out = accept_model_meta({"title": "Model's Title"}, vocab, meta)
+    assert "title" not in out["accepted"]
+    assert ("title", "Model's Title", "kept-authored") in out["rejected"]
+
+    # 2. revalidate: nothing is stamped `generated`, so nothing is re-judged...
+    again, moved = revalidate_generated(copy.deepcopy(meta), vocab)
+    assert moved == [] and again["tags"] == ["linux"]
+    # ... and the unreadable block is still there for the linter to report.
+    assert again[PROVENANCE_KEY] == "generated"
+
+    # 3. coverage: counted as filled, with nothing claiming to be authored.
+    cov = meta_coverage(copy.deepcopy(meta), vocab)
+    assert cov["authored"] == 0 and cov["invalid"] == 0
+
+    # 4. order: carried through verbatim, in its canonical last slot.
+    ordered = order_meta(copy.deepcopy(meta))
+    assert list(ordered)[-1] == PROVENANCE_KEY
+    assert ordered[PROVENANCE_KEY] == "generated"
+
+    # 5. set_provenance: a scalar holds no field's origin, so there is nothing to
+    #    preserve — and recording NOTHING would make the next run read this run's
+    #    own value as authored and freeze it forever.
+    written = copy.deepcopy(meta)
+    set_provenance(written, "title", SOURCE_DERIVED)
+    assert written[PROVENANCE_KEY]["title"]["source"] == SOURCE_DERIVED
+
+
+def test_a_well_formed_provenance_block_is_still_read_and_still_mutated(vocab):
+    # The other direction: the guard must not turn every provenance block into an
+    # empty one, which would silently disarm `authored wins` for the whole corpus.
+    meta = {"type": "playbook",
+            PROVENANCE_KEY: {"type": {"source": SOURCE_GENERATED,
+                                      "value_sha": value_sha("playbook")}}}
+    out, moved = revalidate_generated(meta, vocab)
+
+    assert out["type"] == "runbook"                           # alias canonicalised
+    assert ("type", "playbook", "canonicalised") in moved
+    # The live block was updated in place, so the next run does not read the
+    # re-written value as a human edit.
+    assert out[PROVENANCE_KEY]["type"]["value_sha"] == value_sha("runbook")
+
+    authored = {"title": "Mine", PROVENANCE_KEY: {"title": {"source":
+                                                            SOURCE_AUTHORED}}}
+    assert accept_model_meta({"title": "Theirs"}, vocab, authored)["accepted"] == {}
+
+
+# --------------------------------------------------- whitespace is not a value
+
+def test_a_whitespace_only_required_key_is_refused_here_instead_of_erroring_forever(
+        gvocab):
+    # `_lint._empty` strips and this one did not, so a `ref: "  "` passed acceptance,
+    # was stored, and then failed `kb_lint` with `record-uncited` on every run —
+    # accepted by one gate and permanently rejected by the next.
+    # A blank `url`: refused whatever the caller knows about anchors.
+    blank_url = {"links": {"internal": [{"url": "  ", "ref": "#rollback"}]}}
+    out = accept_model_meta(blank_url, gvocab, {}, anchors=ANCHORS)
+    assert "links" not in out["accepted"]
+    assert ("links.internal", {"url": "  ", "ref": "#rollback"},
+            "missing-required-url") in out["rejected"]
+
+    # A blank `ref` with NO anchors supplied — the case `_bad_ref` deliberately
+    # declines to judge, so `_missing_required` is the only gate the record meets.
+    blank_ref = {"links": {"internal": [{"url": "run.md", "ref": "   "}]}}
+    out = accept_model_meta(blank_ref, gvocab, {}, anchors=None)
+    assert "links" not in out["accepted"]
+    assert ("links.internal", {"url": "run.md", "ref": "   "},
+            "missing-required-ref") in out["rejected"]
+
+    # A real ref is still accepted — the rule tightened, it did not close.
+    ok = accept_model_meta({"links": {"internal": [{"url": "run.md",
+                                                    "ref": "#rollback"}]}},
+                           gvocab, {}, anchors=ANCHORS)
+    assert ok["accepted"]["links"]["internal"][0]["ref"] == "#rollback"
+
+
+def test_a_whitespace_only_value_is_pending_rather_than_coverage(vocab):
+    # It is not a value, so it may not count as one — and it may not protect the
+    # field from the model that could fill it either.
+    blank = {"title": "   ", PROVENANCE_KEY: {"title": {"source": SOURCE_DERIVED}}}
+    assert meta_coverage(blank, vocab)["filled"] == 0
+    assert accept_model_meta({"title": "A Real Title"}, vocab,
+                             blank)["accepted"]["title"] == "A Real Title"
+
+
+# ------------------------------------------------------- URL case-sensitivity
+
+def test_two_urls_differing_only_in_path_case_are_two_edges():
+    # RFC 3986 §6.2.2.1: the scheme and host are case-insensitive, the path is not.
+    # `url.lower()` therefore threw away the second of two distinct documents.
+    outline = [{"title": "1. Scope", "anchor": "1-scope", "links": [
+        {"text": "Guide", "url": "https://x.example/Guide", "line": 3},
+        {"text": "guide", "url": "https://x.example/guide", "line": 4},
+        # ... while the two spellings the RFC DOES fold stay one edge, so the
+        # duplicate suppression this dedupe exists for still works.
+        {"text": "again", "url": "HTTPS://X.Example/Guide", "line": 5},
+        {"text": "again", "url": "https://x.example/Guide", "line": 6}]}]
+
+    urls = [r["url"] for r in harvested_links(outline)["ecosystem"]]
+    assert urls == ["https://x.example/Guide", "https://x.example/guide"]
+
+
+def test_a_model_link_is_not_dropped_as_a_duplicate_of_a_different_path(gvocab):
+    # The same rule where a proposal meets the evidence: `_record_identity` lowered
+    # the whole URL, so a model's `/Guide` was discarded as a duplicate of the
+    # harvested `/guide`.
+    harvested = {"ecosystem": [{"url": "https://x.example/guide",
+                                "ref": "#1-scope", EVIDENCE_KEY: SOURCE_EXTRACTED}]}
+    existing = {"links": harvested,
+                PROVENANCE_KEY: {"links": {"source": SOURCE_EXTRACTED,
+                                           "value_sha": value_sha(harvested)}}}
+    proposed = {"links": {"ecosystem": [
+        {"url": "https://x.example/Guide", "ref": "#1-scope"},
+        {"url": "https://x.example/guide", "ref": "#rollback"}]}}
+
+    kept = accept_model_meta(proposed, gvocab, existing,
+                             anchors=ANCHORS)["accepted"]["links"]["ecosystem"]
+
+    assert [r["url"] for r in kept] == ["https://x.example/guide",
+                                        "https://x.example/Guide"]
+    # The measured record keeps its home; only the genuinely new URL joins it.
+    assert record_source(kept[0]) == SOURCE_EXTRACTED
+
+
+# ------------------------------------ the two proposal merges say the same thing
+
+def test_the_two_paths_that_write_a_proposals_slot_agree(vocab):
+    """`_lint` and `_enrich` both fill `<field>_proposed`, and neither may hash it.
+
+    They are written separately on purpose — this pins them to each other by RESULT
+    rather than by an import, which is the only way two implementations of one rule
+    are allowed to agree here.
+    """
+    from backend.kb import normalize_document
+
+    meta = {"tags": ["kafka", {"a": 1}, "kafka"],
+            PROVENANCE_KEY: {"tags": {"source": SOURCE_GENERATED,
+                                      "value_sha": value_sha(
+                                          ["kafka", {"a": 1}, "kafka"])}}}
+    revalidated, _moved = revalidate_generated(copy.deepcopy(meta), vocab)
+    normalised, _changed = normalize_document(copy.deepcopy(meta), vocab)
+
+    assert revalidated[proposed_key("tags")] == normalised[proposed_key("tags")]
+    assert revalidated[proposed_key("tags")] == ["kafka", {"a": 1}]
+
+
+def test_a_provenance_RECORD_that_is_not_a_mapping_is_read_as_no_record(vocab):
+    # One level down from the block, and reachable the same way: `_provenance:
+    # {title: generated}` puts a scalar where the schema declares a record.
+    # `_lint` reports it ("this field's origin is unverifiable"); these two read it.
+    meta = {"title": "T", "tags": ["linux"],
+            PROVENANCE_KEY: {"title": "generated", "tags": ["generated"]}}
+
+    # Nothing readable says a machine wrote these, so nothing claims to be authored
+    # and nothing is re-judged as generated — the fail-safe reading, both times.
+    assert meta_coverage(copy.deepcopy(meta), vocab)["authored"] == 0
+    out, moved = revalidate_generated(copy.deepcopy(meta), vocab)
+    assert moved == [] and out["tags"] == ["linux"]
+
+    # A readable record still decides, in both directions.
+    good = {"title": "T", PROVENANCE_KEY: {"title": {"source": SOURCE_AUTHORED}}}
+    assert meta_coverage(good, vocab)["authored"] == 1
+
+
+def test_a_grouped_field_that_is_not_a_mapping_does_not_abort_the_merge(gvocab):
+    # `links: none` under a machine stamp is a hand edit the linter reports as
+    # `field-malformed`; `merge_group_evidence` did `.items()` on it. It holds no
+    # evidence record, so there is none to protect and the incoming block stands.
+    existing = {"links": "none",
+                PROVENANCE_KEY: {"links": {"source": SOURCE_GENERATED}}}
+    proposed = {"links": {"internal": [{"url": "run.md", "ref": "#rollback"}]}}
+
+    out = accept_model_meta(proposed, gvocab, existing, anchors=ANCHORS)
+    assert out["accepted"]["links"]["internal"][0]["url"] == "run.md"
+
+    # A real harvested block is still protected record by record.
+    harvested = {"ecosystem": [{"url": "https://x.example/w", "ref": "#1-scope",
+                                EVIDENCE_KEY: SOURCE_EXTRACTED}]}
+    kept = accept_model_meta(
+        {"links": {"ecosystem": [{"url": "https://x.example/w", "ref": "#rollback"}]}},
+        gvocab, {"links": harvested,
+                 PROVENANCE_KEY: {"links": {"source": SOURCE_EXTRACTED,
+                                            "value_sha": value_sha(harvested)}}},
+        anchors=ANCHORS)["accepted"]["links"]
+    assert kept["ecosystem"][0]["ref"] == "#1-scope"      # the measurement survives
+
+
+def test_ordering_a_block_never_depends_on_every_key_being_a_string():
+    # `0644:` and `2:` are keys to any YAML 1.1 reader, and `sorted(meta)` raised
+    # `'<' not supported between 'str' and 'int'` while merely ORDERING the block.
+    out = order_meta({7: "a", "title": "b", PROVENANCE_KEY: {7: "x", "title": {}}})
+
+    assert list(out) == ["title", 7, PROVENANCE_KEY]
+    assert list(out[PROVENANCE_KEY]) == ["title", 7]
+    # An ordinary all-string block is ordered exactly as before: schema order first,
+    # extras alphabetically, provenance last.
+    plain = order_meta({"zeta": 1, "title": "b", "id": "x"})
+    assert list(plain) == ["id", "title", "zeta"]
+
+
+def test_a_model_reply_that_is_not_an_object_is_rejected_rather_than_raised(vocab):
+    # `parse_json_reply` returns {} for a non-object today, so this is the cache and
+    # the direct-caller path — and the rejection is RECORDED, because "which answer
+    # did it keep giving" is the question this list exists to answer.
+    out = accept_model_meta([{"title": "T"}], vocab, {})
+
+    assert out["accepted"] == {}
+    assert out["rejected"] == [("<reply>", [{"title": "T"}],
+                                "wrong-kind-expected-mapping")]
+    # None still means "no answer to judge", not a rejection.
+    assert accept_model_meta(None, vocab, {})["rejected"] == []

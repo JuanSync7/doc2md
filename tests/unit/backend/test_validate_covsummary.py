@@ -99,6 +99,58 @@ def test_an_empty_corpus_is_not_a_clean_bill_of_health():
     assert "nothing to summarize" in text
 
 
+# ---------------------------------------------- a record that measured nothing
+#
+# The two halves of this module disagreed about an absent `recall`: worst_documents
+# defaulted it to 1.0 and dropped the record, summarize defaulted it to 0.0 and
+# refused to count it lossless. One page therefore said "lossless: 1 of 2" and,
+# four lines later, "no document below 1.0 recall" — about the same corpus. One
+# meaning now, and it is the project's rule everywhere else: a missing measurement
+# is not a pass.
+
+def _unmeasured(doc_id, n_source=500):
+    return {"id": doc_id, "rel": doc_id + ".docx", "n_source": n_source,
+            "n_missing": 0}
+
+
+def test_a_document_with_no_recall_is_not_counted_as_lossless():
+    text = summarize_coverage([_unmeasured("never_graded"), _rec("good", 1.0)])
+    assert "lossless (recall == 1.0): 1 of 2" in text
+    assert "no recall recorded: 1 of 2" in text
+
+
+def test_a_document_with_no_recall_is_never_filtered_out_of_the_worst_list():
+    # The contradiction itself: the summary must not claim "no document below 1.0"
+    # over a document it never measured.
+    records = [_unmeasured("never_graded"), _rec("good", 1.0)]
+    worst, too_small = worst_documents(records)
+    assert [r["id"] for r in worst] == ["never_graded"] and too_small == 0
+    text = summarize_coverage(records)
+    assert "no document below 1.0 recall" not in text
+    assert "never_graded.docx" in text
+
+
+def test_an_unmeasured_document_prints_as_unknown_not_as_a_percentage():
+    # 0.0% would be a measurement nobody made, and 100.0% would be a lie.
+    text = summarize_coverage([_unmeasured("never_graded")])
+    assert "unknown" in text
+    assert "0.0%   never_graded" not in text
+
+
+def test_an_unmeasured_document_ranks_below_every_measured_one():
+    records = [_rec("bad", 0.4), _unmeasured("never_graded"), _rec("mid", 0.9)]
+    worst, _ = worst_documents(records)
+    assert [r["id"] for r in worst] == ["never_graded", "bad", "mid"]
+
+
+def test_a_measured_zero_is_still_a_measurement():
+    # The other direction: a real 0.0 recall must keep reading as a measured 0.0%,
+    # not fall into the "never measured" bucket.
+    text = summarize_coverage([_rec("wiped", 0.0)])
+    assert "no recall recorded" not in text
+    assert "0.0%" in text and "unknown" not in text
+
+
 def test_figure_losses_orders_by_how_much_was_lost():
     a = _rec("a", 1.0, figures={"n_body": 9, "n_lost": 1})
     b = _rec("b", 1.0, figures={"n_body": 9, "n_lost": 7})

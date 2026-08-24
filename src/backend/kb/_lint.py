@@ -135,6 +135,12 @@ def facet_report(pairs, warn=0.45, fail=0.75, min_uses=8):
 
 # --------------------------------------------------------------- collection
 
+# The vocabulary that answers "what type do this group's members take?". Named here
+# because two findings below have to say which term list was missing, and a message
+# that cannot name it sends an operator looking through the whole file.
+_ENTITY_VOCAB = "entity_types"
+
+
 def _records(meta, name, findings=None):
     # type: (dict, str, list) -> list
     """``(index, mapping)`` for each mapping member of a record list.
@@ -161,6 +167,36 @@ def _records(meta, name, findings=None):
     return out
 
 
+def _implied_types(vocab, groups, findings):
+    # type: (object, dict, list) -> object
+    """``{group: implied type}``, or ``None`` when no vocabulary can answer.
+
+    ``Vocabulary.group_type`` reads the ``entity_types`` vocabulary and RAISES when
+    the loaded file does not declare one — a partial ``$DOC2MD_VOCAB`` is an ordinary
+    configuration state, and it made ``lint_document`` exit with a ``VocabularyError``
+    traceback over a document whose only offence was having entities. The linter's
+    contract is that a corpus it cannot grade produces FINDINGS, and a term list it
+    cannot consult is no different: it is reported, not raised.
+
+    ``None`` is kept distinct from an empty table on purpose. "The vocabulary says
+    this group implies no type" is a fact about the DOCUMENT (register the group, or
+    type the entity); "no vocabulary could be asked" is a fact about the RUN, and
+    grading the second as the first blames every untyped entity in the corpus for a
+    term list the operator never loaded. The callers below say which one they saw.
+    """
+    table = {}  # type: dict
+    try:
+        for gname in groups.keys():
+            table[gname] = vocab.group_type(gname)
+    except Exception as exc:
+        findings.append(Finding(
+            "vocab-missing", ERROR, "entities",
+            "no usable %r vocabulary (%s), so no entity group implies a member type "
+            "and nothing below is checked against one" % (_ENTITY_VOCAB, exc)))
+        return None
+    return table
+
+
 def _entity_rows(meta, vocab, findings):
     # type: (dict, object, list) -> list
     """``(where, type)`` for every entity, with the group's implied type filled in.
@@ -176,10 +212,16 @@ def _entity_rows(meta, vocab, findings):
     groups = meta.get("entities")
     if not isinstance(groups, dict):
         return out
+    types = _implied_types(vocab, groups, findings)
     for gname, members in groups.items():
-        implied = vocab.group_type(gname)
+        implied = "" if types is None else types.get(gname, "")
         if isinstance(members, dict):
-            if not implied:
+            if types is None:
+                findings.append(Finding(
+                    "entity-group-unknown", WARN, "entities.%s" % gname,
+                    "no %r vocabulary was loaded, so nothing in this scalar entity "
+                    "group is type-checked" % _ENTITY_VOCAB))
+            elif not implied:
                 findings.append(Finding(
                     "entity-group-unknown", WARN, "entities.%s" % gname,
                     "scalar entity group %r is not in entity_types.group_types, so "
@@ -212,10 +254,14 @@ def _entity_rows(meta, vocab, findings):
             etype = ent.get("type")
             if not etype:
                 if not implied:
-                    findings.append(Finding(
-                        "entity-untyped", ERROR, where,
-                        "entity has no `type` and group %r implies none — add a "
-                        "type or register the group" % gname))
+                    if types is None:
+                        why = ("no %r vocabulary was loaded to imply one, so "
+                               "nothing checks it" % _ENTITY_VOCAB)
+                    else:
+                        why = ("group %r implies none — add a type or register "
+                               "the group" % gname)
+                    findings.append(Finding("entity-untyped", ERROR, where,
+                                            "entity has no `type` and %s" % why))
                     continue
                 etype = implied
             out.append((where, etype))
@@ -348,11 +394,36 @@ def _empty(val):
 
 
 def _declared_schema(meta):
-    # type: (dict) -> int
-    try:
-        return int("%s" % ((meta or {}).get("schema_version"),))
-    except (TypeError, ValueError):
+    # type: (dict) -> object
+    """Which revision this block declares: an ``int``, or ``None`` for UNKNOWN.
+
+    Three states, and the middle one used to be folded into the first:
+
+      ABSENT       no ``schema_version`` at all -> current. The block is hand-authored
+                   or hand-edited, and it is being written now (see the note above).
+      UNPARSEABLE  something is declared and it is not a revision number — an unquoted
+                   ``2.0`` (a float to every YAML 1.1 reader), a ``v3``, a bool. That
+                   is NOT current: it is a block whose revision nobody can read, and
+                   reading it as current silently promoted `record-uncited` from the
+                   WARN backfill item a pre-v3 block earns into an ERROR against a
+                   revision the block never claimed. ``None`` says so.
+      A NUMBER     graded against the revision it declares.
+
+    A bool is rejected before ``int`` sees it: ``True`` is an integer in Python and
+    ``schema_version: yes`` is the retyped scalar this linter exists to catch, not
+    revision 1.
+    """
+    raw = (meta or {}).get("schema_version")
+    if raw is None:
         return SCHEMA_VERSION
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, int):
+        return raw
+    try:
+        return int(("%s" % (raw,)).strip())
+    except (TypeError, ValueError):
+        return None
 
 
 def _cited(rec):
@@ -394,16 +465,30 @@ def _check_required(name, where, rec, required, rv, schema_version, findings):
         if sub == "ref":
             if _cited(rec):
                 continue
-            severity = (ERROR if schema_version >= _REF_REQUIRED_FROM else WARN)
+            # An UNKNOWN revision (``None``) is not the current one. A rule that
+            # arrived at revision N can only be applied to a block that says which
+            # revision it is, so an unreadable version earns the same backfill WARN a
+            # declared pre-v3 block earns — and the version itself is reported on its
+            # own, where it can be fixed.
+            known = schema_version is not None
+            severity = (ERROR if known and schema_version >= _REF_REQUIRED_FROM
+                        else WARN)
+            if severity == ERROR:
+                detail = ""
+            elif known:
+                detail = ("; this block declares schema_version=%d, and `ref` became "
+                          "required at %d, so this is backfill rather than a defect"
+                          % (schema_version, _REF_REQUIRED_FROM))
+            else:
+                detail = ("; this block's `schema_version` is not a readable revision "
+                          "number (reported separately), so it cannot be shown to "
+                          "have promised a `ref` — fix the version, then this row "
+                          "says whether it is backfill or a defect")
             findings.append(Finding(
                 "record-uncited", severity, "%s.%s" % (where, sub),
                 "no `ref` (and no extracted `line`), so \"which section asserts "
                 "this?\" is unanswerable — a record nobody can locate cannot be "
-                "checked, quoted or repaired%s"
-                % ("" if severity == ERROR else
-                   "; this block declares schema_version=%d, and `ref` became "
-                   "required at %d, so this is backfill rather than a defect"
-                   % (schema_version, _REF_REQUIRED_FROM))))
+                "checked, quoted or repaired%s" % detail))
             continue
         if sub in rv:
             # A GOVERNED sub-key that is present but empty is already reported by the
@@ -446,7 +531,13 @@ def _check_refs(meta, anchors, known_ids, findings, unreadable=0):
     register_ids = set()
     for name in ("decisions", "risks", "open_questions"):
         for _i, rec in _records(meta, name):
-            if rec.get("id"):
+            # STRINGS ONLY, the same test the entity branch below already applies.
+            # A pointer is a string, so an `id` that is a mapping or a list can never
+            # be the target of one — and putting it in the set raised `unhashable
+            # type: 'dict'` from inside the linter that had just promised to report
+            # this document rather than refuse it. An unresolvable id still resolves
+            # nothing: whatever points at it is reported as unresolved, which is true.
+            if isinstance(rec.get("id"), str) and rec["id"]:
                 register_ids.add(rec["id"])
     groups = meta.get("entities")
     if isinstance(groups, dict):
@@ -588,11 +679,32 @@ def lint_document(meta, vocab, anchors=None, known_ids=None, unreadable=0):
     findings = []  # type: list
     proposals = {}  # type: dict
 
+    if not isinstance(meta, dict):
+        # THE BLOCK ITSELF, not a field in it. `meta: draft` is a hand edit away in
+        # any front matter, and every collector below assumes a mapping — starting
+        # with `meta.keys()`, which raised `'list' object has no attribute 'keys'`
+        # out of the function that promises never to raise. One finding, and no
+        # pretence that anything else was checked. (`scripts/kb_lint.py` refuses such
+        # a document earlier with a message that also names the file; this is the
+        # guarantee for every OTHER caller of a public entry point.)
+        return {
+            "findings": [Finding(
+                "meta-malformed", ERROR, META_KEY,
+                "the metadata block is %s, not a mapping — nothing in this document "
+                "is checked" % type(meta).__name__)],
+            "facets": [], "proposals": {}, "errors": 1, "warnings": 0,
+        }
+
     known = set(field_names())
     for key in meta.keys():
         if key == PROVENANCE_KEY or key in known:
             continue
-        if key.endswith("_proposed") and key[:-len("_proposed")] in known:
+        # A key that is not a string cannot be a field name, and it cannot answer
+        # `.endswith` either — an unquoted `0644:` or `2:` is a key to any YAML 1.1
+        # reader, and asking it made the linter raise on a block it was about to
+        # report as carrying an unknown field.
+        if isinstance(key, str) and key.endswith("_proposed") \
+                and key[:-len("_proposed")] in known:
             continue
         findings.append(Finding("unknown-field", WARN, "%s.%s" % (META_KEY, key),
                                 "%r is not in the metadata schema" % key))
@@ -644,6 +756,17 @@ def lint_document(meta, vocab, anchors=None, known_ids=None, unreadable=0):
     # is checked, and every REQUIRED sub-key is checked separately from that — the
     # two questions are independent and nesting them made the second unaskable.
     schema_version = _declared_schema(meta)
+    if schema_version is None:
+        declared = meta.get("schema_version")
+        findings.append(Finding(
+            "schema-version-unreadable", ERROR,
+            "%s.schema_version" % META_KEY,
+            "`schema_version` is %s (%r), which is not a revision number — this "
+            "block is graded as UNKNOWN rather than current, so every rule that "
+            "arrived at a particular revision reports backfill instead of a defect. "
+            "Write an integer (quoting keeps `2.0` from being retyped by a YAML 1.1 "
+            "reader), or remove the key to declare the current revision (%d)"
+            % (type(declared).__name__, declared, SCHEMA_VERSION)))
     for f in FIELDS:
         if f.kind != "records":
             continue
@@ -726,6 +849,55 @@ def lint_document(meta, vocab, anchors=None, known_ids=None, unreadable=0):
     }
 
 
+def _governs(vocab, vname):
+    # type: (object, str) -> bool
+    """Can this vocabulary answer questions about ``vname`` at all?
+
+    The same guard ``_closed_terms`` already applies, for the same reason: every
+    query below (``normalize``, ``governance``, ``values``) raises on a vocabulary
+    that does not declare the field, and a partial ``$DOC2MD_VOCAB`` is configuration
+    rather than corruption. A field nothing governs is carried through UNCHANGED —
+    normalising against a term list that was never loaded is the one thing this
+    function must not invent — and ``lint_document`` reports the gap as
+    ``vocab-missing`` on the very same block.
+    """
+    try:
+        return bool(vname) and vocab is not None and vocab.has(vname)
+    except Exception:
+        return False
+
+
+def _merge_proposed(existing, new):
+    # type: (object, object) -> list
+    """Merge values into a ``<field>_proposed`` slot: deduplicated and deterministic.
+
+    NOTHING HERE MAY BE HASHED. This slot exists to hold what is NOT a term, and the
+    loop below routes a mapping or a list into it deliberately, so
+    ``sorted(set(...), key=str)`` raised ``unhashable type: 'dict'`` — ``set()`` runs
+    before ``key`` is ever applied — from inside the module whose contract is that a
+    malformed block is a finding rather than a traceback. ``sorted`` without a key
+    would fail on the mixed types for a second reason.
+
+    Identity is the RENDERED form, which is already the sort key: two values that
+    print the same are one proposal. That also removes the older nondeterminism —
+    ``sorted`` over a ``set`` is stable over an iteration order that varies with the
+    hash seed, so two runs over one document could write the slot in two orders.
+
+    ``_enrich._merge_proposed`` states the same rule for the write path, which fills
+    the same slot. They are written separately and pinned to each other by a test
+    rather than coupled by an import.
+    """
+    out = []  # type: list
+    seen = set()
+    for v in list(existing or []) + list(new or []):
+        text = "%s" % (v,)
+        if text in seen:
+            continue
+        seen.add(text)
+        out.append(v)
+    return sorted(out, key=lambda v: "%s" % (v,))
+
+
 def normalize_document(meta, vocab):
     # type: (dict, object) -> tuple
     """``(normalised_meta, changed)`` — aliases resolved, alias qualifiers merged.
@@ -748,24 +920,23 @@ def normalize_document(meta, vocab):
             # A `<field>_proposed` list must MERGE, never replace. Overwriting it
             # loses whichever side arrived first depending purely on key order, and
             # what it loses is the promotion evidence this function promises to keep.
-            base = key[:-len("_proposed")] if key.endswith("_proposed") else ""
+            base = (key[:-len("_proposed")]
+                    if isinstance(key, str) and key.endswith("_proposed") else "")
             if base and base in field_names() and isinstance(val, list):
-                out[key] = sorted(set(list(out.get(key) or []) + list(val)),
-                                  key=str)
+                out[key] = _merge_proposed(out.get(key), val)
             else:
                 out[key] = val
             continue
         f = field(key)
-        if f.vocab and f.kind == "scalar" and isinstance(val, str):
+        if _governs(vocab, f.vocab) and f.kind == "scalar" and isinstance(val, str):
             canonical, _ = norm_scalar(f.vocab, val, key)
             if vocab.governance(f.vocab) == "registry" \
                     and canonical not in vocab.values(f.vocab):
                 slot = proposed_key(key)
-                out[slot] = sorted(set(list(out.get(slot) or []) + [canonical]),
-                                   key=str)
+                out[slot] = _merge_proposed(out.get(slot), [canonical])
                 continue
             out[key] = canonical
-        elif f.vocab and f.kind == "list" and isinstance(val, list):
+        elif _governs(vocab, f.vocab) and f.kind == "list" and isinstance(val, list):
             keep, prop = [], []
             for i, v in enumerate(val):
                 if not isinstance(v, str):
@@ -782,7 +953,7 @@ def normalize_document(meta, vocab):
             out[key] = keep
             if prop:
                 slot = proposed_key(key)
-                out[slot] = sorted(set(list(out.get(slot) or []) + prop), key=str)
+                out[slot] = _merge_proposed(out.get(slot), prop)
         elif record_vocab(key) and isinstance(val, list):
             rv = record_vocab(key)
             recs = []
@@ -792,7 +963,7 @@ def normalize_document(meta, vocab):
                     continue
                 new = OrderedDict(rec)
                 for sub, vname in rv.items():
-                    if isinstance(new.get(sub), str):
+                    if isinstance(new.get(sub), str) and _governs(vocab, vname):
                         canonical, quals = norm_scalar(
                             vname, new[sub], "%s[%d].%s" % (key, i, sub))
                         new[sub] = canonical
@@ -826,13 +997,18 @@ def corpus_report(doc_metas, vocab):
         used = Counter()      # canonical value -> document frequency
         proposed = Counter()  # unknown value   -> document frequency
         for meta in doc_metas:
-            vals = (meta or {}).get(name)
+            # A row that is not a mapping contributes no terms — and must not cost
+            # the other 999 documents their registry health either. `_corpus._rows`
+            # is where a malformed row becomes a FINDING; here it is simply not a
+            # document with tags in it.
+            meta = meta if isinstance(meta, dict) else {}
+            vals = meta.get(name)
             seen = set()
             if isinstance(vals, list):
                 seen |= set(v for v in vals if isinstance(v, str))
             elif isinstance(vals, str):
                 seen.add(vals)
-            prop = (meta or {}).get(proposed_key(name))
+            prop = meta.get(proposed_key(name))
             if isinstance(prop, list):
                 seen |= set(v for v in prop if isinstance(v, str))
             known = vocab.values(field(name).vocab)

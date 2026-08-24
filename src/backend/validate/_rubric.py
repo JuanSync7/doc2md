@@ -149,33 +149,117 @@ def _nothing_to_grade(what):
 
 # ---------------------------------------------------- markdown, read first-hand
 
-# A fence opener/closer as CommonMark defines it: up to three leading spaces then
-# three or more backticks or tildes.
-_CODE_FENCE = re.compile(r"^ {0,3}(?:`{3,}|~{3,})")
+# A fence opener as CommonMark §4.5 defines it: up to three leading spaces then
+# three or more backticks or tildes, then an info string — which for a BACKTICK
+# fence may not itself contain a backtick. The CLOSER is a separate rule, and the
+# reason the scanner below carries the open fence rather than matching a line: it
+# must repeat the opener's character with a run at least as long, and carry
+# nothing after it but spaces.
+_CODE_FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
+_CODE_FENCE_CLOSE = re.compile(r"^ {0,3}(`{3,}|~{3,})[ \t]*$")
+# A list item's marker. It matters here only because it moves the column its
+# content is measured from, and therefore the column at which four spaces mean
+# "indented code" rather than "this list item's second paragraph".
+_LIST_ITEM = re.compile(r"^([-*+]|\d{1,9}[.)])([ \t]+|$)")
+# CommonMark §4.4: four spaces past the enclosing block's content column.
+_INDENTED_CODE = 4
+# CommonMark §4.5: a fence may be indented up to three spaces past that column.
+_FENCE_INDENT = 3
 # An unescaped cell divider, and a GFM delimiter-row cell (`---`, `:-:`, `--:`).
 _TABLE_PIPE = re.compile(r"(?<!\\)\|")
 _SEP_CELL = re.compile(r"^:?-+:?$")
 
 
+def _fence_pair(line, indent, opener):
+    # type: (str, int, tuple) -> bool
+    """Does ``line`` close the fence ``opener`` = ``(char, length, column)``?
+
+    Same character, a run at least as long as the opener, nothing after it but
+    spaces, and indented no more than three spaces past the opener's own column —
+    four is code content, not a close. A line indented LESS than that column has
+    dedented out of the block that held the fence, and CommonMark ends the code
+    block there, so such a line may close it too."""
+    char, length, column = opener
+    m = _CODE_FENCE_CLOSE.match(line.lstrip(" "))
+    if not m or indent > column + _FENCE_INDENT:
+        return False
+    run = m.group(1)
+    return run[0] == char and len(run) >= length
+
+
 def _prose_lines(markdown):
     # type: (str) -> list
-    """``markdown``'s lines, with everything inside a fenced block blanked out.
+    """``markdown``'s lines, with every line a renderer reads as CODE blanked out.
 
     Spelled out here rather than imported from ``backend.sections`` on purpose,
     like every other fact this module grades: the rubric checks what that package
     produced, and a check that asked the producer where the code is would only be
     asking a module whether it agrees with itself. A shell transcript's ``# reset
-    the board`` makes no fragment addressable and its pipe art is not a table. An
-    unclosed fence runs to the end of the document, which is what CommonMark does
-    with one, so the mask matches the renderer."""
+    the board`` makes no fragment addressable and its pipe art is not a table.
+
+    Markdown has TWO code blocks and this mask used to know only one of them.
+    Pipe art drawn in an INDENTED block —
+
+        | col | col |
+        | --- | --- |
+
+    — was read as a live GFM table by ``_gfm_tables``, and ``_c5_table_nodes``
+    then hard-failed a bundle for not publishing a node for a table its document
+    renders as a code listing. That is a rubric row failing a correct document,
+    so the mask now covers indented code as well, from CommonMark §4.4:
+
+      * an indented chunk is four or more spaces past the enclosing block's
+        content column (a tab counts as four, so the line is expanded first);
+      * blank lines separate chunks WITHIN one block rather than ending it;
+      * an indented chunk cannot INTERRUPT a paragraph, which is what makes a
+        wrapped, over-indented prose line a continuation and not a listing; and
+      * inside a list item the column is the ITEM's content column, so a list's
+        own second paragraph is prose, not code.
+
+    An unclosed fence runs to the end of the document, which is what CommonMark
+    does with one, so the mask matches the renderer there too — and a fence is
+    closed only by its OWN character at its own length, so a ``~~~`` line inside
+    a ``` block is content, not a closer."""
     out = []
-    in_fence = False
-    for line in (markdown or "").splitlines():
-        if _CODE_FENCE.match(line):
-            in_fence = not in_fence
+    fence = ()          # (character, run length, column) of the open fence
+    icode = False       # inside an indented code block
+    cols = []           # content column of each open list item, outermost first
+    blank = True        # the previous line was blank: an indent may open code
+    for raw in (markdown or "").splitlines():
+        line = raw.expandtabs(4)
+        stripped = line.strip()
+        indent = len(line) - len(line.lstrip(" "))
+        if fence:
+            out.append("")
+            if _fence_pair(line, indent, fence):
+                fence = ()
+                # The block that closed left no open paragraph behind it, so the
+                # next indented line opens code rather than continuing prose.
+                blank = True
+            continue
+        if not stripped:
+            out.append("")
+            blank = True
+            continue
+        while cols and indent < cols[-1]:
+            cols.pop()                      # dedented out of the item that held it
+        base = cols[-1] if cols else 0
+        if indent >= base + _INDENTED_CODE and (icode or blank):
+            icode = True
             out.append("")
             continue
-        out.append("" if in_fence else line)
+        icode = False
+        blank = False
+        opener = _CODE_FENCE.match(line[base:])
+        if opener and not (opener.group(1)[0] == "`" and "`" in opener.group(2)):
+            fence = (opener.group(1)[0], len(opener.group(1)), base)
+            out.append("")
+            continue
+        item = _LIST_ITEM.match(line[indent:])
+        if item:
+            after = len(item.group(2))
+            cols.append(indent + len(item.group(1)) + (after if after else 1))
+        out.append(raw)
     return out
 
 
@@ -332,20 +416,35 @@ def _b4_runlog(view):
 
 def _b6_no_vacuous_pass(view):
     # type: (dict) -> tuple
-    if not _all(view):
+    """No document claims a recall without the token count it is over.
+
+    The ``if loss and ...`` guard this row shipped with made the row's own shape
+    the vacuous pass it exists to forbid: a bundle whose report carries NO
+    losslessness block at all skipped both checks, fell out of the loop, and was
+    then counted in ``"%d recall(s) reported alongside the token count they are
+    over"``. A report that measured nothing is not a report that measured
+    everything, so a missing block is now the per-document ``nothing to grade``
+    the rest of the rubric already uses — never a silent pass, and never a
+    corpus-wide excuse that a sibling's block could cover."""
+    bundles = _all(view)
+    if not bundles:
         return _nothing_to_grade("no bundles in the corpus under grade")
-    for b in _all(view):
+    for b in bundles:
+        short = b.get("doc_id", "?")[:8]
         loss = b.get("report", {}).get("losslessness") or {}
-        if loss and "n_source_tokens" not in loss:
-            return (FAIL, "%s claims a recall with no n_source_tokens"
-                    % b.get("doc_id", "?")[:8])
+        if not loss:
+            return _nothing_to_grade(
+                "%s publishes no losslessness block at all, so this row would "
+                "otherwise report a recall nobody measured" % short)
+        if "n_source_tokens" not in loss:
+            return (FAIL, "%s claims a recall with no n_source_tokens" % short)
         if loss.get("n_source_tokens") == 0 and loss.get("gate") == PASS:
             codes = [w.get("code") for w in b.get("report", {}).get("warnings") or []]
             if "empty_source" not in codes:
                 return (FAIL, "%s passed the gate over zero tokens with no "
-                              "empty_source code" % b.get("doc_id", "?")[:8])
+                              "empty_source code" % short)
     return (PASS, "%d recall(s) reported alongside the token count they are "
-                  "over" % len(_all(view)))
+                  "over" % len(bundles))
 
 
 # ------------------------------------------------- C. structure.json — the tree

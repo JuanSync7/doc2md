@@ -118,24 +118,34 @@ _HEADING = re.compile(r"^ {0,3}(#{1,6})[ \t]+(.+?)[ \t]*#*[ \t]*$")
 # (``sections.fenced_lines``) and deliberately not an import of it: the two
 # implementations are separate on purpose (see ``heading_anchor``), so this one is
 # written out rather than borrowed — but it has to agree on every input, which means
-# copying the RULE, including its looseness. A run of three of either character
-# toggles the state; the delimiter lines are code themselves; an unclosed fence runs
-# to the end of the document, which is what CommonMark does with one.
-_FENCE_LINE = re.compile(r"^\s{0,3}(```|~~~)")
+# copying the RULE. It used to copy the rule's LOOSENESS too — any run of three of
+# either character toggled the state — and that was a defect on both sides, not a
+# harmless simplification: a ``~~~`` line inside a ``` block closed it, so the rest
+# of the listing became prose and published anchors for its `#` comments, while the
+# real headings after the true closer were masked as code and lost theirs. The rule
+# is CommonMark's: a closer repeats the OPENER's character with a run at least as
+# long and carries nothing after it but spaces. The delimiter lines are code
+# themselves; an unclosed fence runs to the end of the document, as a renderer does.
+_FENCE_LINE = re.compile(r"^\s{0,3}(`{3,}|~{3,})(.*)$")
 
 
 def _fenced_lines(body_md):
     # type: (str) -> set
     """Line indices (0-based) the body renders as CODE rather than as prose."""
     out = set()
-    in_fence = False
+    opened = None                      # (char, length) of the fence currently open
     for i, line in enumerate((body_md or "").splitlines()):
-        if _FENCE_LINE.match(line):
-            out.add(i)
-            in_fence = not in_fence
+        m = _FENCE_LINE.match(line)
+        if opened is None:
+            if m:
+                run = m.group(1)
+                opened = (run[0], len(run))
+                out.add(i)
             continue
-        if in_fence:
-            out.add(i)
+        out.add(i)
+        if m and m.group(1)[0] == opened[0] and len(m.group(1)) >= opened[1] \
+                and not m.group(2).strip():
+            opened = None
     return out
 
 

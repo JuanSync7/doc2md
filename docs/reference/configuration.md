@@ -115,9 +115,18 @@ recoverable from no artifact. `replay_run.py --stage enrich_metadata` replays it
 | `--excerpt-chars` | `12000` | How much body the model sees. Truncation is announced in the prompt header. Raising it changes `prompt_sha` and re-asks the corpus. |
 | `--keyword-limit` | `120` | How many tier-1 identifier candidates are offered as `keywords` seeds. |
 | `--run-id` | UTC timestamp | Stamped into `meta.extraction.run_at`. A run that changes nothing does **not** re-stamp it — that is what keeps re-runs byte-identical. |
-| `--fail-on-pending` | off | Exit `3` when any model-writable field is still empty. Off by default: a deterministic run leaves 13 fields pending *by design*, and that is a complete success, not a failure. |
-| `--vlm-url` | `""` | **A model is used iff this is non-empty.** Which way it went is a `metadata_tier` decision (`model` or `deterministic`) in every report. Omit it and the run is deterministic-only — but not empty: `title`, `abstract` and `links` are still filled from the source's own title property, its lede paragraph and the URLs harvested into `structure.json`, and only the 13 fields that need judgement stay `pending`. `doc_meta.gate` is `disabled`. |
+| `--fail-on-pending` | off | Exit `3` when any model-writable field is still empty. Off by default: a deterministic run leaves 13 fields pending *by design*, and that is a complete success, not a failure. Outranked by `4` (below), because a model that never answered is the *cause* of the pending fields and the more useful answer. |
+| `--vlm-url` | `""` | **A model is used iff this is non-empty.** Which way it went is a `metadata_tier` decision (`model` or `deterministic`) in every report. Omit it and the run is deterministic-only — but not empty: `title`, `abstract` and `links` are still filled from the source's own title property, its lede paragraph and the URLs harvested into `structure.json`, and only the 13 fields that need judgement stay `pending`. `doc_meta.gate` is `disabled`. Naming an endpoint that never answers is **not** the same run: same artifacts, exit `4`. |
 | `--vlm-model` | `$DOC2MD_VLM_MODEL` / `qwen2.5-vl-7b` | Model name requested and recorded in `doc_meta.model`. Part of `prompt_sha`, so swapping models re-asks. |
+
+Exit codes:
+
+| code | meaning |
+|---|---|
+| `0` | every tier this run was asked for ran. A no-model run leaves the whole model tier `pending` and still exits `0` — that is a complete deterministic run, and `report.json` agrees (`doc_meta.gate: "disabled"`). |
+| `1` | a document could not be read, parsed or written. |
+| `4` | **a model was asked for and never answered** — `--vlm-url` unreachable at the health check, or `ok: false` for document after document. The artifacts are the ones a deterministic run writes (`pending`, never guessed, always re-runnable); what differs is that nobody *chose* this, so it is not a success. A nightly backfill against a model that had been down for a week used to report success every night. |
+| `3` | with `--fail-on-pending` only: work is outstanding. |
 
 ### `replay_run.py` — repeat a recorded run
 
@@ -153,8 +162,15 @@ Exit codes:
 |---|---|
 | `0` | everything applicable was compared, and none of it moved. |
 | `3` | a divergence was **demonstrated** — or the replay produced a different `markdown_sha256`, or produced no bundle at all. |
-| `4` | **nothing diverged, but at least one class could not be compared.** Explicitly *not* an all-clear. |
+| `4` | **nothing diverged, but at least one class could not be compared.** Explicitly *not* an all-clear. Also the answer when `--execute` ran the command and **the command itself exited non-zero**: the replay did not complete, so nothing downstream of it was compared, and `--compare` is refused rather than allowed to read a bundle an *earlier* replay left at `--out`. |
 | `1` | a usage or I/O error, which now includes `--compare` pointed at the root being replayed. |
+
+These four codes are this tool's vocabulary and nothing else's. The exit code of the
+command a replay executes is **printed, never returned** — it used to be returned
+verbatim, so a replayed `build_bundle` exiting `1` (a document failed) came back as
+replay's "usage or I/O error", its `3` came back as "a divergence was demonstrated"
+— a verdict about the recorded run that nothing had computed — and a `2` came back
+as a code replay does not define at all.
 
 `4` exists because the two-code scheme had no way to say "I did not check". Folding
 "could not compare" into `3` would call an unchecked class a divergence; folding it
@@ -337,7 +353,9 @@ Recorded because they cost time, not because they are elegant.
    used to return `2` whenever any field was pending, so a healthy deterministic run
    could never exit `0` and broke every `set -e` chain — while `report.json` called
    the same state `doc_meta.gate: "disabled"`. Now: `0` success, `1` a document
-   failed, and `3` only with `--fail-on-pending`.
+   failed, `4` a model was asked for and never answered, and `3` only with
+   `--fail-on-pending`. The `4` is the other half of the same rule: "what happened"
+   has to include *the tier you asked for did not run*, which `0` was also saying.
 4. **Five fields ship as empty registries.** `subtype`, `tags`, `keywords`,
    `topics` and `audience` start with `values: []`, so a fully classified document
    reports `pending: 5` until terms are promoted. `kb_lint --promote` is what

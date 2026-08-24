@@ -436,6 +436,14 @@ class _Lines(object):
         # type: (str) -> None
         self.rows = []  # type: list
         for no, raw in enumerate((text or "").split("\n"), start=1):
+            # ``\r\n`` is a line break, not content (YAML 1.2 §5.4 normalises every
+            # break to ``\n``, and so does PyYAML). Dropping it here rather than in
+            # each scanner is what keeps a CRLF document's BLOCK SCALARS right:
+            # ``peek`` rstrips, so plain and quoted scalars never saw the ``\r``,
+            # but ``raw_from`` hands its lines over untouched and a folded
+            # rationale came back with a stray ``\r`` on every line.
+            if raw.endswith("\r"):
+                raw = raw[:-1]
             if "\t" in raw[:len(raw) - len(raw.lstrip())]:
                 raise YamlSubsetError("tab indentation at line %d" % no)
             stripped = raw.strip()
@@ -601,6 +609,45 @@ def _parse_child(lines, parent_indent):
     return _parse_map(lines, ind)
 
 
+def _item_child(lines, dash_indent, key_indent):
+    # type: (_Lines, int, int) -> object
+    """The value of ``- key:`` with nothing after the colon.
+
+    ``_parse_child`` cannot serve this: it is told the PARENT's indent, and inside
+    a block sequence the dash is not the parent. A sequence item is a mapping that
+    begins at its FIRST KEY, so the key's own column — not the dash's — is what
+    separates this key's value from the item's next key. Reading the dash's column
+    instead silently restructured the record: ``- k:`` followed by ``j: w`` at the
+    key's column is ``{'k': None, 'j': 'w'}`` to every YAML reader, and this module
+    returned ``{'k': {'j': 'w'}}`` — a hand-authored pair moved a level down with
+    nothing to warn the author. The three cases below are the three the YAML
+    indentation rules distinguish:
+
+      deeper than the key      this key's value (a nested block)
+      exactly the key's column a SIBLING key of the same item — not a value here
+      between dash and key     outside the subset; a real parser rejects it too
+    """
+    row = lines.peek()
+    if row is None:
+        return None
+    no, ind, text = row
+    if ind <= dash_indent:
+        return None                    # the item ended; this key has no value
+    if ind < key_indent:
+        raise YamlSubsetError(
+            "line %d is indented %d where this sequence item's keys start at "
+            "column %d (a block-sequence item is a mapping that begins at its "
+            "first key, not at the dash): %r" % (no, ind, key_indent, text))
+    if text.startswith("-"):
+        # A block sequence is allowed to sit at its own key's column as well as
+        # deeper (YAML's "zero-indented" sequence), and either way it is the value
+        # of the key rather than a sibling of it.
+        return _parse_seq(lines, ind)
+    if ind == key_indent:
+        return None                    # a sibling key; the caller merges it in
+    return _parse_map(lines, ind)
+
+
 def _parse_seq(lines, indent):
     # type: (_Lines, int) -> list
     out = []  # type: list
@@ -639,9 +686,14 @@ def _parse_seq(lines, indent):
         if m:
             # ``- key: value`` — a map item whose remaining pairs align under the key.
             item = OrderedDict()
+            # Where the item's mapping actually starts: past the dash and whatever
+            # spaces follow it. ``-   k:`` puts the key at column 6, not column 4,
+            # and every indentation decision below is measured from there.
+            after_dash = text[1:]
+            key_indent = ind + 1 + (len(after_dash) - len(after_dash.lstrip(" ")))
             key, val = m.group(1), (m.group(2) or "").strip()
             if val and val[0] in ("|", ">"):
-                item[key] = _block_scalar(lines, val, ind)
+                item[key] = _block_scalar(lines, val, key_indent)
             elif val == "[]":
                 item[key] = []
             elif val == "{}":
@@ -655,10 +707,20 @@ def _parse_seq(lines, indent):
             elif val:
                 item[key] = _scalar_value(val)
             else:
-                item[key] = _parse_child(lines, ind)
+                item[key] = _item_child(lines, ind, key_indent)
             nxt = lines.peek()
             if nxt is not None and nxt[1] > ind:
-                rest_map = _parse_map(lines, nxt[1])
+                if nxt[1] != key_indent:
+                    # Deeper than the item's own keys with no key left to own it
+                    # (``- k: v`` then a line indented past ``k``), or between the
+                    # dash and the key. Both are outside the subset and both are a
+                    # parser error to PyYAML; reading either as a sibling pair
+                    # would file the author's line under the wrong record.
+                    raise YamlSubsetError(
+                        "line %d is indented %d where this sequence item's keys "
+                        "start at column %d: %r"
+                        % (nxt[0], nxt[1], key_indent, nxt[2]))
+                rest_map = _parse_map(lines, key_indent)
                 for k, v in rest_map.items():
                     if k in item:
                         raise YamlSubsetError("duplicate key %r at line %d" % (k, no))
@@ -688,7 +750,16 @@ def parse_block(text):
     return result
 
 
-_FENCE = re.compile(r"^---\n((?:.*\n)*?)---\n")
+# The opening and closing fence, on either line ending. A document written on
+# Windows fences its front matter with ``---\r\n``, and a pattern that only knows
+# ``---\n`` reports NO front matter at all — the single wrong-value outcome this
+# module forbids. `enrich_metadata` believes that answer and prepends a second
+# block, so the document ends up with two, and every reader of the first one
+# (`grade_output`, `kb_lint`, the parity test) is reading metadata the pipeline
+# thinks it just replaced. ``[ \t]*`` is deliberately NOT allowed: a fence with
+# trailing spaces is not one, and the three raw-line strippers elsewhere in the
+# repo scan for an exact ``---`` line.
+_FENCE = re.compile(r"^---\r?\n((?:.*\n)*?)---\r?\n")
 
 
 def split_front_matter(md):
@@ -705,6 +776,11 @@ def split_front_matter(md):
     if not m:
         return (OrderedDict(), text)
     body = text[m.end():]
-    if body.startswith("\n"):
+    # The one separator newline the assembler inserts, in whichever spelling this
+    # document uses. Removing only the ``\n`` of a ``\r\n`` would leave a stray
+    # carriage return at the head of the bytes ``markdown_sha256`` covers.
+    if body.startswith("\r\n"):
+        body = body[2:]
+    elif body.startswith("\n"):
         body = body[1:]
     return (parse_block(m.group(1)), body)

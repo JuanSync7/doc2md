@@ -26,7 +26,12 @@ _COMMENT = re.compile(r"(?<!\\)<!--.*?-->", re.S)
 # embedder and a BM25 index actually read. The (?<!\\) exempts a converter-escaped
 # "\<br>", which is prose ABOUT the tag rather than the tag.
 _BR = re.compile(r"(?<!\\)<br\s*/?>", re.I)
-_FENCE = re.compile(r"^\s*(```+|~~~+)")
+# The run and its tail, because a CLOSER is not just "a fence-looking line": it
+# repeats the opener's character with a run at least as long and carries nothing
+# after it but spaces (CommonMark 4.5). Toggling on either character meant a `~~~`
+# inside a ``` listing ended it, after which the rest of that listing was processed
+# as PROSE — inline markup stripped out of text a renderer shows verbatim.
+_FENCE = re.compile(r"^\s*(`{3,}|~{3,})(.*)$")
 _HR = re.compile(r"^\s*([-*_])(?:\s*\1){2,}\s*$")
 _SETEXT = re.compile(r"^\s*(=+|-+)\s*$")
 _TABLE_SEP = re.compile(r"^\s*\|?[\s:|-]*-[\s:|-]*\|?\s*$")
@@ -184,16 +189,23 @@ def markdown_to_text(md):
     md = _COMMENT.sub(" ", md)
     md = _BR.sub(" ", md)
     out = []
-    in_code = False
+    in_code = None      # (char, length) of the open fence, or None outside one
     para_open = False       # is there a paragraph a setext underline could attach to?
     for raw in md.split("\n"):
-        if _FENCE.match(raw):
-            in_code = not in_code
-            para_open = False
-            continue  # drop the fence marker line itself
-        if in_code:
+        fence = _FENCE.match(raw)
+        if in_code is not None:
+            if (fence and fence.group(1)[0] == in_code[0]
+                    and len(fence.group(1)) >= in_code[1]
+                    and not fence.group(2).strip()):
+                in_code = None
+                para_open = False
+                continue  # drop the closing marker line itself
             out.append(raw.rstrip())  # keep code content verbatim (tokens may be entities)
             continue
+        if fence:
+            in_code = (fence.group(1)[0], len(fence.group(1)))
+            para_open = False
+            continue  # drop the opening marker line itself
         line = raw
         # WHAT A RENDERER REALLY DELETES. A thematic break, a setext UNDERLINE and a
         # GFM delimiter row draw furniture and contribute no text, so dropping them

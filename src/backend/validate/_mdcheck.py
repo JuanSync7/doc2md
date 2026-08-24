@@ -27,7 +27,17 @@ __all__ = ["validate_markdown", "conversion_report", "build_report",
 
 MdIssue = namedtuple("MdIssue", ["line", "code", "severity", "message"])
 
-_FENCE = re.compile(r"^\s{0,3}(```|~~~)")
+# A fenced code block, read as CommonMark §4.5 defines it. A single "is this a
+# fence line" regex cannot answer the question, because the CLOSING rule depends
+# on the OPENER: the closer must use the SAME character and a run AT LEAST AS
+# LONG, with nothing but spaces after it. Toggling on "any fence line" is how a
+# ``~~~`` line inside a ``` block closed it — the rest of the document was then
+# read as code, the ``` that really closed it opened a phantom block, and the
+# resulting `fence-unclosed` error made `build_report` report status="failed" on
+# markdown a renderer is perfectly happy with. That verdict withdraws a good
+# bundle, so this reader has to get the pair right rather than the line.
+_FENCE_LINE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
+_FENCE_CLOSE = re.compile(r"^ {0,3}(`{3,}|~{3,})[ \t]*$")
 _HEADING = re.compile(r"^(#{1,6})\s+\S")
 _PIPE = re.compile(r"(?<!\\)\|")
 _SEP_CELL = re.compile(r"^:?-+:?$")
@@ -62,6 +72,41 @@ def _is_separator(line):
     # type: (str) -> bool
     cells = _cells(line)
     return bool(cells) and all(_SEP_CELL.match(c.strip()) for c in cells)
+
+
+def _fence_opener(line):
+    # type: (str) -> tuple
+    """``(character, run length)`` if ``line`` OPENS a fenced block, else ``()``.
+
+    CommonMark §4.5: an opener is three or more backticks or three or more
+    tildes, indented at most three spaces, optionally followed by an info string
+    — and a BACKTICK fence's info string may not itself contain a backtick
+    (``` ```a`b ``` ``` is a paragraph, not a code block), while a tilde fence's
+    may. Both facts are read off the spec here; ``_mdstructure`` reads the same
+    spec separately, because two independent readings of the emitted markdown is
+    the point of having two readers."""
+    m = _FENCE_LINE.match(line)
+    if not m:
+        return ()
+    run, info = m.group(1), m.group(2)
+    if run[0] == "`" and "`" in info:
+        return ()
+    return (run[0], len(run))
+
+
+def _fence_closes(line, char, length):
+    # type: (str, str, int) -> bool
+    """Does ``line`` CLOSE a fence opened by ``length`` x ``char``?
+
+    Same character, a run at least as long as the opener, and nothing on the line
+    after it but spaces. A shorter run, the other character, or any trailing text
+    is CONTENT of the block, which is exactly what a ``~~~`` inside a ``` block
+    is."""
+    m = _FENCE_CLOSE.match(line)
+    if not m:
+        return False
+    run = m.group(1)
+    return run[0] == char and len(run) >= length
 
 
 def _check_table_block(block, issues):
@@ -113,7 +158,8 @@ def validate_markdown(md):
                 issues.append(MdIssue(i + 1, "bad-chars", "error",
                                       "control or replacement character in front matter"))
 
-    in_fence = False
+    fence_char = ""
+    fence_len = 0
     fence_open_line = 0
     last_heading = 0
     block = []  # type: list
@@ -123,14 +169,20 @@ def validate_markdown(md):
         if _BAD_CHARS.search(text):
             issues.append(MdIssue(no, "bad-chars", "error",
                                   "control or replacement character in line"))
-        if _FENCE.match(text):
+        if fence_char:
+            # Inside a block: only a matching closer ends it. Everything else,
+            # including a fence line of the OTHER character or a shorter run, is
+            # code content and is exempt from the markdown rules.
+            if _fence_closes(text, fence_char, fence_len):
+                fence_char = ""
+            continue
+        opener = _fence_opener(text)
+        if opener:
             if block:
                 _check_table_block(block, issues)
                 block = []
-            in_fence = not in_fence
+            fence_char, fence_len = opener
             fence_open_line = no
-            continue
-        if in_fence:
             continue
         if _XML_LEAK.search(text):
             issues.append(MdIssue(no, "xml-leak", "error",
@@ -150,7 +202,7 @@ def validate_markdown(md):
             block = []
     if block:
         _check_table_block(block, issues)
-    if in_fence:
+    if fence_char:
         issues.append(MdIssue(fence_open_line, "fence-unclosed", "error",
                               "code fence is never closed"))
     return sorted(issues, key=lambda i: (i.line, i.code))
@@ -246,32 +298,42 @@ def _content_metrics(md, token_count=None):
         tokens = sum((len(ln) + 3) // 4 for ln in lines)
     else:
         tokens = sum(token_count(ln) for ln in lines)
-    headings = tables = lists = fences = images = links = 0
-    in_fence = False
+    headings = tables = lists = blocks = images = links = 0
+    fence_char = ""
+    fence_len = 0
     i = 0
     n = len(lines)
     while i < n:
         ln = lines[i]
-        if _FENCE.match(ln):
-            fences += 1
-            in_fence = not in_fence
+        if fence_char:
+            if _fence_closes(ln, fence_char, fence_len):
+                fence_char = ""
             i += 1
             continue
-        if not in_fence:
-            if _HEADING.match(ln):
-                headings += 1
-            if _LIST.match(ln):
-                lists += 1
-            images += len(_IMG_MD.findall(ln))
-            links += len(_LINK_MD.findall(ln))
-            if (i + 1 < n and _PIPE.search(ln) and _is_separator(lines[i + 1])
-                    and _PIPE.search(lines[i + 1])):
-                tables += 1
+        opener = _fence_opener(ln)
+        if opener:
+            # Counted on the OPENER, not as delimiters//2: an unclosed fence is
+            # still one code block — it runs to the end of the document, which is
+            # what a renderer does with it — and a ``~~~`` inside a ``` block is
+            # not a delimiter at all.
+            blocks += 1
+            fence_char, fence_len = opener
+            i += 1
+            continue
+        if _HEADING.match(ln):
+            headings += 1
+        if _LIST.match(ln):
+            lists += 1
+        images += len(_IMG_MD.findall(ln))
+        links += len(_LINK_MD.findall(ln))
+        if (i + 1 < n and _PIPE.search(ln) and _is_separator(lines[i + 1])
+                and _PIPE.search(lines[i + 1])):
+            tables += 1
         i += 1
     return {
         "chars": len(md), "tokens": tokens, "headings": headings,
         "tables": tables, "images": images, "links": links, "lists": lists,
-        "code_blocks": fences // 2, "formulas": md.count("$$") // 2,
+        "code_blocks": blocks, "formulas": md.count("$$") // 2,
     }
 
 
@@ -574,8 +636,17 @@ def caption_report(enabled, expected, captioned, furniture, useless, pending,
 
     ``gate``: ``disabled`` when captioning is off; ``pending`` before the first run
     (nothing attempted); ``complete`` when every expected image reached a terminal
-    verdict (``pending == 0``); ``incomplete`` when a run left images uncaptioned
-    (re-run when the VLM is back)."""
+    verdict AND none of those verdicts is ``useless``; ``incomplete`` when a run
+    left images uncaptioned or captioned uselessly (re-run when the VLM is back).
+
+    NOTE ``useless`` keeps the gate off ``complete``, exactly as ``invalid`` does in
+    ``doc_meta_report``, and for the same reason: it is a TERMINAL verdict, so it
+    drives ``pending`` to zero while leaving the image with nothing a reader can
+    use. Without that guard ``caption_report(True, 3, 0, 0, 3, 0)`` — three images,
+    three captions the useful gate threw away, not one usable line — reported
+    ``complete``, which is the block claiming coverage it does not have. Furniture
+    is NOT in the guard: a caption the model deliberately declined to write for a
+    spacer rule is a correct, finished outcome, not a failed one."""
     attempted = captioned + furniture + useless
     b = OrderedDict()
     b["enabled"] = bool(enabled)
@@ -588,7 +659,7 @@ def caption_report(enabled, expected, captioned, furniture, useless, pending,
     b["prompt_sha"] = prompt_sha or ""
     if not enabled:
         b["gate"] = "disabled"
-    elif expected == 0 or pending == 0:
+    elif useless == 0 and (expected == 0 or pending == 0):
         b["gate"] = "complete"
     elif attempted == 0:
         b["gate"] = "pending"

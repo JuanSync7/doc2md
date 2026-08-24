@@ -43,8 +43,15 @@ Exit codes:
      hash, or produced no bundle at all).
   4  no divergence was demonstrated, but at least one class could NOT be compared.
      Not an all-clear. Supply what is missing (usually ``--src``, or the
-     ``runs.jsonl`` from the run root) and ask again.
+     ``runs.jsonl`` from the run root) and ask again. This is also the answer when
+     ``--execute`` ran the command and the command itself exited non-zero: the
+     replay did not complete, so nothing downstream of it was compared.
   1  a usage or I/O error.
+
+These four codes are this tool's own vocabulary and nothing else's. The exit code
+of the command a replay executes is PRINTED, never returned — a replayed
+``build_bundle`` exiting 1 is not "replay hit a usage error", and its 3 is not "a
+divergence was demonstrated".
 """
 from __future__ import print_function
 
@@ -609,8 +616,24 @@ def main(argv=None):
 
     ran = subprocess.call(cmd)
     if ran != 0:
-        print("replay exited %d" % ran, file=sys.stderr)
-        return ran
+        # The replay did not finish, so the one thing executing was for — a
+        # replayed bundle to compare — does not exist. Its exit code belongs to the
+        # REPLAYED TOOL's vocabulary, not to this one's: returning it made
+        # `build_bundle` exiting 1 read as "replay hit a usage error", a 3 read as
+        # "a divergence was demonstrated", and a 4 read as "not compared" — three
+        # verdicts this tool never computed. Report only what it knows: the
+        # comparison could not be made (4), unless a divergence was already
+        # demonstrated (3), and print the child's code as the child's.
+        print("replay command exited %d (that is %s's exit code, not this tool's) "
+              "— the replay did not complete, so nothing downstream of it was "
+              "compared" % (ran, os.path.basename(cmd[1] if len(cmd) > 1 else cmd[0])),
+              file=sys.stderr)
+        if args.compare:
+            # Never fall through to _compare here: a stale bundle left at --out by
+            # an earlier replay would compare REPRODUCED for a run that just died.
+            print("--compare cannot answer: the replay produced no bundle for this "
+                  "invocation to compare", file=sys.stderr)
+        return 3 if rc == 3 else 4
     if args.compare:
         # Precedence, not `max()`: a usage error beats everything, a demonstrated
         # difference beats an unverified one, and 0 needs both halves to be clean.

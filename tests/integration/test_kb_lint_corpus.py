@@ -922,3 +922,43 @@ def test_the_corpus_gates_stay_sound_and_affordable_at_a_thousand_documents(
     # took ~58s over 24,630 keyword terms; this budget is loose enough for a shared
     # CI box and tight enough that a return to quadratic sweeping fails here.
     assert elapsed < 60, "corpus gates took %.1fs over 1000 documents" % elapsed
+
+
+def test_a_document_the_linter_can_only_describe_never_stops_the_corpus_scan(
+        tmp_path, capsys):
+    """The contract, end to end: a block full of states the linter merely REPORTS.
+
+    `lint_document` documents that it never raises on bad data, and three of these
+    shapes made it raise anyway — an unhashable record `id` (`TypeError`), and, one
+    layer on, `normalize_document` and the enrichment entry points on the same
+    block. A corpus scan that aborts on one file is useless on a real corpus, and
+    every document after it disappears from the report.
+    """
+    kb = _mod("kb_lint")
+    bundles = tmp_path / "bundles"
+    _write_doc(bundles, "b01", _meta("alpha-runbook"))
+    _write_doc(bundles, "b02", _meta("beta-runbook", [
+        # An unquoted 2.0 is a FLOAT to every YAML 1.1 reader, not revision 2.
+        ("schema_version", 2.0),
+        # The schema declares a mapping of field -> origin record.
+        ("_provenance", "generated"),
+        # A pointer target that cannot be a pointer.
+        ("decisions", [OrderedDict([("id", OrderedDict([("oops", 1)])),
+                                    ("title", "Keep the collector"),
+                                    ("status", "accepted"),
+                                    ("ref", "#overview")])]),
+    ]))
+    _write_doc(bundles, "b03", _meta("gamma-runbook"))
+
+    rc = kb.main(_argv(bundles))
+    out, err = capsys.readouterr()
+
+    assert rc == 1                                   # findings — not a traceback
+    assert "documents=3" in err                      # all three found ...
+    assert "RESULT documents=3 graded=3" in out      # ... and all three GRADED
+    assert "unreadable=0" in out
+    # The version finding names the document and what it read.
+    assert "b02/document.md" in out
+    assert "2.0" in out and "schema_version" in out
+    # The two clean documents are not implicated by their neighbour.
+    assert "b01/document.md" not in out and "b03/document.md" not in out

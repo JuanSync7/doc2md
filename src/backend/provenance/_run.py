@@ -47,9 +47,15 @@ DECISION_CODES = (
 )
 
 # A scheme, then `://`. Used to tell a network URL (a switch that decided the
-# output, and safe to publish) from `file://`, which is an absolute host path
-# wearing a scheme.
+# output, and safe to publish) from `file:///abs` — or any other scheme with an
+# EMPTY authority — which is an absolute host path wearing a scheme.
 _URL = re.compile(r"^([A-Za-z][A-Za-z0-9+.\-]*)://")
+
+# A long option name: everything a `--flag` may be spelled with, so the switch half
+# of `--src/vols/x` can be told from the path half. A long option NEVER attaches its
+# value without `=` (that form is split before this), so whatever follows the name is
+# a value and nothing of the name is at stake.
+_LONG_NAME = re.compile(r"^--[A-Za-z][A-Za-z0-9_\-]*")
 
 
 def path_id(path):
@@ -74,6 +80,40 @@ def corpus_id(rows):
     return hashlib.sha256("\n".join(pairs).encode("utf-8")).hexdigest()
 
 
+def _split_switch(piece):
+    # type: (str) -> tuple
+    """``(switch, rest)`` for a piece that opens with a switch, else ``("", "")``.
+
+    A short option carries its value ATTACHED, with no delimiter for the
+    ``=``/``:``/``,`` tests below to find — ``-o/vols/secret/x`` is how an absolute
+    path used to reach a published artifact verbatim. Splitting the switch off lets
+    the same shape tests run on the value half; the switch half is copied through
+    untouched, so no ordinary switch can be rewritten by this.
+
+    A short option is EXACTLY ONE LETTER. Taking more would mistake the head of a
+    relative value for part of the switch — ``-obuild/out`` is ``-o`` with the
+    value ``build/out``, and hashing ``/out`` out of the middle of it would destroy
+    a replayable value to protect a path that was never there. It must be a letter,
+    so ``-1/2`` is left alone as the number it looks like. The cost is a BUNDLED
+    short option that also carries a path (``-xzf/vols/x``, which nothing here
+    emits): "flags x and z then f=/vols/x" and "flag x with value zf/vols/x" are the
+    same characters, and guessing between them is what this module forbids. Every
+    other spelling — ``-f /vols/x``, ``-f=/vols/x``, ``-f/vols/x`` — is redacted."""
+    if piece.startswith("--"):
+        m = _LONG_NAME.match(piece)
+        # A long option never attaches a value without `=`, so its whole name is
+        # the switch. `--` and `---x` match no name; two characters is still the
+        # part that cannot be a path.
+        cut = m.end() if m else 2
+    elif len(piece) > 1 and piece[0] == "-" and piece[1].isalpha():
+        cut = 2
+    elif piece[:2] in ("-/", "-~"):
+        cut = 1                     # a bare `-` in front of a path
+    else:
+        return ("", "")
+    return (piece[:cut], piece[cut:]) if piece[cut:] else ("", "")
+
+
 def _redact_piece(piece):
     # type: (str) -> str
     """One whitespace-free fragment with any absolute host path replaced by its id.
@@ -89,15 +129,26 @@ def _redact_piece(piece):
     not: ``//vols/private/spec.docx`` is a working POSIX path that resolves exactly
     like ``/vols/private/spec.docx``, and ``file:///vols/...`` went through the same
     door. Only a piece that really opens with ``<scheme>://`` is a URL, and even
-    then the ``file`` scheme is a host path, not a network location."""
+    then an empty authority is a host path, not a network location.
+
+    A path is looked for ANYWHERE in the piece, not only at position 0: it can be
+    glued straight onto a short option (``-o/vols/x``), or sit third in a
+    comma-joined list (``-Wl,-rpath,/opt/lib``), or be the LEFT half of a pair
+    (``char:/vols/x--out=1``). Each test still fires on the VALUE's shape — the
+    switch half is copied through untouched — so no ordinary switch can be
+    rewritten by one of them."""
     m = _URL.match(piece)
     if m:
+        rest = piece[m.end():]
+        if rest.startswith("/"):
+            # An EMPTY AUTHORITY: `file:///vols/private/x`, and `char:///vols/x`
+            # just the same. What decides this is the empty host, not the scheme
+            # name — with nothing between the `//` and the `/`, what follows is a
+            # local path and there is no network location to disclose.
+            return "%s://<path:%s>" % (m.group(1), path_id(rest))
         # `--source-base-url https://wiki/docs` decided every permalink in the
         # bundle and discloses no host path, so it survives verbatim.
-        if m.group(1).lower() != "file":
-            return piece
-        rest = piece[m.end():]
-        return ("file://<path:%s>" % path_id(rest)) if rest.startswith("/") else piece
+        return piece
     if piece.startswith("/") and len(piece) > 1:
         return "<path:%s>" % path_id(piece)
     if piece.startswith("~") and "/" in piece:
@@ -105,17 +156,29 @@ def _redact_piece(piece):
         # directory — and the second form names the user, which this layer must
         # never record.
         return "<path:%s>" % path_id(piece)
-    head, sep, tail = piece.partition("=")
-    # A `k=/abs/path` pair riding inside a compound value:
-    # `--worker-cmd "python3 w.py --out=/vols/private/x"`. The TOP-level `=` form is
-    # split by `redact_argv` before it ever reaches here; this is the buried one.
-    if sep and "/" in tail:
-        return "%s=%s" % (head, _redact_piece(tail))
-    head, sep, tail = piece.partition(":")
-    # A path riding inside a compound value: `char:/home/me/models/tok`. A URL was
-    # returned above, so this test cannot swallow one.
-    if sep and tail.startswith("/"):
-        return "%s:<path:%s>" % (head, path_id(tail))
+    switch, rest = _split_switch(piece)
+    # `-o/vols/private/x`, `-I/usr/include`. An absolute path is a path wherever it
+    # sits in the argument, not only at position 0 or after a delimiter.
+    if switch:
+        return "%s%s" % (switch, _redact_piece(rest))
+    # The delimiters a path can ride behind inside one compound value:
+    #   `=`  `--worker-cmd "python3 w.py --out=/vols/private/x"` (the top-level
+    #        form is split by `redact_argv`; this is the buried one)
+    #   `:`  `--tokenizer char:/home/me/models/tok`
+    #   `,`  `--exclude a,/vols/private/b`, and the linker's `-Wl,-rpath,/opt/lib`
+    # BOTH halves go back through this function. The tail because the path is as
+    # often the third element as the second, and because it can be `~/models/tok`
+    # or carry its own switch; the head because it can hold a path too
+    # (`char:/vols/x--out=1` used to publish its first path whole while carefully
+    # redacting the second). Each half is strictly shorter, so this terminates, and
+    # a half holding no path comes back byte-identical — `--out`, `char`, `-rpath`
+    # and `a/b` are all returned unchanged by the tests above. A URL returned
+    # already, so none of these can swallow one. `=` first, then `:`, then `,`, so
+    # a `k=a,b` pair is still read as one pair.
+    for delim in ("=", ":", ","):
+        head, sep, tail = piece.partition(delim)
+        if sep and "/" in piece:
+            return "%s%s%s" % (_redact_piece(head), delim, _redact_piece(tail))
     return piece
 
 
@@ -185,7 +248,16 @@ def redact_argv(argv, paths=None):
         flag, eq, value = arg.partition("=")
         placeholder = _placeholder_for(flag, paths) if arg.startswith("-") else ""
         if eq:
-            out.append("%s=%s" % (flag, placeholder or _redact_value(value)))
+            # The left half of `--flag=value` is a SWITCH and is copied through, so
+            # it never loses its name to a placeholder. But a left half holding a
+            # `/` is not a switch at all — `/vols/private/x=1` is a positional
+            # argument that happens to contain an `=`, and its path used to be
+            # published whole while the right half was carefully redacted. It goes
+            # through the same shape test as everything else. The right half is
+            # redacted as ONE value, not word by word, so a path with a space in it
+            # (`--out=/vols/spec drafts/x.docx`) still hashes as one path.
+            left = _redact_value(flag) if "/" in flag else flag
+            out.append("%s=%s" % (left, placeholder or _redact_value(value)))
         elif placeholder:
             out.append(arg)
             expect = placeholder

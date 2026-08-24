@@ -687,3 +687,159 @@ def test_lint_document_reports_a_malformed_block_instead_of_raising():
     empty = lint_document(None, _vocab())
     assert empty["findings"] == [] and empty["errors"] == 0
     assert empty["proposals"] == {}
+
+
+def test_normalize_document_never_raises_on_a_value_the_linter_just_reported():
+    # THE CONTRACT THIS PAIR HAS TO KEEP. `lint_document` promises never to raise on
+    # bad data; `normalize_document` consumes the very same block, and
+    # `sorted(set(...), key=str)` hashed BEFORE `key` was applied — so a mapping in a
+    # governed list (the shape the proposals branch exists to catch) reported cleanly
+    # and then crashed the normaliser with `unhashable type: 'dict'`.
+    meta = {"tags": [{"a": 1}, ["b"], "linux", "kafka"]}
+    assert lint_document(meta, _vocab())["errors"] >= 1     # reported, not raised
+
+    out, _changed = normalize_document(meta, _vocab())
+
+    assert out["tags"] == ["linux"]
+    # The non-terms are KEPT, in the slot that exists for them — routing them there
+    # and then losing them to a TypeError would destroy the promotion evidence.
+    assert {"a": 1} in out["tags_proposed"] and ["b"] in out["tags_proposed"]
+    assert "kafka" in out["tags_proposed"]
+    # Deterministic: the rendered form is both the identity and the order, so a
+    # re-run over one document writes the same bytes.
+    assert out["tags_proposed"] == sorted(out["tags_proposed"], key=str)
+    assert normalize_document(meta, _vocab())[0] == out
+
+
+def test_a_proposals_slot_merges_duplicates_without_hashing_them():
+    # The merge is why the slot is read back at all: an existing `_proposed` and the
+    # values being normalised are two sides of one list, and one side arriving first
+    # must not delete the other.
+    meta = {"tags_proposed": [{"a": 1}, "kafka"], "tags": ["kafka", {"a": 1}]}
+    out, _changed = normalize_document(meta, _vocab())
+
+    assert out["tags_proposed"] == ["kafka", {"a": 1}]      # one of each, not four
+
+
+def test_lint_document_reports_a_partial_vocabulary_instead_of_raising():
+    # A `$DOC2MD_VOCAB` that declares no `entity_types` is configuration, not
+    # corruption — and `Vocabulary.group_type` raises on it, so a document whose only
+    # offence was HAVING entities aborted the whole corpus walk with a VocabularyError.
+    partial = load_vocab(text="version: 1\ntags:\n  governance: registry\n"
+                              "  values: []\n")
+    meta = {"entities": {"hosts": [{"name": "db-1"}, {"name": "db-2",
+                                                     "type": "Host"}],
+                         "identifiers": {"gpg": "ABC123"}}}
+
+    result = lint_document(meta, partial)
+
+    assert all(isinstance(f, Finding) for f in result["findings"])
+    # Reported ONCE, naming the term list that could not be consulted...
+    missing = _of(result, "vocab-missing")
+    assert any(f.where == "entities" and "entity_types" in f.message
+               for f in missing)
+    # ... and the untyped entity is still reported, without blaming the DOCUMENT for
+    # a group registration the linter could not look up.
+    untyped = _of(result, "entity-untyped")
+    assert len(untyped) == 1 and "no 'entity_types' vocabulary" in untyped[0].message
+    assert "register the group" not in untyped[0].message
+
+    # A vocabulary that CAN answer still says what it always said.
+    full = lint_document(meta, _vocab())
+    assert _of(full, "vocab-missing") == []
+    assert _of(full, "entity-untyped") == []       # `hosts` implies Host
+
+
+def test_an_unhashable_record_id_is_a_finding_not_a_traceback():
+    # `register_ids.add(rec["id"])` assumed a pointer target is hashable, while the
+    # entity branch beside it already filtered to strings.
+    meta = {"decisions": [{"id": {"oops": 1}, "title": "t", "status": "accepted",
+                           "ref": "#a"}],
+            "risks": [{"id": "r1", "impact": "high", "control": "r1", "ref": "#a"}]}
+
+    result = lint_document(meta, _vocab(), anchors=set(["a"]), known_ids=set())
+
+    assert all(isinstance(f, Finding) for f in result["findings"])
+    # The one register id that IS a pointer still resolves — the guard drops the
+    # unusable value, never the check.
+    assert _of(result, "register-unresolved") == []
+
+
+def test_a_non_string_metadata_key_is_reported_rather_than_asked_for_endswith():
+    # `0644:` and `2:` are keys to any YAML 1.1 reader. `key.endswith` raised on them
+    # inside the loop whose whole purpose is to report a key the schema does not know.
+    result = lint_document({7: "x", "tags": ["linux"]}, _vocab())
+
+    assert [f.where for f in _of(result, "unknown-field")] == ["meta.7"]
+
+
+# ------------------------------------------------ schema version: three states
+
+def test_an_unreadable_schema_version_is_unknown_and_never_reads_as_current():
+    # An unquoted `2.0` is a float to every YAML 1.1 reader. Graded as CURRENT it
+    # silently promoted the missing-citation row from the WARN backfill item a
+    # pre-v3 block earns into an ERROR against a revision the block never claimed.
+    uncited = {"decisions": [{"id": "d1", "title": "t", "status": "accepted"}]}
+
+    unreadable = dict(uncited, schema_version=2.0)
+    result = lint_document(unreadable, _vocab())
+
+    bad = _of(result, "schema-version-unreadable")
+    assert len(bad) == 1 and bad[0].severity == ERROR
+    assert bad[0].where == "meta.schema_version"
+    assert "2.0" in bad[0].message and "float" in bad[0].message   # what it read
+    assert [f.severity for f in _of(result, "record-uncited")] == [WARN]
+
+    # ... and the two states either side of it are unchanged. A DECLARED pre-v3
+    # block is backfill; a block declaring nothing is being written now, so it is
+    # current and the missing citation is a defect.
+    old = lint_document(dict(uncited, schema_version=2), _vocab())
+    assert [f.severity for f in _of(old, "record-uncited")] == [WARN]
+    assert _of(old, "schema-version-unreadable") == []
+
+    unstamped = lint_document(dict(uncited), _vocab())
+    assert [f.severity for f in _of(unstamped, "record-uncited")] == [ERROR]
+    assert _of(unstamped, "schema-version-unreadable") == []
+
+    # A quoted version is readable, and v3 is current: an ordinary bundle is graded
+    # exactly as before and gains no new finding.
+    current = lint_document(dict(uncited, schema_version="3"), _vocab())
+    assert _of(current, "schema-version-unreadable") == []
+    assert [f.severity for f in _of(current, "record-uncited")] == [ERROR]
+
+
+def test_a_cited_record_is_unaffected_by_an_unreadable_schema_version():
+    # The version decides the SEVERITY of a missing citation and nothing else; a
+    # document that cites its sections must not acquire a row for the version alone.
+    meta = {"schema_version": 3,
+            "decisions": [{"id": "d1", "title": "t", "status": "accepted",
+                           "ref": "#a"}]}
+    result = lint_document(meta, _vocab(), anchors=set(["a"]))
+
+    assert _of(result, "record-uncited") == []
+    assert result["errors"] == 0
+
+
+def test_corpus_report_survives_a_row_that_is_not_a_mapping():
+    # `_corpus._rows` is where a malformed row becomes a finding; here it must
+    # simply not be a document with tags in it — and it must not cost the rest of
+    # the corpus its registry health.
+    docs = [{"tags": ["linux"]}, None, "not a document", {"tags": ["linux"]}]
+    report = corpus_report(docs, _vocab())["tags"]
+
+    assert report["documents"] == 4
+    assert report["terms_used"] == 1 and report["singletons"] == 0
+
+
+def test_a_metadata_block_that_is_not_a_mapping_is_one_finding_not_a_traceback():
+    # `meta: draft` is a hand edit away in any front matter, and `meta.keys()` raised
+    # out of the entry point whose contract is that bad data is a FINDING.
+    result = lint_document(["not", "a", "block"], _vocab())
+
+    assert [f.code for f in result["findings"]] == ["meta-malformed"]
+    assert result["errors"] == 1
+    # Nothing pretends to have been checked: no facets, no proposals.
+    assert result["facets"] == [] and result["proposals"] == {}
+
+    # An ordinary block is graded exactly as before.
+    assert lint_document({"tags": ["linux"]}, _vocab())["errors"] == 0

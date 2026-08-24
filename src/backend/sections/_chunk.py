@@ -379,7 +379,10 @@ def _table_headers(lines, fenced=None):
 _DOT_LEADER_TOC = re.compile(r'\.{4,}\s*\d+\s*$')   # "1.2 Overview .......... 7"
 _ATX_HEADING = re.compile(r'^\s{0,3}#{1,6}\s+\S')
 _IMG_LINK = re.compile(r'!\[[^\]]*\]\([^)]+\)')
-_CODE_FENCE = re.compile(r'^\s{0,3}(```|~~~)')
+# The run is captured whole, and the tail with it: a CLOSER must repeat the opener's
+# character with a run at least as long and carry nothing after it but spaces, so a
+# three-character match is not enough to decide anything.
+_CODE_FENCE = re.compile(r'^\s{0,3}(`{3,}|~{3,})(.*)$')
 _TOC_HEADER = re.compile(r'^\s*(table of contents|contents)\s*$', re.I)
 
 
@@ -408,14 +411,34 @@ def fenced_lines(lines):
     what CommonMark does with one, so the mask matches the renderer.
     """
     mask = [False] * len(lines)
-    in_fence = False
+    open_fence = None            # (char, length) of the fence currently open
     for i, line in enumerate(lines):
-        if _CODE_FENCE.match(line):
-            mask[i] = True
-            in_fence = not in_fence
+        m = _CODE_FENCE.match(line)
+        if open_fence is None:
+            if m:
+                run = m.group(1)
+                open_fence = (run[0], len(run))
+                mask[i] = True
             continue
-        mask[i] = in_fence
+        # Inside a fence, ONLY a matching closer ends it: same character, a run at
+        # least as long as the opener, and nothing after it but spaces. Toggling on
+        # any fence-looking line meant a `~~~` inside a ``` block closed it — so the
+        # rest of the code became prose (a `# comment` was published as a heading)
+        # and the prose after the real closer became code (a real heading vanished
+        # from the outline entirely). A transcript that mentions the other fence
+        # character is ordinary, which is what made this reachable.
+        mask[i] = True
+        if m and _closes(m.group(1), m.group(2), open_fence):
+            open_fence = None
     return mask
+
+
+def _closes(run, tail, open_fence):
+    # type: (str, str, tuple) -> bool
+    """CommonMark 4.5: a closer repeats the opener's character with a run at least as
+    long, and carries nothing after it but spaces (an info string opens, never closes)."""
+    char, length = open_fence
+    return run[0] == char and len(run) >= length and not tail.strip()
 
 
 def content_start(lines):

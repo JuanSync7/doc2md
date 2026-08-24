@@ -29,7 +29,7 @@ import datetime
 import hashlib
 import re
 from collections import OrderedDict
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit, urlunsplit
 
 from backend.ingest import markdown_to_text
 
@@ -89,6 +89,44 @@ def value_sha(value):
 
 # Only these three sources mark a value the pipeline produced and may replace.
 _MACHINE_SOURCES = (SOURCE_GENERATED, SOURCE_DERIVED, SOURCE_EXTRACTED)
+
+
+def _prov_block(meta):
+    # type: (dict) -> dict
+    """The per-field provenance table, or an empty one when the block is unreadable.
+
+    A `_provenance` that is not a mapping is a state the corpus really can be in:
+    `_schema.split_meta` and `merge_meta` both carry it through VERBATIM (with the
+    reason written out there), and `_lint._check_authorship` reports it as
+    `provenance-malformed` rather than rejecting the document. Every reader in this
+    module then did `.get` on it and turned that reported document into an
+    `AttributeError` — enrichment aborting on the one document the linter merely
+    describes.
+
+    An empty table is the FAIL-SAFE reading and not merely the convenient one: no
+    entry means `is_authored` treats every existing value as a person's work, so an
+    unreadable provenance block PROTECTS what the document already holds instead of
+    licensing a model to overwrite it. The mapping is returned as-is when it is one,
+    so callers that mutate it (``revalidate_generated``) still mutate the document.
+    """
+    prov = (meta or {}).get(PROVENANCE_KEY)
+    return prov if isinstance(prov, dict) else {}
+
+
+def _prov_entry(prov, name):
+    # type: (dict, str) -> dict
+    """One field's origin record, or an empty one when it is not a mapping.
+
+    The same state one level down, and reachable the same way: `_provenance:
+    {title: generated}` is a scalar where the schema declares a record, which
+    `_lint._check_authorship` reports as `provenance-malformed` ("this field's
+    origin is unverifiable") rather than rejecting the document. `(prov.get(name)
+    or {}).get(...)` then raised on it. No readable entry means no evidence that a
+    machine wrote the value, which `is_authored` already treats as authored — so
+    the empty record is the same fail-safe reading, spelled once.
+    """
+    rec = (prov or {}).get(name)
+    return rec if isinstance(rec, dict) else {}
 
 
 def is_authored(entry, current):
@@ -208,7 +246,22 @@ def request_spec(vocab, wanted=None):
 
 def _empty(value):
     # type: (object) -> bool
-    return value is None or value == "" or value == [] or value == {}
+    """Absent, for the purpose of accepting or counting a value.
+
+    A WHITESPACE-ONLY STRING IS ABSENT. `_lint._empty` already says so — and says it
+    is "the same rule the ACCEPTANCE layer applies (``_enrich._missing_required``)",
+    which it was not: a record whose `ref` was `"  "` passed `_missing_required`
+    here, got stored, and then failed `_lint` forever with `record-uncited` on a
+    document this layer had already accepted. Two gates disagreeing about what
+    "carried" means is a value that can be neither accepted nor repaired.
+
+    Deliberately NOT falsiness, for the same reason `_lint._empty` is not: `0` and
+    `False` are values a record may legitimately hold, and a `line: 0` reading as
+    absent would reject a real citation.
+    """
+    if isinstance(value, str):
+        return not value.strip()
+    return value is None or value == [] or value == {}
 
 
 def _kind_ok(kind, value):
@@ -413,11 +466,18 @@ def accept_model_meta(proposed, vocab, existing=None, model="", prompt_sha="",
     trying to invent".
     """
     existing = existing or {}
-    prov_existing = existing.get(PROVENANCE_KEY) or {}
+    prov_existing = _prov_block(existing)
     accepted = OrderedDict()
     proposals = OrderedDict()
     rejected = []  # type: list
     provenance = OrderedDict()
+
+    if proposed is not None and not isinstance(proposed, dict):
+        # A reply that is not an object contributes nothing, and it is RECORDED as
+        # contributing nothing: the useful question after a run is which answer the
+        # model kept giving, and a traceback here would end the run instead.
+        rejected.append(("<reply>", proposed, "wrong-kind-expected-mapping"))
+        proposed = {}
 
     for name, value in (proposed or {}).items():
         if name not in field_names():
@@ -537,7 +597,11 @@ def accept_model_meta(proposed, vocab, existing=None, model="", prompt_sha="",
 # functions close.
 
 _ATX = re.compile(r"^ {0,3}(#{1,6})[ \t]+(.+?)[ \t]*#*[ \t]*$")
-_FENCE = re.compile(r"^ {0,3}(```|~~~)")
+# The whole run and its tail: a closer repeats the OPENER's character with a run at
+# least as long and carries nothing after it but spaces (CommonMark 4.5). Toggling on
+# any fence-looking line let a `~~~` inside a ``` listing end it, so the summary this
+# function harvests could be lifted out of the middle of a code block.
+_FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
 # Lines that are structure rather than prose: list bullets, ordered items, table
 # rows and separators, block quotes, HTML/comment sentinels, link/image-only lines.
 _NOT_PROSE = re.compile(r"^ {0,3}([-*+>|]|\d+[.)]\s|<!--|<[a-zA-Z/]|!\[)")
@@ -697,12 +761,16 @@ def _lede_lines(body_md, outline=None):
             start = max(0, min(span[0], len(lines)))
             break
     out = []  # type: list
-    in_code = False
+    opened = None  # type: tuple
     for line in lines[start:]:
-        if _FENCE.match(line):
-            in_code = not in_code
+        m = _FENCE.match(line)
+        if opened is not None:                     # inside a fence: all of it is code
+            if (m and m.group(1)[0] == opened[0] and len(m.group(1)) >= opened[1]
+                    and not m.group(2).strip()):
+                opened = None
             continue
-        if in_code:
+        if m:                                      # this line opens one
+            opened = (m.group(1)[0], len(m.group(1)))
             continue
         stripped = line.strip()
         if not stripped:
@@ -768,6 +836,30 @@ def link_category(url):
     return "ecosystem" if text.startswith(("http://", "https://")) else "internal"
 
 
+def _url_identity(url):
+    # type: (str) -> str
+    """What makes two URLs the SAME edge — RFC 3986 §6.2.2.1, and nothing more.
+
+    ONLY the scheme and the host are case-insensitive. Everything after them — path,
+    query, fragment — is case-SENSITIVE on the web, and `url.lower()` therefore made
+    ``/Guide`` and ``/guide`` one edge and threw the second one away, silently, as a
+    duplicate. Two distinct documents is exactly what those two URLs usually are.
+
+    Folding the two components the RFC does declare case-insensitive keeps the
+    duplicate suppression this dedupe exists for (one URL cited in three sections is
+    one edge), and userinfo is left alone because the RFC does not declare it
+    case-insensitive either.
+    """
+    text = (url or "").strip()
+    parts = urlsplit(text)
+    if not parts.scheme and not parts.netloc:
+        return text                    # relative ref / fragment: nothing to fold
+    userinfo, at, hostport = parts.netloc.rpartition("@")
+    netloc = (userinfo + at + hostport.lower()) if at else parts.netloc.lower()
+    return urlunsplit((parts.scheme.lower(), netloc, parts.path, parts.query,
+                       parts.fragment))
+
+
 def harvested_links(outline, anchors=None):
     # type: (list, set) -> OrderedDict
     """Every outbound URL the body carries, grouped by category — tier 0.
@@ -808,9 +900,10 @@ def harvested_links(outline, anchors=None):
             if not isinstance(url, str) or not url.strip():
                 continue
             url = url.strip()
-            if url.lower() in seen:
+            identity = _url_identity(url)
+            if identity in seen:
                 continue
-            seen.add(url.lower())
+            seen.add(identity)
             rec = OrderedDict()
             text = (link.get("text") or "").strip()
             if text:
@@ -841,6 +934,13 @@ def _record_identity(rec):
     for key in ("url", "name", "id", "s"):
         val = rec.get(key)
         if isinstance(val, str) and val.strip():
+            # A URL is folded by the RFC's rule (`_url_identity`), not by
+            # `.lower()`: a proposed link to `/Guide` is not a duplicate of a
+            # harvested `/guide`, and dropping it as one loses an edge. The other
+            # three keys are NAMES, where case is deliberately not an identity —
+            # the same reading `_corpus.norm_key` applies to every entity.
+            if key == "url":
+                return "url=%s" % _url_identity(val)
             return "%s=%s" % (key, val.strip().lower())
     return _stable_repr(rec)
 
@@ -858,7 +958,13 @@ def merge_group_evidence(existing, incoming):
     """
     evidence = OrderedDict()
     known = set()
-    for gname, members in (existing or {}).items():
+    # A hand-edited `links: none` reaches here whenever the block's provenance says
+    # a machine wrote it, and `.items()` on it aborted the enricher over a document
+    # `_lint` reports as `field-malformed`. A value that is not a mapping of groups
+    # holds no evidence RECORD, so there is none to protect: the incoming block
+    # stands, and the linter still grades what gets written.
+    existing = existing if isinstance(existing, dict) else {}
+    for gname, members in existing.items():
         if not isinstance(members, list):
             continue
         keep = [m for m in members
@@ -1002,20 +1108,62 @@ def order_meta(meta):
             if key in meta:
                 out[key] = meta[key]
                 placed.add(key)
-    for key in sorted(meta):
+    # `key=str` because a metadata block may hold a key that is not a string —
+    # `0644:` and `2:` are keys to any YAML 1.1 reader — and `sorted` then raises
+    # `'<' not supported between 'str' and 'int'` while merely ORDERING a block.
+    # For the ordinary all-string block the key is the identity, so nothing moves.
+    for key in sorted(meta, key=str):
         if key not in placed and key != PROVENANCE_KEY:
             out[key] = meta[key]
     prov = meta.get(PROVENANCE_KEY)
-    if prov:
-        ordered = OrderedDict()
-        for name in field_names():
-            if name in prov:
-                ordered[name] = prov[name]
-        for name in sorted(prov):
-            if name not in ordered:
-                ordered[name] = prov[name]
-        out[PROVENANCE_KEY] = ordered
+    if isinstance(prov, dict):
+        if prov:
+            ordered = OrderedDict()
+            for name in field_names():
+                if name in prov:
+                    ordered[name] = prov[name]
+            for name in sorted(prov, key=str):
+                if name not in ordered:
+                    ordered[name] = prov[name]
+            out[PROVENANCE_KEY] = ordered
+    elif prov:
+        # A NON-MAPPING `_provenance` IS CARRIED THROUGH VERBATIM, in the same last
+        # slot. `sorted(prov)` over a string used to yield its characters and
+        # `prov[name]` then raised `string indices must be integers` — ordering a
+        # block is not the place to crash on it, and it is not the place to delete it
+        # either: `split_meta` keeps it deliberately so the linter can report it, and
+        # a write path that dropped it would remove the evidence between the run that
+        # found it and the run that reports it.
+        out[PROVENANCE_KEY] = prov
     return out
+
+
+def _merge_proposed(existing, new):
+    # type: (object, object) -> list
+    """Merge values into a ``<field>_proposed`` slot: deduplicated and deterministic.
+
+    NOTHING HERE MAY BE HASHED OR COMPARED. The slot holds what did NOT pass as a
+    term, and `vocab.normalize` returns a non-string value UNCHANGED, so a
+    `tags: [{...}]` stamped `generated` reached `sorted(set(...))` and raised
+    `unhashable type: 'dict'` — inside the function whose job is to survive a
+    vocabulary bump over whatever the corpus happens to hold. A mixed `["a", 1]`
+    raised from `sorted` for the second reason.
+
+    Identity and order are both the RENDERED form: two values that print the same are
+    one proposal, and nothing depends on hash iteration order. `_lint._merge_proposed`
+    states the same rule for the lint path, which writes the same slot; the two are
+    written separately and pinned to each other by test_kb_enrich.py rather than
+    coupled by an import.
+    """
+    out = []  # type: list
+    seen = set()
+    for v in list(existing or []) + list(new or []):
+        text = "%s" % (v,)
+        if text in seen:
+            continue
+        seen.add(text)
+        out.append(v)
+    return sorted(out, key=lambda v: "%s" % (v,))
 
 
 def revalidate_generated(meta, vocab):
@@ -1042,7 +1190,7 @@ def revalidate_generated(meta, vocab):
     ``value_sha`` in place makes the very next run see a value whose fingerprint does
     not match, conclude a person edited it, and freeze it as authored forever.
     """
-    prov = meta.get(PROVENANCE_KEY) or {}
+    prov = _prov_block(meta)
     moved = []  # type: list
 
     def refingerprint(name):
@@ -1054,7 +1202,7 @@ def revalidate_generated(meta, vocab):
     for name in list(meta.keys()):
         if name == PROVENANCE_KEY or name not in field_names():
             continue
-        if (prov.get(name) or {}).get("source") != SOURCE_GENERATED:
+        if _prov_entry(prov, name).get("source") != SOURCE_GENERATED:
             continue
         if is_authored(prov.get(name), meta.get(name)):
             continue          # stamped generated, but edited since — a human's work
@@ -1136,7 +1284,7 @@ def revalidate_generated(meta, vocab):
                 prov.pop(name, None)
                 if status == "proposed":
                     slot = proposed_key(name)
-                    meta[slot] = sorted(set(list(meta.get(slot) or []) + [canonical]))
+                    meta[slot] = _merge_proposed(meta.get(slot), [canonical])
                 moved.append((name, value, status))
         else:
             keep, prop, drop = [], [], []
@@ -1150,7 +1298,7 @@ def revalidate_generated(meta, vocab):
                     drop.append(v)
             if prop:
                 slot = proposed_key(name)
-                meta[slot] = sorted(set(list(meta.get(slot) or []) + prop))
+                meta[slot] = _merge_proposed(meta.get(slot), prop)
                 moved.extend((name, v, "proposed") for v in prop)
             for v in drop:
                 moved.append((name, v, "rejected"))
@@ -1191,10 +1339,22 @@ def set_provenance(meta, name, source, model="", prompt_sha="", value=None):
     PROV-O's per-field ``wasGeneratedBy``, kept as plain nested YAML. This is what
     makes ``authored wins`` enforceable later instead of being a convention nobody
     can check.
+
+    A `_provenance` that is NOT a mapping is REPLACED rather than written into (it
+    used to raise ``'str' object does not support item assignment`` and abort the
+    enricher). Nothing is lost that this block could hold: `_provenance` is a table of
+    field -> origin record, so a scalar or a list in that slot carries no field's
+    origin at all, and the alternative — recording nothing — is worse than it looks.
+    A value this run wrote with no origin recorded reads to the NEXT run as a value
+    with no provenance, i.e. as authored, which freezes a machine value permanently.
+    Repairing the block is what a write path is for; the linter reports the state it
+    found on the read path, where the evidence still exists.
     """
     if name not in field_names():
         return
-    prov = meta.setdefault(PROVENANCE_KEY, OrderedDict())
+    if not isinstance(meta.get(PROVENANCE_KEY), dict):
+        meta[PROVENANCE_KEY] = OrderedDict()
+    prov = meta[PROVENANCE_KEY]
     prov[name] = _prov(source, model, prompt_sha,
                        meta.get(name) if value is None else value)
 
@@ -1282,7 +1442,7 @@ def meta_coverage(meta, vocab):
     while ``kb_lint`` reported the same block as six ERRORs.
     """
     meta = meta or {}
-    prov = meta.get(PROVENANCE_KEY) or {}
+    prov = _prov_block(meta)
     expected = filled = authored = invalid = 0
     for f in FIELDS:
         if not model_writable(f.name):
@@ -1305,7 +1465,7 @@ def meta_coverage(meta, vocab):
             ok = False
         if ok:
             filled += 1
-            if (prov.get(f.name) or {}).get("source") == SOURCE_AUTHORED:
+            if _prov_entry(prov, f.name).get("source") == SOURCE_AUTHORED:
                 authored += 1
         else:
             invalid += 1

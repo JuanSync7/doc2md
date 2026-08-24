@@ -8,6 +8,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import sys
 from collections import OrderedDict
 
 import pytest
@@ -369,7 +370,13 @@ def test_a_model_outage_leaves_the_fields_pending_and_the_run_re_runnable(tmp_pa
 
     rc = em.main(["--bundles", root, "--run-id", "R1"], client=down)
 
-    assert rc == 0 and down.calls == 1   # an outage leaves PENDING, not a failure
+    # The ARTIFACT of an outage is a gap, never a guess and never an empty value —
+    # everything below this line pins that, and none of it changed. The VERDICT is
+    # the part that was wrong: exiting 0 said "the tiers you asked for ran", which
+    # is the one thing that did not happen, and a nightly backfill against a model
+    # that had been down for a week reported success every night. 4 = asked for,
+    # never answered; re-run when it is up.
+    assert rc == 4 and down.calls == 1
     _fm, meta, body = _meta(d)
     # Nothing INVENTED — but the deterministic floor is not the model's work and does
     # not go missing when the model does. What is absent is every field that needs
@@ -481,6 +488,130 @@ def test_the_exit_code_says_whether_the_corpus_needs_another_run(tmp_path):
     assert em.main(["--bundles", broken, "--run-id", "R1"],
                    client=_StubClient(FULL_REPLY)) == 1
     assert _coverage(broken)[-1]["status"] == "unparseable"
+
+    # 4 — a model was ASKED FOR and answered for nothing. Deliberately NOT 0: the
+    # artifacts are indistinguishable from a deterministic run's, and a deterministic
+    # run is a choice while this is an outage. Ahead of --fail-on-pending's 3,
+    # because the outage is the CAUSE of the pending fields.
+    down = os.path.join(str(tmp_path), "outage")
+    os.makedirs(down)
+    _bundle(down, doc_id="unanswered")
+    assert em.main(["--bundles", down, "--run-id", "R1"],
+                   client=_StubClient(FULL_REPLY, ok=False)) == 4
+    assert em.main(["--bundles", down, "--run-id", "R1", "--fail-on-pending"],
+                   client=_StubClient(FULL_REPLY, ok=False)) == 4
+
+    # 0 — the SAME artifacts when nobody asked for a model. This is the line that
+    # keeps the code above from being "pending is a failure" in disguise.
+    quiet = os.path.join(str(tmp_path), "quiet")
+    os.makedirs(quiet)
+    d_quiet = _bundle(quiet, doc_id="offline")
+    assert em.main(["--bundles", quiet, "--run-id", "R1"]) == 0
+    assert _report(d_quiet)["doc_meta"]["pending"] > 0
+
+
+def test_an_endpoint_that_was_named_and_never_answered_is_not_a_deterministic_run(
+        tmp_path, monkeypatch, capsys):
+    """`--vlm-url` at an address nothing is listening on.
+
+    The health check fails, the client is dropped and the run writes exactly the
+    tiers a no-model run writes — which is right. What was wrong is that it then
+    exited 0, so the two runs a person has to be able to tell apart ("I asked for
+    deterministic" and "I asked for a model and the box was down") were the same
+    number, and no `set -e` chain could see the difference.
+    """
+    import types
+
+    stub = types.ModuleType("vlm_client")
+
+    class _Unreachable(object):
+        model = "stub-lm"
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def healthy(self, timeout=5):
+            return False
+
+    stub.VlmClient = _Unreachable
+    monkeypatch.setitem(sys.modules, "vlm_client", stub)
+
+    em = _mod("enrich_metadata")
+    root, d = _bundles(tmp_path)
+    rc = em.main(["--bundles", root, "--run-id", "R1",
+                  "--vlm-url", "http://127.0.0.1:1/v1/chat/completions"])
+    assert rc == 4
+    assert "not reachable" in capsys.readouterr().err
+    # The artifacts are the deterministic ones, unharmed and re-runnable.
+    _fm, meta, body = _meta(d)
+    assert body == BODY and meta["uid"] == "specs/aaa.docx"
+    assert _report(d)["doc_meta"]["pending"] > 0
+
+    # ...and the other edge of the same rule: a corpus that needed NOTHING from the
+    # model loses nothing when the model is down. 4 reports a gap, not an opinion
+    # about the endpoint, so with no gap it must not fire.
+    full = os.path.join(str(tmp_path), "full")
+    os.makedirs(full)
+    vocab = _seeded_vocab(tmp_path)
+    d_full = _bundle(full, doc_id="complete")
+    assert em.main(["--bundles", full, "--vocab", vocab, "--run-id", "R1"],
+                   client=_StubClient(FULL_REPLY)) == 0
+    assert _report(d_full)["doc_meta"]["gate"] == "complete"
+    assert em.main(["--bundles", full, "--vocab", vocab, "--run-id", "R2",
+                    "--vlm-url", "http://127.0.0.1:1/v1/chat/completions"]) == 0
+
+
+def test_a_hand_edited_provenance_block_is_enriched_rather_than_crashed_on(tmp_path):
+    """`_provenance: generated` — a block a person flattened by hand.
+
+    `backend.kb` carries a non-mapping `_provenance` through verbatim on purpose and
+    `kb_lint` reports it as `provenance-malformed`; enrichment used to die on it with
+    `AttributeError: 'str' object has no attribute 'get'` at five separate reads, so
+    the one document the linter merely described was the one document nothing could
+    enrich — and the failure was recorded against the DOCUMENT, as if its content
+    were at fault.
+
+    Fail-safe, not repaired-in-place: a block that is not a mapping records no
+    field's origin, so every value already there is treated as a person's work and
+    kept, and what this run writes is stamped properly so the NEXT run reads real
+    records instead of inheriting an unreadable one forever.
+    """
+    em = _mod("enrich_metadata")
+    root, d = _bundles(tmp_path)
+    fm, body = split_front_matter(_read(d))
+    fm[META_KEY] = OrderedDict([("id", "aaa"), ("title", "Hand Written Title"),
+                                (PROVENANCE_KEY, "generated")])
+    with open(os.path.join(d, "document.md"), "w", encoding="utf-8") as fh:
+        fh.write(render_front_matter(fm) + "\n" + body)
+
+    assert em.main(["--bundles", root, "--run-id", "R1"]) == 0
+    assert _coverage(root)[-1]["status"] != "error"
+
+    _fm2, meta, body2 = _meta(d)
+    assert body2 == BODY                                   # the body is never touched
+    assert meta["title"] == "Hand Written Title"           # authored value protected
+    block = meta[PROVENANCE_KEY]
+    assert isinstance(block, dict) and block.get("slug", {}).get("source") == "derived"
+
+
+def test_a_provenance_record_that_is_not_a_mapping_is_survived_too(tmp_path):
+    """One level down: `_provenance: {title: generated}`, a record written as a bare
+    source string. `kb_lint` calls this "this field's origin is unverifiable"; here
+    it crashed on the same read."""
+    em = _mod("enrich_metadata")
+    root, d = _bundles(tmp_path)
+    fm, body = split_front_matter(_read(d))
+    fm[META_KEY] = OrderedDict([
+        ("id", "aaa"), ("title", "Hand Written Title"),
+        (PROVENANCE_KEY, OrderedDict([("title", "generated")]))])
+    with open(os.path.join(d, "document.md"), "w", encoding="utf-8") as fh:
+        fh.write(render_front_matter(fm) + "\n" + body)
+
+    assert em.main(["--bundles", root, "--run-id", "R1"]) == 0
+    assert _coverage(root)[-1]["status"] != "error"
+    _fm2, meta, _b = _meta(d)
+    # An unreadable record cannot say "machine wrote this", so the value is kept.
+    assert meta["title"] == "Hand Written Title"
 
 
 def test_a_source_with_no_title_stays_idempotent_once_the_model_supplies_one(tmp_path):

@@ -103,6 +103,30 @@ jobs:
         with:
           name: eval-office-report
           path: eval-office.txt
+      # The executable rubric (docs/quality-plan.md's A–E table). It exits 0 only on
+      # an overall A, so the grade cannot slide from A to D with every other check
+      # green — which is exactly what could happen while this ran nowhere. --json
+      # puts the whole row-by-row verdict on stdout (progress goes to stderr), so
+      # the log and the uploaded artifact are the same bytes.
+      #
+      # BEFORE the enrich+lint pair, and that order is load-bearing. The rubric
+      # grades its own corpus in a temp workdir, but its B/D suite rows are answered
+      # by RUNNING the suites — including `evals/run_eval.py`, which takes its
+      # defaults and so rebuilds `data/eval_bundles` in place. Run last, it
+      # overwrote the very bundles the linter had just graded: `kb-lint.txt` said
+      # `graded=14 errors=0` while the artifacts left on disk carried no metadata
+      # block at all, so the uploaded report and the uploaded bundles were two
+      # different corpora and neither named the other. Whatever the last step
+      # writes is what the artifacts are, so the last step is the one whose verdict
+      # is about them.
+      - name: Grade the output against the rubric
+        shell: bash        # -o pipefail: tee must not mask a non-A grade
+        run: python3 scripts/grade_output.py --json | tee grade-output.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: grade-output
+          path: grade-output.json
       # The KB linter over the bundles the eval just wrote. Nonzero exit = a
       # metadata container that lost its shape, a record nothing can check, a
       # dangling ref, or a corpus-wide gate. It ran in no CI job at all before.
@@ -112,7 +136,10 @@ jobs:
       # `graded=0 no-metadata=14` — exit 0 over nothing, which is the shape of
       # gate this project exists to refuse. A no-model run fills the tier-0/1
       # deterministic floor and exits 0 (pending fields are a fact, not a
-      # failure), which gives the linter 14 real documents to grade.
+      # failure), which gives the linter 14 real documents to grade. No `--vlm-url`
+      # is passed, so this is a deterministic run BY CHOICE: exit 4 ("a model was
+      # asked for and never answered") cannot arise here, and if it ever did it
+      # would be a real failure of this step rather than a pending-field count.
       - name: Enrich the eval bundles offline, then lint them
         shell: bash
         run: |
@@ -123,19 +150,34 @@ jobs:
         with:
           name: kb-lint-report
           path: kb-lint.txt
-      # The executable rubric (docs/quality-plan.md's A–E table). It exits 0 only on
-      # an overall A, so the grade cannot slide from A to D with every other check
-      # green — which is exactly what could happen while this ran nowhere. --json
-      # puts the whole row-by-row verdict on stdout (progress goes to stderr), so
-      # the log and the uploaded artifact are the same bytes.
-      - name: Grade the output against the rubric
-        shell: bash        # -o pipefail: tee must not mask a non-A grade
-        run: python3 scripts/grade_output.py --json | tee grade-output.json
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: grade-output
-          path: grade-output.json
+      # The bundles the linter graded are the bundles this job leaves behind: the
+      # eval must not have been re-run after the lint. A cheap, direct check of
+      # exactly the property the step order above exists to hold — it fails loudly
+      # if a later step is ever inserted that rewrites the corpus underneath the
+      # report.
+      - name: The graded bundles are the linted bundles
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import glob, os, sys
+          sys.path.insert(0, "src")
+          from backend.ingest import split_front_matter
+          roots = sorted(d for d in glob.glob("data/eval_bundles/*")
+                         if os.path.isfile(os.path.join(d, "document.md")))
+          missing = []
+          for d in roots:
+              with open(os.path.join(d, "document.md"), encoding="utf-8") as fh:
+                  fm, _body = split_front_matter(fh.read())
+              if not (fm or {}).get("meta"):
+                  missing.append(os.path.basename(d))
+          print("bundles=%d without a meta block=%d %s"
+                % (len(roots), len(missing), " ".join(missing)))
+          if not roots or missing:
+              print("::error::data/eval_bundles carries no metadata block — it was "
+                    "rewritten after the enrich+lint pair, so kb-lint.txt does not "
+                    "describe these bytes")
+              sys.exit(1)
+          PY
 
   eval-pdf:
     # Heavy ring: docling + torch. Nightly + manual only — not per-push.

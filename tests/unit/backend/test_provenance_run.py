@@ -84,6 +84,81 @@ def test_an_ordinary_switch_is_never_rewritten_into_a_path_placeholder():
     assert redact_argv(["--sr", "/vols/x"], {"--src": "<src>"}) == ["--sr", "<src>"]
 
 
+def test_a_path_glued_straight_onto_a_switch_is_still_a_path():
+    """`-o/vols/secret/x` reached `report.json` and `runs.jsonl` verbatim.
+
+    Redaction tested position 0, a `=` pair and a `:` pair, and a short option is
+    the one place a value attaches with NO delimiter for any of those to find. The
+    root `CLAUDE.md` forbids an absolute host path in published output outright, so
+    "no CLI here happens to spell it that way today" is not a defence — `--stage`
+    and `--worker-cmd` publish whole command lines somebody else wrote.
+    """
+    assert redact_argv(["-o/vols/private/x"]) == [
+        "-o<path:%s>" % path_id("/vols/private/x")]
+    assert redact_argv(["-I/vols/private/inc"]) == [
+        "-I<path:%s>" % path_id("/vols/private/inc")]
+    assert redact_argv(["-o~/private/x"]) == [
+        "-o<path:%s>" % path_id("~/private/x")]
+    # a long flag never attaches a value without `=`, but if one shows up the path
+    # half is still a path
+    assert redact_argv(["--src/vols/private/x"]) == [
+        "--src<path:%s>" % path_id("/vols/private/x")]
+    # third in a comma-joined list is as much a leak as first
+    assert redact_argv(["--exclude=a,/vols/private/b"]) == [
+        "--exclude=a,<path:%s>" % path_id("/vols/private/b")]
+    assert redact_argv(["-Wl,-rpath,/vols/private/lib"]) == [
+        "-Wl,-rpath,<path:%s>" % path_id("/vols/private/lib")]
+    # and buried inside a command line, where a whole `cc` invocation can ride
+    assert "/vols/private" not in " ".join(
+        redact_argv(["--stage", "cc -o/vols/private/x -Ibuild"]))
+    # a `:` pair whose tail is not a bare `/...` — a home directory, or its own
+    # switch — was read as "no path here" and published whole
+    assert redact_argv(["--tokenizer", "char:~/models/tok"]) == [
+        "--tokenizer", "char:<path:%s>" % path_id("~/models/tok")]
+    # the LEFT half of an `=` is a switch and is copied through, so a left half
+    # that is really a path went out untouched while the right half was redacted
+    assert redact_argv(["/vols/private/x=1"]) == [
+        "<path:%s>=1" % path_id("/vols/private/x")]
+    assert "/vols/private" not in " ".join(
+        redact_argv(["-Wl,-rpath,/vols/private/lib--flag=1"]))
+    # an EMPTY AUTHORITY is a local path whatever the scheme spells itself: with
+    # nothing between the `//` and the `/` there is no host to disclose
+    assert redact_argv(["--only", "char:///vols/private/x"]) == [
+        "--only", "char://<path:%s>" % path_id("/vols/private/x")]
+
+
+def test_a_switch_that_carries_a_relative_value_is_left_exactly_alone():
+    """The other direction, which a previous review already caught once.
+
+    `-obuild/out` is `-o` with the value `build/out`: a relative path discloses
+    nothing, and hashing `/out` out of the middle of it would destroy a value
+    `replay_run` needs while protecting a path that was never there. A short option
+    is therefore read as EXACTLY ONE letter — the value starts right after it.
+    """
+    assert redact_argv(["-obuild/out"]) == ["-obuild/out"]
+    assert redact_argv(["-o", "out.md"]) == ["-o", "out.md"]
+    assert redact_argv(["-j4", "-v", "-n", "5"]) == ["-j4", "-v", "-n", "5"]
+    assert redact_argv(["--exclude=a,b"]) == ["--exclude=a,b"]
+    assert redact_argv(["--x", "s/a/b/"]) == ["--x", "s/a/b/"]
+    assert redact_argv(["--only", "relative/path/spec.docx"]) == [
+        "--only", "relative/path/spec.docx"]
+    # `-1/2` is a number, not a switch carrying a path: a short option must be a
+    # LETTER before its value is split off
+    assert redact_argv(["-1/2"]) == ["-1/2"]
+    # a network URL still survives whole, wherever the comma test might have bitten
+    assert redact_argv(["--source-base-url", "https://wiki.example.com/a,b"]) == [
+        "--source-base-url", "https://wiki.example.com/a,b"]
+    # a `=` / `:` / `,` half that holds no path comes back byte-identical, so the
+    # halves can be redacted without any of them being rewritten
+    assert redact_argv(["--tokenizer", "char:models/tok", "a:b=c/d",
+                        "-Wl,-rpath,build/lib", "--exclude=a,b"]) == [
+        "--tokenizer", "char:models/tok", "a:b=c/d",
+        "-Wl,-rpath,build/lib", "--exclude=a,b"]
+    # a path with a space in it is still hashed as ONE path, not word by word
+    assert redact_argv(["--out=/vols/spec drafts/radar spec.docx"]) == [
+        "--out=<path:%s>" % path_id("/vols/spec drafts/radar spec.docx")]
+
+
 def test_a_file_url_is_an_absolute_path_wearing_a_scheme():
     """`//` was waved through as "a scheme-relative URL, not a path". It is both.
 
@@ -122,6 +197,12 @@ def test_no_absolute_path_survives_redaction():
     ["--only", "//vols/private/spec.docx"],               # `//abs` resolves as `/abs`
     ["--vocab", "~/vols/private/vocab.yaml"],             # a home directory
     ["--worker-cmd", "python3 w.py --out=/vols/private/x"],  # buried `k=/abs`
+    ["-o/vols/private/x"],                                # glued to a short option
+    ["-Wl,-rpath,/vols/private/lib"],                     # third in a comma list
+    ["--stage", "cc -o/vols/private/x"],                  # glued, inside a command
+    ["--tokenizer", "char:~/vols/private/models/tok"],    # a `:` tail that is a `~`
+    ["/vols/private/x=1"],                                # the LEFT half of an `=`
+    ["--only", "char:///vols/private/x"],                 # an empty authority
 ])
 def test_no_flag_spelling_can_carry_an_absolute_path_out(argv):
     # The one invariant: whatever the switch, whatever its abbreviation, the VALUE

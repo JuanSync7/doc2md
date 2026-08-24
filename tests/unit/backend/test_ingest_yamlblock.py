@@ -158,6 +158,96 @@ def test_split_front_matter_leaves_a_document_without_front_matter_untouched():
     assert split_front_matter(None) == (OrderedDict(), "")
 
 
+def test_a_document_written_with_crlf_line_endings_still_has_front_matter():
+    # The fence pattern knew only `---\n`, so a Windows-authored document reported
+    # NO front matter and returned the whole file as body. `enrich_metadata` splits,
+    # believes that answer, and PREPENDS a fresh block — so the document ends up
+    # carrying two, and `grade_output` / `kb_lint` / the parity test all read the
+    # stale first one while the pipeline reports it replaced it. Returning a wrong
+    # value silently is the one outcome this codec forbids.
+    crlf = ("---\r\n"
+            "doc_id: \"d1\"\r\n"
+            "tags:\r\n"
+            "  - \"spec\"\r\n"
+            "rationale: |\r\n"
+            "  line one\r\n"
+            "  line two\r\n"
+            "---\r\n"
+            "\r\n"
+            "# Heading\r\n")
+    meta, body = split_front_matter(crlf)
+    assert meta == od(("doc_id", "d1"), ("tags", ["spec"]),
+                      # `\r\n` is a LINE BREAK, not content: YAML 1.2 §5.4
+                      # normalises every break to `\n`, and so does PyYAML. A block
+                      # scalar is the only place the raw lines reach a value, and it
+                      # used to come back with a stray `\r` on every line.
+                      ("rationale", "line one\nline two\n"))
+    # Exactly one separator line ending is dropped, both of its bytes: the body is
+    # the bytes `markdown_sha256` covers and must not gain a leading `\r`.
+    assert body == "# Heading\r\n"
+    # The same document with LF endings means the same thing.
+    lf = crlf.replace("\r\n", "\n")
+    assert split_front_matter(lf) == (meta, "# Heading\n")
+
+
+def test_a_sequence_item_is_a_mapping_that_starts_at_its_key_not_at_the_dash():
+    # `- k:` used to take the DASH's column as the parent indent, so ANY deeper line
+    # became the value of `k`. A line at the key's own column is a SIBLING key of
+    # the same record to every YAML reader, and filing it one level down rewrites a
+    # hand-authored record with nothing to warn the author — the silent misparse
+    # this codec exists to prevent. (Each expectation below is PyYAML's answer for
+    # the same text; PyYAML cannot be imported here, so it is transcribed.)
+    assert parse_block("list:\n  - k:\n    j: w\n") == od(
+        ("list", [od(("k", None), ("j", "w"))]))
+    # The key's column follows the dash's own spacing, not a fixed offset.
+    assert parse_block("list:\n  -   k:\n      j: w\n") == od(
+        ("list", [od(("k", None), ("j", "w"))]))
+    # A block scalar under `- k:` belongs to the key too, so it stops at the
+    # sibling instead of swallowing it.
+    assert parse_block("list:\n  - k: |\n      text\n    j: w\n") == od(
+        ("list", [od(("k", "text\n"), ("j", "w"))]))
+
+
+def test_a_line_deeper_than_the_item_keys_is_still_that_key_s_own_value():
+    # The other direction: the fix must not start rejecting records that are
+    # correct. Anything DEEPER than the item's keys is that key's value, and a
+    # block sequence is allowed to sit at its key's own column ("zero-indented"),
+    # which is how a list of records inside a record is usually written.
+    assert parse_block("list:\n  - k:\n      j: w\n") == od(
+        ("list", [od(("k", od(("j", "w"))))]))
+    assert parse_block("a:\n  - k:\n      x: 1\n    y: 2\n") == od(
+        ("a", [od(("k", od(("x", 1))), ("y", 2))]))
+    assert parse_block("list:\n  - k:\n    - a\n") == od(("list", [od(("k", ["a"]))]))
+    assert parse_block("list:\n  - k:\n      - a\n") == od(("list", [od(("k", ["a"]))]))
+    assert parse_block("list:\n  - k:\n    - a\n    j: w\n") == od(
+        ("list", [od(("k", ["a"]), ("j", "w"))]))
+    assert parse_block("list:\n  - k: v\n    j: w\n") == od(
+        ("list", [od(("k", "v"), ("j", "w"))]))
+    assert parse_block("list:\n  - k: [1, 2]\n    j: w\n") == od(
+        ("list", [od(("k", [1, 2]), ("j", "w"))]))
+    assert parse_block("list:\n  - k: |\n     text\n") == od(
+        ("list", [od(("k", "text\n"))]))
+
+
+@pytest.mark.parametrize("label,text", [
+    # PyYAML raises a ParserError or a ScannerError on every one of these; the
+    # module's rule is to raise on what it does not support rather than pick one of
+    # the two readings. What each used to come back as is in the comment.
+    ("a pair between the dash and the key",
+     "list:\n  - k:\n   j: w\n"),                       # {'k': {'j': 'w'}}
+    ("a sequence between the dash and the key",
+     "list:\n  - k:\n   - a\n"),                        # {'k': ['a']}
+    ("a pair deeper than an item whose key already has a value",
+     "list:\n  - k: v\n      j: w\n"),                  # {'k': 'v', 'j': 'w'}
+    ("a block scalar less indented than its own key",
+     "list:\n  - k: |\n   text\n"),                     # {'k': 'text\n'}
+])
+def test_a_sequence_item_refuses_an_indentation_no_reader_agrees_on(label, text):
+    with pytest.raises(YamlSubsetError) as exc:
+        parse_block(text)
+    assert re.search(r"line \d+", str(exc.value))     # the message names the line
+
+
 @pytest.mark.parametrize("label,text", [
     ("tab indentation", "a: 1\n\tb: 2\n"),
     ("document marker ---", "a: 1\n---\nb: 2\n"),

@@ -381,6 +381,119 @@ def test_a_lane_with_no_semantic_tree_is_unmeasured_rather_than_failed():
     assert "unmeasured" in evidence
 
 
+# ------------------------------------------- B6: the row's own vacuous pass
+#
+# B6 exists to stop a recall being claimed over a token count nobody stated. Its
+# guard was `if loss and "n_source_tokens" not in loss`, so a report carrying NO
+# losslessness block at all skipped both checks, fell out of the loop, and was
+# counted in "N recall(s) reported alongside the token count they are over" — the
+# row asserting there are no vacuous passes, passing vacuously.
+
+def _measured(did, n_tokens=120, gate=PASS):
+    return {"doc_id": did, "markdown": "## Scope\n\nbody\n",
+            "report": {"lane": "office",
+                       "losslessness": {"method": "ooxml-ground-truth",
+                                        "token_recall": 1.0, "gate": gate,
+                                        "n_source_tokens": n_tokens}}}
+
+
+def test_a_bundle_that_measured_no_losslessness_at_all_is_not_a_pass():
+    from backend.validate._rubric import _b6_no_vacuous_pass
+    silent = {"doc_id": "bbbbbbbb", "markdown": "## Scope\n\nbody\n",
+              "report": {"lane": "office"}}
+    status, evidence = _b6_no_vacuous_pass(
+        {"bundles": [_measured("aaaaaaaa"), silent]})
+    assert status == FAIL, evidence
+    assert "bbbbbbbb" in evidence
+    assert "nothing to grade" in evidence
+
+
+def test_an_ordinary_corpus_still_passes_the_no_vacuous_pass_row():
+    # The other direction: two documents that DID state their denominator must
+    # keep passing, or the fix is worse than the hole.
+    from backend.validate._rubric import _b6_no_vacuous_pass
+    status, evidence = _b6_no_vacuous_pass(
+        {"bundles": [_measured("aaaaaaaa"), _measured("bbbbbbbb", 4000)]})
+    assert status == PASS, evidence
+    assert "2 recall(s)" in evidence
+
+
+def test_a_recall_with_no_token_count_still_fails():
+    from backend.validate._rubric import _b6_no_vacuous_pass
+    naked = {"doc_id": "bbbbbbbb", "report": {
+        "lane": "office", "losslessness": {"token_recall": 1.0, "gate": PASS}}}
+    status, evidence = _b6_no_vacuous_pass({"bundles": [naked]})
+    assert status == FAIL and "n_source_tokens" in evidence
+
+
+def test_an_empty_document_may_still_pass_when_it_says_so():
+    # Zero tokens with the `empty_source` warning is an honest, declared shape and
+    # was never the target of this row.
+    from backend.validate._rubric import _b6_no_vacuous_pass
+    empty = _measured("bbbbbbbb", 0)
+    empty["report"]["warnings"] = [{"code": "empty_source", "count": 0}]
+    status, evidence = _b6_no_vacuous_pass({"bundles": [empty]})
+    assert status == PASS, evidence
+
+
+# ------------------------------------------- markdown has TWO kinds of code block
+#
+# `_prose_lines` masked FENCED code and knew nothing about INDENTED code, so pipe
+# art in a four-space listing was counted as a live GFM table and `_c5_table_nodes`
+# hard-failed a bundle for not publishing a node for it. That is a rubric row
+# failing a correct document, which is worse than the bug it guards.
+
+def _indented(text):
+    return "".join("    %s\n" % line for line in text.splitlines())
+
+
+def test_pipe_art_in_an_indented_code_block_is_not_a_table():
+    from backend.validate._rubric import _gfm_tables
+    listing = "Run it like this:\n\n" + _indented(_TABLE)
+    assert _gfm_tables(listing) == 0
+    # ... and the same table at column 0 still counts, so the mask is a mask and
+    # not a blindfold.
+    assert _gfm_tables("Run it like this:\n\n" + _TABLE) == 1
+
+
+def test_an_indented_listing_does_not_demand_a_table_node():
+    from backend.validate._rubric import _c5_table_nodes
+    listing = _b("bbbbbbbb", "## Listing\n\nRun it like this:\n\n" + _indented(_TABLE),
+                 [_node("Listing", "listing", "s1")])
+    status, evidence = _c5_table_nodes({"bundles": [_healthy(), listing]})
+    assert status == PASS, evidence
+
+
+def test_a_table_inside_a_list_item_is_still_a_table():
+    # The column four spaces are measured from is the ITEM's content column, so a
+    # list item's own table is prose. Masking it would quietly excuse the bundle
+    # that never published a node for it.
+    from backend.validate._rubric import _gfm_tables
+    md = "-   step one\n\n" + "".join("    %s\n" % l for l in _TABLE.splitlines())
+    assert _gfm_tables(md) == 1
+
+
+def test_an_indented_line_that_continues_a_paragraph_is_not_code():
+    # CommonMark §4.4: an indented chunk cannot INTERRUPT a paragraph. A wrapped,
+    # over-indented sentence is prose the renderer joins to the line above.
+    from backend.validate._rubric import _prose_lines
+    lines = _prose_lines("A wrapped sentence\n        that continues here.\n")
+    assert lines[1].strip() == "that continues here."
+
+
+def test_an_indented_listing_after_a_blank_line_is_code():
+    from backend.validate._rubric import _prose_lines
+    assert _prose_lines("Prose.\n\n        listing line\n")[2] == ""
+
+
+def test_a_tilde_line_inside_a_backtick_fence_does_not_unmask_the_rest():
+    # The fence CLOSER must repeat the opener's character at its own length; this
+    # mask toggled on any fence line, so a `~~~` inside a transcript re-opened the
+    # document and the pipe art below it was read as a table.
+    from backend.validate._rubric import _gfm_tables
+    assert _gfm_tables("```\n~~~\n" + _TABLE + "```\n") == 0
+
+
 # ------------------------------------------------------------- the slug we share
 
 @pytest.mark.parametrize("title,want", [

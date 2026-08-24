@@ -74,6 +74,13 @@ _CODE_NAMES = frozenset((
 # _ooxml_md module docstring — so they are excluded here too.
 _TEXT_LOCAL = "t"
 
+# The deepest ``w:outlineLvl`` that is a HEADING. The attribute runs 0..9; 0..8 are
+# outline levels 1..9 and the last value, 9, is Word's "Body Text" — the explicit
+# opposite of a heading. Named here because both readers of the attribute (the
+# style map and the paragraph's own w:pPr) have to honour it, and one of them
+# once did not.
+_OUTLINE_MAX = 8
+
 # Word's toggle properties, and the w:val spellings that mean "off". They live up
 # here because both the STYLE reader and the run reader need them: a style can turn
 # bold on and a run inside it can turn that same bold back off.
@@ -196,6 +203,44 @@ def _cells_of(tr):
         for ch in reversed(list(el)):
             stack.append(ch)
     return out
+
+
+def _cell_geometry(tc):
+    # type: (object) -> tuple
+    """``(gridSpan, vMerge)`` this cell declares — its OWN, and nobody else's.
+
+    Bounded to the cell's direct ``w:tcPr`` because that is where ECMA-376 puts
+    them: ``CT_Tc`` is ``(w:tcPr?, block-level content)``, and ``w:gridSpan`` /
+    ``w:vMerge`` are children of that ``w:tcPr``. Anything deeper belongs to some
+    OTHER cell — a cell of a table NESTED in this one, whose geometry is its own
+    table's and never this one's.
+
+    This scan used to be a flat ``tc.iter()``, which descends straight through the
+    nested ``w:tbl`` the owning cell flattens. An ordinary two-column table whose
+    last cell held a nested table with a ``w:gridSpan w:val="3"`` was reported as
+    FOUR columns wide against a markdown that correctly showed two, so a faithful
+    conversion hard-failed the fidelity gate and could not publish. The same loop
+    read the nested table's ``w:vMerge``, which is worse than a wrong width: it
+    forward-fills, so one nested continuation cell put a value from the row above
+    into an outer cell that the document leaves blank — and there the ground truth
+    was asserting content the source does not contain.
+
+    ``w:tcPrChange`` holds the cell properties a tracked change REPLACED, for the
+    same reason ``w:pPrChange`` and ``w:trPrChange`` do, and is never read: a table
+    whose geometry was edited with revisions on still has its old grid in there."""
+    span, vmerge = 1, None
+    for ch in tc:
+        if _local(ch.tag) != "tcPr":
+            continue
+        for pr in ch:
+            loc = _local(pr.tag)
+            if loc == "tcPrChange":
+                continue
+            if loc == "gridSpan":
+                span = max(1, _int_attr(pr, "val", 1))
+            elif loc == "vMerge":
+                vmerge = _attr(pr, "val") or "continue"
+    return span, vmerge
 
 
 def _is_layout_table(tbl):
@@ -413,7 +458,7 @@ def _style_map(styles_xml):
             heading[sid] = int(m.group(1))
         elif _norm(rec["name"]) == "title":
             heading[sid] = 1
-        elif rec["outline"] is not None and 0 <= rec["outline"] <= 8:
+        elif rec["outline"] is not None and 0 <= rec["outline"] <= _OUTLINE_MAX:
             heading[sid] = rec["outline"] + 1
         if _norm(sid) in _CODE_NAMES or _norm(rec["name"]) in _CODE_NAMES:
             code.add(sid)
@@ -550,13 +595,30 @@ def _external(rels_xml):
 
 def _heading_level(props, styles):
     # type: (dict, dict) -> object
-    """The heading level this paragraph renders at, or ``None``."""
+    """The heading level this paragraph renders at, or ``None``.
+
+    A ``w:outlineLvl`` is an index into Word's nine outline levels, and the
+    schema's tenth value is not a tenth level. ECMA-376 gives ``w:outlineLvl`` the
+    range 0..9 with 0..8 meaning "Level 1".."Level 9" and 9 meaning **Body Text**
+    — a paragraph saying, in the one place it can, that it is outside the outline.
+    Reading it as a level is therefore reading the document backwards: it says
+    "not a heading" and the answer comes back "heading".
+
+    That is a fact about the DOCUMENT, so this side owes it the same answer the
+    converter owes it, and owes it for its own reasons — the value is asserted
+    here from the schema, not copied from what the converter happens to do with
+    it. The style map above (``_style_map``) has always applied this bound; a
+    paragraph that declares the level on itself was the path that skipped it, and
+    while both sides skipped it identically the gate certified ordinary body prose
+    published as an ``h6``."""
     level = styles["heading"].get(props["style"])
     if level is None and props["outline"]:
         try:
-            level = int(props["outline"]) + 1
+            declared = int(props["outline"])
         except ValueError:
-            level = None
+            return None
+        if 0 <= declared <= _OUTLINE_MAX:
+            level = declared + 1
     return level
 
 
@@ -781,16 +843,7 @@ def _table_shape(tbl, pmap):
         before, after = _grid_offsets(tr)
         row, col = [""] * before, before
         for tc in _cells_of(tr):
-            span, vmerge = 1, None
-            for el in tc.iter():
-                loc = _local(el.tag)
-                if loc == "gridSpan":
-                    try:
-                        span = max(1, int(_attr(el, "val")))
-                    except ValueError:
-                        span = 1
-                elif loc == "vMerge":
-                    vmerge = _attr(el, "val") or "continue"
+            span, vmerge = _cell_geometry(tc)
             # Block-aware: a cell's own paragraphs, and the rows and cells of any
             # nested table flattened into it, are boundaries the document declares.
             text = _block_text(tc, skip_boxes=True).strip()

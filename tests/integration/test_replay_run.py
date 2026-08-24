@@ -477,6 +477,76 @@ def test_compare_refuses_to_compare_a_bundle_with_itself(tmp_path, monkeypatch,
     assert "with itself" in capsys.readouterr().err
 
 
+def test_a_failed_replay_never_borrows_the_replayed_tools_exit_code(
+        tmp_path, monkeypatch, capsys):
+    """0/1/3/4 are THIS tool's vocabulary; the command it runs has its own.
+
+    The replayed command's code used to be returned verbatim, so a `build_bundle`
+    that exited 1 (a document failed) came back as replay's "usage or I/O error", a
+    3 came back as "a divergence was demonstrated" — a verdict about the RECORDED
+    RUN that nothing here computed — and a 2 came back as a code replay does not
+    define at all. What is actually known when the command dies is that the replay
+    did not complete, so nothing downstream of it was compared: exit 4.
+    """
+    src, out, report_path = _build(tmp_path)
+    rr = _mod("replay_run")
+    _only_the_class_under_test(rr, report_path, monkeypatch)
+    for child_rc in (1, 2, 3, 4):
+        monkeypatch.setattr(rr.subprocess, "call", lambda cmd, _c=child_rc: _c)
+        rc = rr.main(["--report", report_path, "--src", src,
+                      "--out", str(tmp_path / ("r%d" % child_rc)), "--execute"])
+        err = capsys.readouterr().err
+        assert rc == 4, "child exited %d, replay_run returned %r" % (child_rc, rc)
+        # The child's code is a fact worth printing — as the child's.
+        assert "exited %d" % child_rc in err and "not this tool's" in err
+
+
+def test_a_failed_replay_does_not_compare_the_bundle_it_did_not_write(
+        tmp_path, monkeypatch, capsys):
+    """A bundle left at `--out` by an EARLIER replay is not this replay's output.
+
+    Reaching `_compare` after the command died would read that stale bundle, match
+    the recorded hash and print `REPRODUCED` for a run that never produced
+    anything — the same vacuous claim `_compare` already refuses to make over two
+    empty hashes.
+    """
+    src, out, report_path = _build(tmp_path)
+    rr = _mod("replay_run")
+    _only_the_class_under_test(rr, report_path, monkeypatch)
+    with open(report_path, encoding="utf-8") as fh:
+        rep = json.load(fh)
+    stale = tmp_path / "stale" / rep["doc_id"]
+    os.makedirs(str(stale))
+    with open(str(stale / "report.json"), "w", encoding="utf-8") as fh:
+        json.dump({"doc_id": rep["doc_id"],
+                   "markdown_sha256": rep["markdown_sha256"]}, fh)
+
+    monkeypatch.setattr(rr.subprocess, "call", lambda cmd: 1)
+    rc = rr.main(["--report", report_path, "--src", src,
+                  "--out", str(tmp_path / "stale"), "--execute", "--compare"])
+    captured = capsys.readouterr()
+    assert rc == 4
+    assert "REPRODUCED" not in captured.out
+    assert "cannot answer" in captured.err
+
+
+def test_a_replay_whose_command_succeeds_still_reports_the_divergence_verdict(
+        tmp_path, monkeypatch, capsys):
+    """The other direction: executing must not have become "always unverified".
+
+    With every class compared and nothing moved, a successful command still exits
+    0 — the fix above touches only the branch where the command failed.
+    """
+    src, out, report_path = _build(tmp_path)
+    rr = _mod("replay_run")
+    _only_the_class_under_test(rr, report_path, monkeypatch)
+    monkeypatch.setattr(rr.subprocess, "call", lambda cmd: 0)
+    rc = rr.main(["--report", report_path, "--src", src,
+                  "--out", str(tmp_path / "ok"), "--execute"])
+    assert rc == 0
+    assert "no divergences" in capsys.readouterr().out
+
+
 def test_a_report_without_run_provenance_says_so_rather_than_guessing(tmp_path):
     src, out, report_path = _build(tmp_path)
     with open(report_path, encoding="utf-8") as fh:

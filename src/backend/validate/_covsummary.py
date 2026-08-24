@@ -37,6 +37,41 @@ def _pct(value):
     return "%.1f%%" % (100.0 * float(value or 0.0))
 
 
+# What an unmeasured record sorts as: below every measured recall, including 0.0.
+# "We do not know" is not a better position than "we measured nothing survived".
+_UNMEASURED_RANK = -1.0
+
+
+def _recall(rec):
+    # type: (dict) -> object
+    """This record's recall as a float, or ``None`` when it never measured one.
+
+    The two halves of this module used to disagree about an absent ``recall``:
+    ``worst_documents`` defaulted it to 1.0 and dropped the record from the worst
+    list, while ``summarize`` defaulted it to 0.0 and refused to count it as
+    lossless. One corpus therefore printed "lossless (recall == 1.0): 1 of 2" and,
+    four lines later, "no document below 1.0 recall" — the summary contradicting
+    itself about the same document.
+
+    One meaning, and it is the one this project applies everywhere else: an absent
+    measurement is NOT a pass. It is not lossless, it is not filtered out of the
+    worst list, and it is printed as ``unknown`` rather than as a percentage
+    nobody computed."""
+    value = (rec or {}).get("recall")
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _rank(rec):
+    # type: (dict) -> float
+    value = _recall(rec)
+    return _UNMEASURED_RANK if value is None else value
+
+
 def _missing_phrase(missing_top, limit=4):
     # type: (list, int) -> str
     """``[["table", 60], ["skew", 5]]`` -> ``table x60, skew x5``."""
@@ -54,16 +89,17 @@ def worst_documents(records, worst_n=10, min_tokens=50):
     """(worst records by recall, how many were too small to judge).
 
     Sorted by recall then by absolute tokens missing, so a 0.9 over 2000 tokens
-    outranks a 0.9 over 60 — the same ratio, twenty times the loss."""
+    outranks a 0.9 over 60 — the same ratio, twenty times the loss. A record that
+    reports no recall at all is listed too, first: see ``_recall``."""
     gradeable, too_small = [], 0
     for rec in records or []:
         if int(rec.get("n_source", 0) or 0) < int(min_tokens or 0):
             too_small += 1
             continue
         gradeable.append(rec)
-    gradeable.sort(key=lambda r: (float(r.get("recall", 1.0) or 0.0),
-                                  -int(r.get("n_missing", 0) or 0)))
-    worst = [r for r in gradeable if float(r.get("recall", 1.0) or 0.0) < 1.0]
+    gradeable.sort(key=lambda r: (_rank(r), -int(r.get("n_missing", 0) or 0)))
+    worst = [r for r in gradeable
+             if _recall(r) is None or _recall(r) < 1.0]
     return worst[:max(0, int(worst_n or 0))], too_small
 
 
@@ -94,11 +130,18 @@ def summarize(records, worst_n=10, min_tokens=50):
         lines.append("nothing to summarize: no coverage records were found")
         return "\n".join(lines) + "\n"
 
-    perfect = sum(1 for r in records
-                  if float(r.get("recall", 0.0) or 0.0) >= 1.0)
+    measured = [r for r in records if _recall(r) is not None]
+    perfect = sum(1 for r in measured if _recall(r) >= 1.0)
     total_src = sum(int(r.get("n_source", 0) or 0) for r in records)
     total_missing = sum(int(r.get("n_missing", 0) or 0) for r in records)
     lines.append("lossless (recall == 1.0): %d of %d" % (perfect, len(records)))
+    if len(measured) != len(records):
+        # Named, never folded into either side of the ratio: "0 lossless" and
+        # "nobody measured it" must not read the same, and an unmeasured document
+        # is counted as not lossless above.
+        lines.append("no recall recorded: %d of %d (never measured — an absent "
+                     "measurement is not a pass)"
+                     % (len(records) - len(measured), len(records)))
     if total_src:
         lines.append("tokens: %d source, %d missing (%s of the corpus)"
                      % (total_src, total_missing,
@@ -107,11 +150,13 @@ def summarize(records, worst_n=10, min_tokens=50):
     worst, too_small = worst_documents(records, worst_n, min_tokens)
     lines.append(_BAR)
     if worst:
-        lines.append("worst documents (recall < 1.0, at least %d source tokens):"
-                     % min_tokens)
+        lines.append("worst documents (recall < 1.0 or never measured, at least "
+                     "%d source tokens):" % min_tokens)
         for rec in worst:
+            value = _recall(rec)
             lines.append("  %-8s %-40s %d/%d missing"
-                         % (_pct(rec.get("recall")), rec.get("rel", rec.get("id", "?")),
+                         % (_pct(value) if value is not None else "unknown",
+                            rec.get("rel", rec.get("id", "?")),
                             int(rec.get("n_missing", 0) or 0),
                             int(rec.get("n_source", 0) or 0)))
             phrase = _missing_phrase(rec.get("missing_top"))

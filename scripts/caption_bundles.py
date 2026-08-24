@@ -393,7 +393,17 @@ def main(argv=None, client=None):
           "pending=%d truncated=%d -> %s" % (
               s["images"], s["ok"], s["useful"], rate, s["furniture"], s["useless"],
               s["pending"], s["truncated"], cov_path), file=sys.stderr)
-    return 0 if s["pending"] == 0 else 2      # pending => incomplete (re-run when VLM up)
+    # The exit code is READ OFF the gate this run's reports carry, not computed a
+    # second time from `pending` alone. Those two answers had drifted: once
+    # `caption_report` learned that a run whose captions were all USELESS is
+    # `incomplete` — expected images, none of them usable — a corpus with zero
+    # pending still exited 0 while every report.json it wrote said otherwise. A
+    # script that returns success over an artifact it just stamped incomplete is
+    # the same "reports one thing, gates on another" shape the rubric row for this
+    # dimension exists to catch.
+    gate = caption_report(True, s["images"], s["ok"], s["furniture"],
+                          s["useless"], s["pending"])["gate"]
+    return 0 if gate == "complete" else 2
 
 
 def _has_images(doc_dir):
