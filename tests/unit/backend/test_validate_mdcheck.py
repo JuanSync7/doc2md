@@ -66,6 +66,27 @@ def test_caption_report_gate_states():
     assert caption_report(True, 5, 4, 1, 0, 0)["gate"] == "complete"    # every image resolved
 
 
+def test_a_run_that_produced_no_usable_caption_is_not_complete():
+    # `useless` is a TERMINAL verdict, so it drives `pending` to zero while leaving
+    # the image with nothing a reader can use. Three images, three captions the
+    # useful gate threw away, and the block reported `complete`: coverage claimed
+    # over zero coverage. This is the hole doc_meta_report's `invalid` was already
+    # closed for, and caption_report is its twin.
+    b = caption_report(True, 3, 0, 0, 3, 0)
+    assert b["useless"] == 3 and b["captioned"] == 0
+    assert b["gate"] == "incomplete"
+    # One useless caption among four good ones is still not a finished run.
+    assert caption_report(True, 5, 4, 0, 1, 0)["gate"] == "incomplete"
+
+
+def test_furniture_is_a_finished_outcome_and_still_completes():
+    # The other direction: a caption the model deliberately declined to write for a
+    # spacer rule is CORRECT, not a failure. A gate that refused to complete over
+    # furniture would make every deck of decorative images permanently incomplete.
+    assert caption_report(True, 2, 0, 2, 0, 0)["gate"] == "complete"
+    assert caption_report(True, 4, 2, 2, 0, 0)["gate"] == "complete"
+
+
 def _codes(issues):
     return [i.code for i in issues]
 
@@ -104,6 +125,53 @@ def test_unclosed_fence_and_front_matter_are_errors():
 def test_table_rules_do_not_fire_inside_code_fences():
     md = "```\na | b | c\nd | e\n```\n"
     assert validate_markdown(md) == []
+
+
+# ── the fence PAIR, not the fence line ────────────────────────────────────────
+#
+# CommonMark closes a fenced block only with the opener's OWN character, at a run
+# at least as long, on a line carrying nothing else. This reader toggled on any
+# fence line instead, so a `~~~` inside a ``` block closed it: the rest of the
+# document was read as code, the ``` that really closed it opened a phantom block,
+# and the resulting `fence-unclosed` error made build_report say status="failed"
+# over markdown a renderer is perfectly happy with — which WITHDRAWS a good bundle.
+
+def test_a_tilde_line_inside_a_backtick_fence_does_not_close_it():
+    md = ("# Title\n\nBody.\n\n```\nsome code\n~~~\nmore code\n```\n\nTail.\n")
+    assert validate_markdown(md) == []
+    assert build_report("Title Body some code more code Tail", md,
+                        lane="office")["status"] == "ok"
+
+
+def test_a_backtick_line_inside_a_tilde_fence_does_not_close_it():
+    md = "~~~\nliteral ``` in a listing\n~~~\n"
+    assert validate_markdown(md) == []
+
+
+def test_a_shorter_run_does_not_close_a_longer_fence():
+    # A four-backtick fence exists precisely so a three-backtick run can be shown
+    # verbatim inside it.
+    md = "````\n```\nnested sample\n```\n````\n"
+    assert validate_markdown(md) == []
+
+
+def test_a_longer_run_closes_a_shorter_fence():
+    # The rule is "at least as long", not "exactly as long".
+    md = "```\ncode\n`````\n"
+    assert validate_markdown(md) == []
+
+
+def test_a_fence_line_carrying_text_after_it_is_not_a_closer():
+    # `` ```done `` is an info string, not a close, so this block never ends and
+    # the error is real. The fix must not silence the case it was written for.
+    assert "fence-unclosed" in _codes(validate_markdown("```\ncode\n```done\n"))
+
+
+def test_a_tilde_run_inside_a_backtick_fence_is_not_a_second_code_block():
+    # The count came from delimiters//2, so two tilde lines inside one block read
+    # as two blocks. It is counted on the OPENER now.
+    md = "```\nfirst\n~~~\nsecond\n~~~\nthird\n```\n"
+    assert build_report("x", md, lane="office")["content"]["code_blocks"] == 1
 
 
 def test_leaked_ooxml_tags_are_errors():

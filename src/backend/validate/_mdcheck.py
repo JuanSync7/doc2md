@@ -19,13 +19,25 @@ from collections import Counter, OrderedDict, namedtuple
 
 from backend.ingest import coverage, markdown_to_text
 
+from ._mdstructure import md_structure
+
 __all__ = ["validate_markdown", "conversion_report", "build_report",
            "image_report", "caption_report", "outline_report", "savings_report",
-           "MdIssue"]
+           "structure_fidelity_report", "MdIssue"]
 
 MdIssue = namedtuple("MdIssue", ["line", "code", "severity", "message"])
 
-_FENCE = re.compile(r"^\s{0,3}(```|~~~)")
+# A fenced code block, read as CommonMark §4.5 defines it. A single "is this a
+# fence line" regex cannot answer the question, because the CLOSING rule depends
+# on the OPENER: the closer must use the SAME character and a run AT LEAST AS
+# LONG, with nothing but spaces after it. Toggling on "any fence line" is how a
+# ``~~~`` line inside a ``` block closed it — the rest of the document was then
+# read as code, the ``` that really closed it opened a phantom block, and the
+# resulting `fence-unclosed` error made `build_report` report status="failed" on
+# markdown a renderer is perfectly happy with. That verdict withdraws a good
+# bundle, so this reader has to get the pair right rather than the line.
+_FENCE_LINE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
+_FENCE_CLOSE = re.compile(r"^ {0,3}(`{3,}|~{3,})[ \t]*$")
 _HEADING = re.compile(r"^(#{1,6})\s+\S")
 _PIPE = re.compile(r"(?<!\\)\|")
 _SEP_CELL = re.compile(r"^:?-+:?$")
@@ -60,6 +72,41 @@ def _is_separator(line):
     # type: (str) -> bool
     cells = _cells(line)
     return bool(cells) and all(_SEP_CELL.match(c.strip()) for c in cells)
+
+
+def _fence_opener(line):
+    # type: (str) -> tuple
+    """``(character, run length)`` if ``line`` OPENS a fenced block, else ``()``.
+
+    CommonMark §4.5: an opener is three or more backticks or three or more
+    tildes, indented at most three spaces, optionally followed by an info string
+    — and a BACKTICK fence's info string may not itself contain a backtick
+    (``` ```a`b ``` ``` is a paragraph, not a code block), while a tilde fence's
+    may. Both facts are read off the spec here; ``_mdstructure`` reads the same
+    spec separately, because two independent readings of the emitted markdown is
+    the point of having two readers."""
+    m = _FENCE_LINE.match(line)
+    if not m:
+        return ()
+    run, info = m.group(1), m.group(2)
+    if run[0] == "`" and "`" in info:
+        return ()
+    return (run[0], len(run))
+
+
+def _fence_closes(line, char, length):
+    # type: (str, str, int) -> bool
+    """Does ``line`` CLOSE a fence opened by ``length`` x ``char``?
+
+    Same character, a run at least as long as the opener, and nothing on the line
+    after it but spaces. A shorter run, the other character, or any trailing text
+    is CONTENT of the block, which is exactly what a ``~~~`` inside a ``` block
+    is."""
+    m = _FENCE_CLOSE.match(line)
+    if not m:
+        return False
+    run = m.group(1)
+    return run[0] == char and len(run) >= length
 
 
 def _check_table_block(block, issues):
@@ -111,7 +158,8 @@ def validate_markdown(md):
                 issues.append(MdIssue(i + 1, "bad-chars", "error",
                                       "control or replacement character in front matter"))
 
-    in_fence = False
+    fence_char = ""
+    fence_len = 0
     fence_open_line = 0
     last_heading = 0
     block = []  # type: list
@@ -121,14 +169,20 @@ def validate_markdown(md):
         if _BAD_CHARS.search(text):
             issues.append(MdIssue(no, "bad-chars", "error",
                                   "control or replacement character in line"))
-        if _FENCE.match(text):
+        if fence_char:
+            # Inside a block: only a matching closer ends it. Everything else,
+            # including a fence line of the OTHER character or a shorter run, is
+            # code content and is exempt from the markdown rules.
+            if _fence_closes(text, fence_char, fence_len):
+                fence_char = ""
+            continue
+        opener = _fence_opener(text)
+        if opener:
             if block:
                 _check_table_block(block, issues)
                 block = []
-            in_fence = not in_fence
+            fence_char, fence_len = opener
             fence_open_line = no
-            continue
-        if in_fence:
             continue
         if _XML_LEAK.search(text):
             issues.append(MdIssue(no, "xml-leak", "error",
@@ -148,7 +202,7 @@ def validate_markdown(md):
             block = []
     if block:
         _check_table_block(block, issues)
-    if in_fence:
+    if fence_char:
         issues.append(MdIssue(fence_open_line, "fence-unclosed", "error",
                               "code fence is never closed"))
     return sorted(issues, key=lambda i: (i.line, i.code))
@@ -244,38 +298,149 @@ def _content_metrics(md, token_count=None):
         tokens = sum((len(ln) + 3) // 4 for ln in lines)
     else:
         tokens = sum(token_count(ln) for ln in lines)
-    headings = tables = lists = fences = images = links = 0
-    in_fence = False
+    headings = tables = lists = blocks = images = links = 0
+    fence_char = ""
+    fence_len = 0
     i = 0
     n = len(lines)
     while i < n:
         ln = lines[i]
-        if _FENCE.match(ln):
-            fences += 1
-            in_fence = not in_fence
+        if fence_char:
+            if _fence_closes(ln, fence_char, fence_len):
+                fence_char = ""
             i += 1
             continue
-        if not in_fence:
-            if _HEADING.match(ln):
-                headings += 1
-            if _LIST.match(ln):
-                lists += 1
-            images += len(_IMG_MD.findall(ln))
-            links += len(_LINK_MD.findall(ln))
-            if (i + 1 < n and _PIPE.search(ln) and _is_separator(lines[i + 1])
-                    and _PIPE.search(lines[i + 1])):
-                tables += 1
+        opener = _fence_opener(ln)
+        if opener:
+            # Counted on the OPENER, not as delimiters//2: an unclosed fence is
+            # still one code block — it runs to the end of the document, which is
+            # what a renderer does with it — and a ``~~~`` inside a ``` block is
+            # not a delimiter at all.
+            blocks += 1
+            fence_char, fence_len = opener
+            i += 1
+            continue
+        if _HEADING.match(ln):
+            headings += 1
+        if _LIST.match(ln):
+            lists += 1
+        images += len(_IMG_MD.findall(ln))
+        links += len(_LINK_MD.findall(ln))
+        if (i + 1 < n and _PIPE.search(ln) and _is_separator(lines[i + 1])
+                and _PIPE.search(lines[i + 1])):
+            tables += 1
         i += 1
     return {
         "chars": len(md), "tokens": tokens, "headings": headings,
         "tables": tables, "images": images, "links": links, "lists": lists,
-        "code_blocks": fences // 2, "formulas": md.count("$$") // 2,
+        "code_blocks": blocks, "formulas": md.count("$$") // 2,
     }
 
 
+# The facts the fidelity gate compares. Named explicitly rather than "every key
+# both sides happen to produce", so widening the gate is a deliberate edit with a
+# test behind it — never a silent consequence of adding a field.
+_FIDELITY_FACTS = ("headings", "heading_path", "list_items", "ordered_items",
+                   "bullet_items", "ordered_numbers",
+                   "strong", "em", "strike", "code_spans", "code_blocks",
+                   "links", "tables", "list_item_words", "thematic_breaks")
+
+
+def _has_evidence(value):
+    # type: (object) -> bool
+    """Did this fact actually observe anything, on this document?
+
+    ``compared`` used to count fact NAMES the source supplied, which is the schema,
+    not the evidence: a one-paragraph memo with no list, no table and no emphasis
+    reported ``compared: 13`` and read as thirteen things checked when twelve of them
+    were 0 == 0. Counting only facts with something on at least one side stops the
+    block overstating its own coverage."""
+    if isinstance(value, dict):
+        return any(value.values())
+    if isinstance(value, (list, tuple)):
+        return bool(value)
+    return bool(value)
+
+
+def structure_fidelity_report(emitted, source, lane="office"):
+    # type: (dict, dict, str) -> dict
+    """Grade the emitted markdown's STRUCTURE against the source's.
+
+    ``emitted`` comes from ``md_structure`` (what a renderer sees), ``source`` from
+    the converter-blind ``docx_source_structure``. Every disagreement is published
+    as a delta, because a gate that reports only pass/fail teaches nobody anything.
+
+    The lane asymmetry is the same one losslessness has, for the same reason: a PDF
+    has no ground-truth semantic tree, so it cannot claim a provable pass. A caller
+    that supplies no source facts gets ``unmeasured`` — never a free pass.
+
+    ``ordered_numbers`` compares what the two sides say the reader SEES on each
+    step, not the digits that were written. Counts and depths cannot see a list
+    broken in two — a screenshot dropped between step 2 and step 3 leaves the item
+    count, the depth histogram and the token multiset all untouched while the
+    renderer prints 1, 2, 1, 2 — and they cannot see a declared start of 5 being
+    ignored either. ``heading_path`` is the same argument for prose: a histogram of
+    heading LEVELS cannot see two section titles exchanged.
+
+    Two fields keep this block honest about its own reach:
+
+      * ``compared`` counts facts that OBSERVED SOMETHING on this document, not
+        facts the source happened to supply a key for. A memo with no lists and no
+        tables is not thirteen things checked.
+      * ``unmeasured`` names, when a ground truth IS present, every fact it did not
+        supply — so a partial second opinion reads as partial instead of as a clean
+        bill of health. ``gate`` still answers only for what was measured; read the
+        two together."""
+    out = OrderedDict()
+    out["method"] = "ooxml-structure-ground-truth" if source else "unmeasured"
+    deltas = []
+    unmeasured = []
+    compared = 0
+    for fact in _FIDELITY_FACTS:
+        if fact not in source:
+            # The ground truth has no opinion on this one. Say so by NAME: silently
+            # skipping it is how a gate ends up reporting a confident "pass" over a
+            # fact vector nobody compared.
+            unmeasured.append(fact)
+            continue
+        want, got = source.get(fact), emitted.get(fact)
+        if fact == "tables":
+            # Geometry AND placement. Rows x columns alone cannot see a
+            # transposition: swap two values between rows and the dimensions, the
+            # counts and the token multiset are all unchanged, while an escalation
+            # table now pages the wrong rota.
+            want = [(t.get("rows"), t.get("cols"), t.get("cells"))
+                    for t in want or []]
+            got = [(t.get("rows"), t.get("cols"), t.get("cells"))
+                   for t in got or []]
+        elif isinstance(want, dict):
+            # Normalise away the difference between "absent" and "zero" so a
+            # delta always means a real disagreement.
+            keys = set(want) | set(got or {})
+            want = dict((k, want.get(k, 0)) for k in keys if want.get(k, 0))
+            got = dict((k, (got or {}).get(k, 0)) for k in keys if (got or {}).get(k, 0))
+        if _has_evidence(want) or _has_evidence(got):
+            compared += 1
+        if want != got:
+            deltas.append(OrderedDict([("fact", fact), ("source", want),
+                                       ("markdown", got)]))
+    out["compared"] = compared
+    if source and unmeasured:
+        out["unmeasured"] = unmeasured
+    out["deltas"] = deltas
+    if not source:
+        out["gate"] = "unmeasured"
+    elif lane != "office":
+        out["gate"] = "best-effort"
+    else:
+        out["gate"] = "pass" if not deltas else "fail"
+    return out
+
+
 def build_report(source_text, md, lane="office", losslessness=None,
-                 token_count=None, content_min=_CONTENT_GATE):
-    # type: (str, str, str, dict, object, float) -> dict
+                 token_count=None, content_min=_CONTENT_GATE,
+                 source_structure=None):
+    # type: (str, str, str, dict, object, float, dict) -> dict
     """Assemble the validator's verdict for ``report.json`` — pure, no disk, no LLM.
 
     This is the machine-checkable core of the bundle report: the losslessness block,
@@ -305,6 +470,12 @@ def build_report(source_text, md, lane="office", losslessness=None,
             "method": "ooxml-ground-truth",
             "token_recall": rep["recall"],
             "content_recall": rep["content_recall"],
+            # The DENOMINATOR, so a recall of 1.0 is never claimable over nothing.
+            # The PDF block has carried n_source_tokens all along; without it here a
+            # zero-byte upload reported `token_recall: 1.0, gate: pass, lossless:
+            # true, warnings: []` in exactly the vocabulary of a real conversion, and
+            # the only tell was recognising e3b0c442... as the sha of no bytes.
+            "n_source_tokens": rep["n_source"],
             "missing_tokens": rep["missing_top"] if not rep["valid"] else [],
             "gate": "pass" if rep["valid"] else "fail",
         }
@@ -317,7 +488,13 @@ def build_report(source_text, md, lane="office", losslessness=None,
         if loss.get("gate") in (None, "pass"):
             loss["gate"] = "best-effort"
 
-    if loss.get("gate") == "fail" or n_err > 0:
+    # The second hard gate. A ratchet beside token recall, never a replacement:
+    # emphasis, list nesting and table geometry are not tokens, so recall == 1.0
+    # can be — and was — true of a procedure whose steps had been renumbered.
+    fidelity = structure_fidelity_report(md_structure(md), source_structure or {},
+                                         lane=lane)
+
+    if loss.get("gate") == "fail" or fidelity["gate"] == "fail" or n_err > 0:
         status = "failed"
     elif n_warn > 0:
         status = "degraded"
@@ -328,14 +505,16 @@ def build_report(source_text, md, lane="office", losslessness=None,
         "markdown_sha256": hashlib.sha256((md or "").encode("utf-8")).hexdigest(),
         "status": status,
         "losslessness": loss,
+        "structure_fidelity": fidelity,
         "content": _content_metrics(md, token_count=token_count),
         "structural_errors": n_err,
         "structural_warnings": n_warn,
     }
 
 
-def image_report(referenced, extracted, unique_files, missing, orphans, verified):
-    # type: (int, int, int, int, int, int) -> dict
+def image_report(referenced, extracted, unique_files, missing, orphans, verified,
+                 orphans_removed=0):
+    # type: (int, int, int, int, int, int, int) -> dict
     """The deterministic image-extraction integrity block for ``report.json``.
 
     This is the office text gate's twin, for pixels. Body images are HTML-comment
@@ -348,7 +527,14 @@ def image_report(referenced, extracted, unique_files, missing, orphans, verified
         unless bytes were missing)
       * ``unique_files`` — distinct content-addressed files expected under ``images/``
       * ``missing``      — referenced pictures whose bytes were ABSENT in the package
-      * ``orphans``      — files on disk with no body reference (0 after GC)
+      * ``orphans``      — files on disk with no body reference REMAINING after the
+        sweep, so a non-zero value means the GC itself failed and the gate must say so
+      * ``orphans_removed`` — how many the sweep took out. Separate from ``orphans``
+        on purpose: the gate needs "are there orphans now", a dashboard asking "how
+        much churn is this corpus seeing" needs "how many were there", and folding
+        both into one number loses whichever question you did not ask first. Before
+        this the removed count existed only inside a prose ``detail`` string, so
+        aggregating it corpus-wide was impossible.
       * ``verified``     — files whose on-disk ``sha256[:16]`` matches their filename
         (content-addressed integrity: the bytes actually landed intact)
 
@@ -364,6 +550,7 @@ def image_report(referenced, extracted, unique_files, missing, orphans, verified
     b["extracted"] = extracted
     b["missing"] = missing
     b["orphans"] = orphans
+    b["orphans_removed"] = orphans_removed
     b["verified"] = verified
     b["gate"] = "pass" if intact else "degraded"
     return b
@@ -449,8 +636,17 @@ def caption_report(enabled, expected, captioned, furniture, useless, pending,
 
     ``gate``: ``disabled`` when captioning is off; ``pending`` before the first run
     (nothing attempted); ``complete`` when every expected image reached a terminal
-    verdict (``pending == 0``); ``incomplete`` when a run left images uncaptioned
-    (re-run when the VLM is back)."""
+    verdict AND none of those verdicts is ``useless``; ``incomplete`` when a run
+    left images uncaptioned or captioned uselessly (re-run when the VLM is back).
+
+    NOTE ``useless`` keeps the gate off ``complete``, exactly as ``invalid`` does in
+    ``doc_meta_report``, and for the same reason: it is a TERMINAL verdict, so it
+    drives ``pending`` to zero while leaving the image with nothing a reader can
+    use. Without that guard ``caption_report(True, 3, 0, 0, 3, 0)`` — three images,
+    three captions the useful gate threw away, not one usable line — reported
+    ``complete``, which is the block claiming coverage it does not have. Furniture
+    is NOT in the guard: a caption the model deliberately declined to write for a
+    spacer rule is a correct, finished outcome, not a failed one."""
     attempted = captioned + furniture + useless
     b = OrderedDict()
     b["enabled"] = bool(enabled)
@@ -463,7 +659,63 @@ def caption_report(enabled, expected, captioned, furniture, useless, pending,
     b["prompt_sha"] = prompt_sha or ""
     if not enabled:
         b["gate"] = "disabled"
-    elif expected == 0 or pending == 0:
+    elif useless == 0 and (expected == 0 or pending == 0):
+        b["gate"] = "complete"
+    elif attempted == 0:
+        b["gate"] = "pending"
+    else:
+        b["gate"] = "incomplete"
+    return b
+
+
+def doc_meta_report(enabled, expected, filled, authored, invalid, pending,
+                    schema_version=0, vocab_version=0, model="", prompt_sha=""):
+    # type: (bool, int, int, int, int, int, int, int, str, str) -> dict
+    """The document-metadata block for ``report.json`` — the same shape, and the same
+    deliberate separation from ``status``, as ``caption_report``.
+
+    Metadata enrichment is the second re-runnable overlay on a lossless build, and it
+    must not be able to make a lossless document read as degraded because no model has
+    classified it yet. So it carries its own verdict:
+
+      * ``expected`` — model-writable fields in the schema (tier 2, not authored-only)
+      * ``filled``   — fields carrying a value the vocabulary accepts
+      * ``authored`` — fields a PERSON wrote; counted separately because a generated
+                       value must never overwrite one, so they are not "model coverage"
+      * ``invalid``  — fields present but carrying a value the vocabulary rejects
+      * ``pending``  — model-writable fields still empty (never run / model outage)
+
+    ``gate``: ``disabled`` when enrichment is off; ``pending`` before the first run;
+    ``complete`` when nothing is outstanding; ``incomplete`` when a run left fields
+    unfilled or invalid. NOTE ``invalid`` keeps the gate off ``complete`` — a value
+    outside the closed vocabulary is worse than an absent one, because it silently
+    becomes a new term for every consumer that groups by that field.
+
+    The two versions are recorded because they invalidate DIFFERENT work: a schema
+    bump means the field inventory moved, a vocab bump means the allowed values did
+    and only the classified fields need revisiting.
+    """
+    attempted = filled + invalid
+    b = OrderedDict()
+    b["enabled"] = bool(enabled)
+    b["schema_version"] = int(schema_version or 0)
+    b["vocab_version"] = int(vocab_version or 0)
+    b["expected"] = expected
+    b["filled"] = filled
+    b["authored"] = authored
+    b["invalid"] = invalid
+    b["pending"] = pending
+    b["model"] = model or ""
+    b["prompt_sha"] = prompt_sha or ""
+    if not enabled:
+        b["gate"] = "disabled"
+    elif invalid == 0 and (expected == 0 or pending == 0):
+        # `invalid` gates independently of BOTH other counts. A run can fill every
+        # model-writable field and still leave one holding a value the vocabulary
+        # rejects: pending reaches 0 while invalid does not, and the earlier form
+        # (`expected == 0 or pending == 0`) called that complete. Guarding on
+        # `invalid` first also keeps the `expected == 0` short-circuit honest for any
+        # caller that counts invalid fields outside the model-writable set.
         b["gate"] = "complete"
     elif attempted == 0:
         b["gate"] = "pending"

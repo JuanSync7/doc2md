@@ -14,8 +14,12 @@ summary: Deterministic, lossless document -> Markdown conversion with measured f
 Deterministic **document → Markdown** conversion for RAG ingestion, with an
 independent second-pass validator: every conversion is *measured*, never
 assumed. Office documents are converted from their OOXML XML directly and hard-gated
-at **token recall = 1.0**; PDF/HTML go through a best-effort lane whose loss is
-quantified and surfaced, never hidden.
+**twice** — at **token recall = 1.0**, and against a converter-blind OOXML
+structural ground truth (`structure_fidelity`, fifteen facts: headings and their
+titles, list nesting, printed ordered numbers, emphasis, fences, links, every table
+cell, every list item in order). Structure *is* content, so a document whose
+headings flattened or whose table rows scrambled fails even at recall 1.0. PDF/HTML
+go through a best-effort lane whose loss is quantified and surfaced, never hidden.
 
 ## What it produces
 
@@ -27,9 +31,11 @@ binding contract):
 <out>/<doc_id>/
   document.md      # the converted body, frontmatter-stamped (hashes, lane, run)
   structure.json   # heading outline + figure nodes with line spans
-  report.json      # measured gates: losslessness, outline coverage, image integrity
+  report.json      # measured gates: losslessness, structure fidelity, coverage, images
+  knowledge.json   # the extracted graph payload — only once enrichment has run
   images/          # content-addressed (<sha16>.<ext>), byte-verified figures
 <out>/manifest.jsonl
+<out>/runs.jsonl
 ```
 
 `report.json` carries an honest `status`: `ok`, `degraded` (converted, with a
@@ -64,6 +70,17 @@ python3 scripts/setup_libreoffice.py --rpms /path/to/libreoffice/rpms
 
 # Optional VLM figure captions (separate overlay stage, cache-keyed):
 python3 scripts/caption_bundles.py --bundles /path/to/bundles --vlm-url http://127.0.0.1:8000
+
+# Document metadata: descriptors into document.md, the graph payload into
+# knowledge.json; deterministic tiers always, model tier when one is reachable:
+python3 scripts/enrich_metadata.py --bundles /path/to/bundles
+# Lint per document AND corpus-wide (identity, synonymy, entities, graph, skew):
+python3 scripts/kb_lint.py --bundles /path/to/bundles --strict
+
+# Grade the OUTPUT itself against the rubric: builds a deliberately adversarial
+# document, converts it, enriches it with no model, and prints a letter per
+# dimension with the evidence behind every row.
+python3 scripts/grade_output.py
 ```
 
 Both writers share the same output root and `manifest.jsonl`; re-runs skip
@@ -73,11 +90,29 @@ completed bundles (`--force` rebuilds).
 
 - `src/backend/` — the domain: `ingest` (routing, conversion, repair),
   `sections` (outline), `validate` (independent fidelity checks), `bundle`
-  (report assembly). `ingest`/`validate` are Python 3.6 + stdlib only.
+  (report assembly), `kb` (metadata tiers + controlled vocabulary). All of these
+  are Python 3.6 + stdlib only.
 - `scripts/` — entrypoints (converters, writers, validators); no domain logic.
 - `tests/` — `unit/` mirrors `src/`, `integration`/`e2e` by scenario.
 - `vendor/` — self-contained LibreOffice (build artifact, not committed).
-- `docs/design/` — the output contract and lane designs.
+- `config/vocab.yaml` — the controlled vocabularies governing document metadata.
+- `docs/design/` — the output contract, the metadata contract, and lane designs.
+
+## Documentation
+
+| Read this | For |
+|---|---|
+| [`docs/guide.md`](docs/guide.md) | **Start here** — what the pipeline produces, how it runs with and without a model, and how every claim is measured, with a real worked example |
+| [`docs/reference/configuration.md`](docs/reference/configuration.md) | Every switch and env var, and what it changes in the output |
+| [`docs/reference/output-schema.md`](docs/reference/output-schema.md) | Every key of every artifact |
+| [`docs/reference/vocabulary.md`](docs/reference/vocabulary.md) | Every governed metadata field and term (generated) |
+| [`docs/design/`](docs/design/) | The binding contracts: output shape, metadata, the lanes |
+| [`docs/end-goal.md`](docs/end-goal.md) | The charter — what "lossless" means here |
+| [`docs/quality-plan.md`](docs/quality-plan.md) | The honest current grade per output dimension, and the plan to A |
+| [`docs/roadmap.md`](docs/roadmap.md) | PDF fidelity, the SDK, keel compliance |
+
+The three reference files are **drift-tested**: adding a flag, an env var, a
+report key or a vocabulary term fails CI until the reference is updated.
 
 See [`CONVENTIONS.md`](CONVENTIONS.md) for the repo taxonomy and
 `CLAUDE.md` files for per-directory agent rules.

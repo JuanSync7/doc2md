@@ -40,6 +40,7 @@ import tempfile
 import time
 import xml.etree.ElementTree as _ET
 import zipfile
+import zlib
 from collections import OrderedDict
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -51,7 +52,8 @@ from backend.ingest import (  # noqa: E402
     supported_formats,
     ROUTE_OOXML, ROUTE_LIBREOFFICE, ROUTE_DOCLING, ROUTE_FENCE, ROUTE_PASSTHROUGH,
     ooxml_markdown, ooxml_source_text, core_properties, front_matter,
-    OOXML_MAIN_PARTS, load_source_root, load_ingest_config)
+    OOXML_MAIN_PARTS, load_source_root, load_ingest_config, furniture_drops,
+    docx_source_structure, policy_drops)
 from backend.validate import conversion_report  # noqa: E402  (the validator layer)
 
 COV_NAME = "_coverage_ooxml.jsonl"
@@ -139,15 +141,28 @@ def soffice_to_ooxml(soffice, src_path, target_ext, timeout=180):
     fresh temp dir; return the produced file's path, or ``""`` on any failure.
 
     Caller owns the returned file's temp dir and must remove it. Generic — keys only
-    off the extension, never a per-document path."""
+    off the extension, never a per-document path.
+
+    Each call gets its **own throwaway user profile** via ``-env:UserInstallation``.
+    Without it every invocation shares ``~/.config/libreoffice``, and LibreOffice
+    single-instances on that profile: a second concurrent ``--convert-to`` attaches
+    to the first process and silently converts nothing, or dies. The symptom is a
+    nondeterministic ``libreoffice-convert-failed`` on a file that converts fine on
+    its own — measured here as three eval runs failing different legacy documents
+    while other work ran. ``evals/gen_corpus.py`` already isolated its profile; the
+    lane did not, so a sharded corpus or two users on one host raced."""
     tmp = tempfile.mkdtemp(prefix="doc2md_lo_")
+    profile = tempfile.mkdtemp(prefix="doc2md_loprofile_")
     try:
         subprocess.check_output(
-            [soffice, "--headless", "--convert-to", target_ext, "--outdir", tmp, src_path],
+            [soffice, "-env:UserInstallation=file://%s" % profile,
+             "--headless", "--convert-to", target_ext, "--outdir", tmp, src_path],
             stderr=subprocess.STDOUT, timeout=timeout)
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
         shutil.rmtree(tmp, ignore_errors=True)
         return ""
+    finally:
+        shutil.rmtree(profile, ignore_errors=True)
     expected = os.path.join(tmp, os.path.splitext(os.path.basename(src_path))[0] + "." + target_ext)
     if os.path.isfile(expected):
         return expected
@@ -194,8 +209,9 @@ def plan(sources, out_dir):
     return rows
 
 
-def load_parts(row, soffice="", want_media=False):
-    # type: (dict, str, bool) -> tuple
+def load_parts(row, soffice="", want_media=False, furniture_out=None,
+               members_out=None):
+    # type: (dict, str, bool, dict, list) -> tuple
     """``(parts, media, eff_ext, error)`` for one row — the single reader both the
     convert and validate paths use.
 
@@ -205,7 +221,13 @@ def load_parts(row, soffice="", want_media=False):
     (``libreoffice-unavailable`` / ``libreoffice-convert-failed``). ``media`` is
     ``{media_part: bytes}`` when ``want_media`` (read from the SAME effective source,
     incl. a legacy temp before cleanup), else ``{}`` — so the bundle writer's image
-    extraction reads the exact bytes the converter's sentinels point at."""
+    extraction reads the exact bytes the converter's sentinels point at.
+    ``furniture_out``, when given, is filled with the dropped page-furniture parts
+    (read from that same effective source, so a soffice-produced header is measured
+    before the temp tree is removed). ``members_out``, when given, is filled with the
+    EFFECTIVE package's full member list for the same reason — the drop checks must
+    read the package the converter actually walked, not the pre-conversion original,
+    whose ODF/CFB member names can never match an OOXML part pattern."""
     if row.get("lane") == ROUTE_LIBREOFFICE:
         target = _LO_TARGET.get(row["ext"])
         if not target:
@@ -217,27 +239,107 @@ def load_parts(row, soffice="", want_media=False):
             return {}, {}, "", "libreoffice-convert-failed"
         try:
             media = read_media(produced) if want_media else {}
-            return read_parts(produced, target), media, target, ""
+            return (read_parts(produced, target, furniture_out, members_out),
+                    media, target, "")
         finally:
             shutil.rmtree(os.path.dirname(produced), ignore_errors=True)
     media = read_media(row["src"]) if want_media else {}
-    return read_parts(row["src"], row["ext"]), media, row["ext"], ""
+    return (read_parts(row["src"], row["ext"], furniture_out, members_out),
+            media, row["ext"], "")
 
 
-def read_parts(path, ext):
-    # type: (str, str) -> dict
-    """The converter's input: {part_name: xml_text} for this format's main parts.
+# Page-furniture parts the converter never walks. Read ONLY to measure what the
+# policy drop cost (backend.ingest.furniture_drops decides what is reportable) —
+# they are kept out of ``parts`` so neither the converter nor the converter-blind
+# ground truth can ever see them, which is what keeps the drop symmetric.
+_FURNITURE_READ = re.compile(r"^word/(header|footer)\d*\.xml$")
 
-    A malformed/unreadable zip returns {} (the caller records the failure)."""
-    pats = [re.compile(p) for p in OOXML_MAIN_PARTS.get(ext, ())]
-    parts = {}
+
+def zip_members(path):
+    # type: (str) -> list
+    """Every member name in the package, unfiltered.
+
+    ``read_parts`` deliberately keeps only the parts the converter reads, which is
+    why an embedded OLE object is invisible to it — and to ``--audit-parts``, which
+    inspects only members ending in ``.xml``. Reporting a drop needs the full list.
+
+    NOTE for callers that report a DROP: this reads the file it is handed. On the
+    LibreOffice lane the file that matters is the soffice-PRODUCED package, not the
+    original .odt/.doc — use ``load_parts(..., members_out=[])`` there instead, or a
+    drop check silently grades the wrong package (see ``bundle_inputs``)."""
     try:
         with zipfile.ZipFile(path) as zf:
-            for name in zf.namelist():
+            return zf.namelist()
+    except Exception:                                    # noqa: BLE001
+        return []
+
+
+def _zip_read_errors():
+    # type: () -> tuple
+    """Everything ``ZipFile.read`` can raise on a package we cannot decompress.
+
+    ``BadZipFile``/``OSError``/``KeyError`` are the obvious ones, but a member is
+    handed to a DECOMPRESSOR and each of those has its own error type that inherits
+    from ``Exception``, not from ``OSError``:
+
+      * ``zlib.error``        — a corrupt deflate stream, the one an ordinary
+                                bit-rotted or text-mode-transferred file reaches;
+      * ``lzma.LZMAError`` / bz2's error — the same for methods 12/14;
+      * ``NotImplementedError`` — a compression method this interpreter has no
+                                decompressor for (AES/99, zstd/93, LZMA on a build
+                                without the module);
+      * ``RuntimeError``      — an encrypted member with no password;
+      * ``EOFError``          — a truncated stream.
+
+    Every one of them used to escape, so ONE damaged document aborted the whole
+    batch instead of being recorded as that document's failure. The list is
+    explicit rather than a blanket ``except Exception`` on purpose: an unreadable
+    package must become a NAMED failure (``unreadable-zip``), and a genuine bug in
+    this module must still crash loudly instead of being laundered into one."""
+    errors = [zipfile.BadZipFile, OSError, KeyError,
+              NotImplementedError, RuntimeError, EOFError, zlib.error]
+    for mod_name, err_name in (("lzma", "LZMAError"), ("bz2", "BZ2Error")):
+        try:
+            mod = __import__(mod_name)
+        except ImportError:                  # an interpreter built without it
+            continue
+        err = getattr(mod, err_name, None)
+        if isinstance(err, type) and issubclass(err, Exception):
+            errors.append(err)
+    return tuple(errors)
+
+
+_ZIP_READ_ERRORS = _zip_read_errors()
+
+
+def read_parts(path, ext, furniture_out=None, members_out=None):
+    # type: (str, str, dict, list) -> dict
+    """The converter's input: {part_name: xml_text} for this format's main parts.
+
+    A malformed/unreadable zip returns {} (the caller records the failure). When
+    ``furniture_out`` is a dict it is filled in place with the dropped page-furniture
+    parts, so a deliberate drop can be reported with a measured size instead of
+    silently looking like a document that never had a header. When ``members_out``
+    is a list it is filled in place with EVERY member name of the package actually
+    read — which on the LibreOffice lane is the soffice-produced OOXML sibling, the
+    only package whose part names a drop check can meaningfully match. It is left
+    EMPTY on the unreadable path, so a package nobody could open can never fabricate
+    a drop warning."""
+    pats = [re.compile(p) for p in OOXML_MAIN_PARTS.get(ext, ())]
+    parts = {}
+    names = []                                           # type: list
+    try:
+        with zipfile.ZipFile(path) as zf:
+            names = zf.namelist()
+            for name in names:
                 if any(p.match(name) for p in pats):
                     parts[name] = zf.read(name).decode("utf-8", "replace")
-    except (zipfile.BadZipFile, OSError, KeyError):
+                elif furniture_out is not None and _FURNITURE_READ.match(name):
+                    furniture_out[name] = zf.read(name).decode("utf-8", "replace")
+    except _ZIP_READ_ERRORS:
         return {}
+    if members_out is not None:
+        members_out.extend(names)
     return parts
 
 
@@ -260,7 +362,7 @@ def read_media(path):
             for name in zf.namelist():
                 if _MEDIA_RE.match(name):
                     out[name] = zf.read(name)
-    except (zipfile.BadZipFile, OSError, KeyError):
+    except _ZIP_READ_ERRORS:
         return {}
     return out
 
@@ -276,14 +378,14 @@ def read_media(path):
 _CONTENT_PARTS = {
     "docx": re.compile(r"^word/document\.xml$"
                        r"|^word/(footnotes|endnotes|comments)\.xml$"
-                       r"|^word/charts/chart\d+\.xml$|^word/diagrams/data\d+\.xml$"),
+                       r"|^word/charts/chart(?:Ex)?\d+\.xml$|^word/diagrams/data\d+\.xml$"),
     "pptx": re.compile(r"^ppt/slides/slide\d+\.xml$"
                        r"|^ppt/notesSlides/notesSlide\d+\.xml$"
-                       r"|^ppt/diagrams/data\d+\.xml$|^ppt/charts/chart\d+\.xml$"
+                       r"|^ppt/diagrams/data\d+\.xml$|^ppt/charts/chart(?:Ex)?\d+\.xml$"
                        r"|^ppt/comments/[^/]+\.xml$"),
     "xlsx": re.compile(r"^xl/worksheets/[^/]+\.xml$|^xl/workbook\.xml$"
                        r"|^xl/sharedStrings\.xml$|^xl/comments\d*\.xml$"
-                       r"|^xl/charts/chart\d+\.xml$"),
+                       r"|^xl/charts/chart(?:Ex)?\d+\.xml$"),
 }
 
 
@@ -324,7 +426,10 @@ def bundle_inputs(row, soffice="", emit_images=False):
     media read).
 
     Returns a dict ``{error, body, source_text, meta, warnings, eff_ext, media,
-    source_repr_chars}``. ``error`` is ``""`` on success; ``"empty-source-file"`` is a
+    source_repr_chars, source_structure}``. ``source_structure`` is the
+    converter-blind STRUCTURAL ground truth (docx only today) that the
+    ``structure_fidelity`` gate grades the emitted markdown against; ``{}`` means
+    unmeasured, and an unmeasured lane can never claim a structural pass. ``error`` is ``""`` on success; ``"empty-source-file"`` is a
     SUCCESS sentinel (a 0-byte upload is vacuously lossless — nothing to lose), while
     every other non-empty ``error`` is a genuine failure and ``body``/``source_text``
     are empty. ``source_repr_chars`` is the decompressed size (chars) of every XML part
@@ -341,7 +446,14 @@ def bundle_inputs(row, soffice="", emit_images=False):
                     "eff_ext": row.get("ext", ""), "media": {}, "source_repr_chars": 0}
     except OSError:
         pass
-    parts, media, eff_ext, err = load_parts(row, soffice, want_media=emit_images)
+    furniture = {}                                       # type: dict
+    members = []                                         # type: list
+    parts, media, eff_ext, err = load_parts(row, soffice, want_media=emit_images,
+                                            furniture_out=furniture,
+                                            members_out=members)
+    # Every deliberate drop is NAMED (end-goal.md §1): running headers/footers are
+    # correctly excluded, but "excluded" must not read the same as "absent".
+    warnings.extend(furniture_drops(furniture))
     if row.get("lane") == ROUTE_LIBREOFFICE and not err:
         # Provenance for the one external binary in the lane: name its version.
         ver = soffice_version(soffice)
@@ -366,8 +478,23 @@ def bundle_inputs(row, soffice="", emit_images=False):
     # The raw-representation size the markdown replaces: decompressed chars of every
     # XML part parsed (report ``savings`` block; measured, never estimated).
     repr_chars = sum(len(v) for v in parts.values())
+    # Every deliberate flattening or drop, NAMED with its counts. A drop nobody
+    # counted reads exactly like a bug (end-goal.md §1).
+    # ``members`` is the EFFECTIVE package's member list, not the source file's: on
+    # the LibreOffice lane (odt/odp/ods/doc/ppt/xls/rtf) the original carries ODF
+    # member names — or, for the legacy CFB binaries, is not a zip at all — so
+    # reading the drop off the SOURCE made ``dropped_embedded_objects`` a check that
+    # could never fire on that whole lane, while the embedded object was really
+    # dropped from the soffice-produced docx the converter walked.
+    warnings.extend(policy_drops(parts, members))
     body = ooxml_markdown(eff_ext, parts, emit_images)
     src_text = ooxml_source_text(eff_ext, parts)
+    # Only docx has a structural ground truth so far. pptx (every paragraph is a
+    # bullet) and xlsx (every sheet is one table) have far less structure to lose,
+    # and claiming to grade them without a second implementation would be the exact
+    # dishonesty this gate exists to end.
+    src_struct = (docx_source_structure(parts)
+                  if eff_ext.lower().lstrip(".") == "docx" else {})
     if not body.strip() and src_text.strip():
         return {"error": "empty-conversion", "body": "", "source_text": src_text,
                 "meta": OrderedDict(), "warnings": warnings, "eff_ext": eff_ext,
@@ -376,7 +503,7 @@ def bundle_inputs(row, soffice="", emit_images=False):
                            parts.get("docProps/app.xml", ""))
     return {"error": "", "body": body, "source_text": src_text, "meta": meta,
             "warnings": warnings, "eff_ext": eff_ext, "media": media,
-            "source_repr_chars": repr_chars}
+            "source_repr_chars": repr_chars, "source_structure": src_struct}
 
 
 def convert_one(row, soffice=""):

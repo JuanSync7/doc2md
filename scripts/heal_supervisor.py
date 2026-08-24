@@ -638,8 +638,10 @@ def main(argv=None):
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--src", default=load_source_root(),
                     help="source documents root (default $DOC2MD_SRC or [paths].source_docs)")
-    ap.add_argument("--out", default=cfg.markdown_dir)
-    ap.add_argument("--ocr", choices=["auto", "on", "off"], default="auto")
+    ap.add_argument("--out", default=cfg.markdown_dir,
+                    help="markdown output dir (default $DOC2MD_MARKDOWN_DIR / [ingest].markdown_dir)")
+    ap.add_argument("--ocr", choices=["auto", "on", "off"], default="auto",
+                    help="OCR scanned PDFs: auto-detect (default), always, never")
     ap.add_argument("--threads", type=int, default=0,
                     help="threads per worker (0 = [ingest].threads_per_shard)")
     ap.add_argument("--max-workers", type=int, default=0, help="hard cap on workers (0 = admission-bound)")

@@ -27,14 +27,32 @@ Two distinct things live here — a *map* and a *derivation*:
 
 ## Public API
 
-- `document_outline(text, token_count=None)` → `{"total_tokens", "has_toc", "outline": [node, …]}`
-  - Each node: `id, level, title, anchor, line_span, self_tokens, subtree_tokens,
-    tables, images, children`. `self_tokens`/`subtree_tokens` partition cleanly
-    (parent == self + Σ children). Excludes table rows and list items from headings.
-    Image `caption` is left `null` for the separable captioning stage. Line indices
-    are **body-relative** (see `docs/design/output-contract.md`).
+- `document_outline(text, token_count=None)` → `{"total_tokens", "has_toc",
+  "levels_inferred", "outline": [node, …]}`
+  - Each node: `id, section_id, parent, level, title, anchor, line_span, self_tokens,
+    subtree_tokens, fingerprint, tables, images, links, children`.
+    `self_tokens`/`subtree_tokens` partition cleanly (parent == self + Σ children), and
+    `fingerprint` covers the node's own body so it partitions the same way. `id` is
+    positional; `section_id` is content-derived and is what survives an inserted
+    heading. Excludes table rows and list items from headings. Tables and images are
+    addressable nodes; image `caption` is left `null` for the separable captioning
+    stage. Line indices are **body-relative** (see `docs/design/output-contract.md`).
+  - `levels_inferred` is `true` when the nesting was read from the titles' section
+    numbering because the extractor emitted a single level for the whole document
+    **and** those numbers read as a nested outline (every nested number extends one
+    the document already stated) — so a docx written with one heading style is never
+    reshaped by digits that are measurements rather than section numbers.
 - `chunk_sections(doc_id, text, token_count=None)` → `[Section(...)]`
   - Heading-anchored, size-bounded chunks with stable ids + content fingerprints.
   - `token_count`: optional `str -> int` tokenizer. Given, budgets are measured in
     real tokens; omitted, char-based sizing (byte-for-byte stable).
-- `is_heading(line)`, `normalize_title(s)` — shared heading helpers.
+- `is_heading(line)`, `normalize_title(s)`, `gfm_anchor(title)`,
+  `fenced_lines(lines)` — shared helpers. `gfm_anchor` is the one anchor scheme: the
+  `#fragment` a renderer emits for a heading — lowercase, non-word/space/hyphen
+  characters dropped, every run of spacing-and-hyphens collapsed to one `-` — kept in
+  step with `validate.gfm_anchor` and `kb.heading_anchor` by
+  `tests/unit/backend/test_anchor_parity.py`. `is_heading` returns the length of the
+  **leading** ATX hash run, never the count of hashes on the line.
+  `fenced_lines` is the per-line "this is code, not prose" mask both the outline and
+  the chunker filter through, so a shell comment in a transcript is never a heading
+  and pipe art in a fence is never a table.

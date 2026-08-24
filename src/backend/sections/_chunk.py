@@ -19,7 +19,7 @@ from collections import namedtuple, Counter
 
 from ..ingest import markdown_to_text
 
-__all__ = ["Section", "chunk_sections", "is_heading", "normalize_title"]
+__all__ = ["Section", "chunk_sections", "gfm_anchor", "is_heading", "normalize_title"]
 
 # section_id is the stable key; fingerprint detects content change; l0/l1 are the
 # CURRENT line span (addressing, always taken fresh — never trusted across builds).
@@ -47,25 +47,278 @@ SECTION_TARGET_TOK = 4000
 MIN_SEC_TOK = 500
 SUBSPLIT_TOK = 3500
 WIN_TOK = 2200
-_NUM = re.compile(r'^\s*\d+(?:\.\d+){0,3}\.?\s+')   # leading "1.2.3 " section number
+# A leading "1.2.3 " section number. Two alternatives, because real documents lose
+# the space: a DOTTED number may be glued to the title ("1.2reference documents" —
+# no ordinary word starts "<digit>.<digit>"), a BARE integer may not ("3D layout" is
+# a title, not section 3 of "D layout"; "2026 budget" still loses its year only when
+# a space follows, exactly as before).
+_NUM = re.compile(r'^\s*(?:\d+(?:\.\d+){1,3}\.?\s*|\d+\.?\s+)')
 _WS = re.compile(r"\s+")
+
+# The URL fragment a rendered heading is addressable by — the SINGLE anchor scheme
+# (docs/quality-plan.md C3). This is deliberately a re-implementation of
+# ``backend.validate.gfm_anchor`` rather than an import of it: this package may only
+# depend on ``backend.ingest`` (see its CLAUDE.md), and the rubric that GRADES anchors
+# must not share code with the layer that PRODUCES them — the same converter-blind
+# rule the token gate follows. ``tests/unit/backend/test_anchor_parity.py`` is what
+# keeps the copies honest (here, ``backend.validate.gfm_anchor``,
+# ``backend.kb.heading_anchor``).
+#
+# THE SECTION NUMBER STAYS IN THE ANCHOR: "1.2 Scope" -> "12-scope", not "scope".
+# An anchor's only job is to be the fragment a renderer emits for that heading, and
+# every common renderer (GitHub, Python-Markdown, pandoc) drops the dot and keeps the
+# digits. ``kb._lint._check_refs`` grades every "#fragment" ref against
+# ``kb.body_anchors``, which is derived from the rendered heading text — so an anchor
+# with the number stripped would report every ref into a numbered section as a dead
+# link. It also keeps two same-named sections ("2.1 Overview" / "3.1 Overview")
+# distinct without needing a disambiguating suffix.
+_ANCHOR_DROP = re.compile(r'[^\w\s-]', re.UNICODE)
+_ANCHOR_SEP = re.compile(r'[-\s]+', re.UNICODE)
+
+
+def gfm_anchor(title):
+    # type: (str) -> str
+    """The ``#fragment`` a rendered heading titled ``title`` is addressable by.
+
+    Lowercase, drop everything that is not a word character / whitespace / hyphen
+    (underscores and non-ASCII letters survive — dropping them reported live links
+    as dead), then collapse whitespace-and-hyphen runs to a single hyphen and trim.
+    """
+    s = _ANCHOR_DROP.sub('', (title or "").strip().lower())
+    return _ANCHOR_SEP.sub('-', s).strip('-')
+
+
+# --- bounds on the ALL-CAPS heuristic (docs/quality-plan.md P4.6) -------------
+# Un-marked-up native text shouts its headings, so an ALL-CAPS line is real evidence
+# of one. It is ALSO how a runbook shouts an instruction — "DO NOT REBOOT THE PRIMARY
+# NODE" — and promoting that to a heading does not merely add a node: it becomes a
+# level-1 heading that REPARENTS every section after it, with both gates green (the
+# text is all still there; only its shape is wrong). So the branch is bounded.
+#
+# The separating idea is grammatical, not lexical: a heading is a noun-phrase LABEL,
+# a callout is a CLAUSE. Three shape bounds and one closed word list, no model:
+_CAPS_MAX_CHARS = 60          # labels are short; 70 admitted whole sentences
+_CAPS_MAX_WORDS = 6           # "ABSOLUTE MAXIMUM RATINGS AND LIMITS" is 5
+_CAPS_TERMINAL = ".!?,;:"     # a label does not end in a full stop or a comma
+# Determiners, pronouns, auxiliaries, modals and negations: a label almost never
+# needs one, a sentence almost always carries one. OF / AND / FOR / IN / TO / ON are
+# deliberately ABSENT — "THEORY OF OPERATION" and "TERMS AND ABBREVIATIONS" are
+# headings, and a list that rejected them would trade one silent failure for another.
+_CLAUSE_WORDS = frozenset((
+    "THE", "A", "AN", "THIS", "THAT", "THESE", "THOSE", "ITS", "IT", "YOU",
+    "YOUR", "WE", "OUR", "THEY", "THEIR",
+    "IS", "ARE", "WAS", "WERE", "BE", "BEEN", "BEING", "AM",
+    "HAS", "HAVE", "HAD", "DO", "DOES", "DID",
+    "WILL", "WOULD", "SHALL", "SHOULD", "CAN", "COULD", "MAY", "MIGHT",
+    "MUST", "CANNOT", "NOT", "NEVER", "ALWAYS", "PLEASE", "DONT", "DON'T",
+))
+# P4.6's list bounded the branch by FUNCTION words, and an imperative has none of
+# them: no determiner, no pronoun, no auxiliary. Three of four realistic runbook
+# callouts still walked into the tree — "POWER DOWN ALL NODES FIRST", "CONTACT SRE
+# BEFORE FAILOVER", "DISABLE AUTOSCALING DURING MAINTENANCE" — while only
+# "ESCALATE TO THE ON-CALL LEAD IMMEDIATELY" was stopped, and only by its THE.
+#
+# What an imperative DOES carry is the adverbial furniture a clause needs to say
+# WHEN, or HOW MANY: a noun-phrase label names a thing, it does not schedule one.
+# Same grammatical principle as above, second closed list. FIRST / LAST are absent
+# on purpose ("FIRST BOOT" is a real heading) and are not needed: the callouts that
+# end in FIRST reach for ALL or THE on the way.
+_ADVERBIAL_WORDS = frozenset((
+    "ALL", "ANY", "EVERY", "EACH", "BOTH", "ONLY", "JUST",
+    "BEFORE", "AFTER", "DURING", "WHILE", "UNTIL", "UNLESS", "WHENEVER",
+    "WHEN", "IF", "THEN", "ELSE", "AGAIN", "NOW", "SOON", "TWICE",
+    "IMMEDIATELY", "ALREADY",
+))
+# HONEST ABOUT WHAT REMAINS: a bare imperative with a bare object and no adverbial
+# — "RESTART NGINX", "RUN DIAGNOSTICS", "FLUSH CACHE" — is still promoted, because
+# nothing in its SHAPE separates it from "RESET SEQUENCE" or "POWER SUPPLY". Shape
+# alone cannot decide whether the first word is a verb or a noun; a part-of-speech
+# model could, and this layer is deliberately model-free. The bound removes the
+# common class — anything that says WHEN or HOW MANY — not every case.
+_CAPS_WORD = re.compile(r"[^A-Z']")   # keep letters and the apostrophe of DON'T
+
+
+def _looks_like_a_sentence(s):
+    # type: (str) -> bool
+    """True when an ALL-CAPS line reads as a clause rather than a section label."""
+    if len(s) > _CAPS_MAX_CHARS or s[-1] in _CAPS_TERMINAL:
+        return True
+    words = s.split()
+    if len(words) > _CAPS_MAX_WORDS:
+        return True
+    for w in words:
+        bare = _CAPS_WORD.sub("", w.upper())
+        if bare in _CLAUSE_WORDS or bare in _ADVERBIAL_WORDS:
+            return True
+    return False
+
+
+# --- bounds on the KEYWORD heuristic (docs/quality-plan.md P4.7) --------------
+# "Chapter 4", "Appendix A", "Section 2.3" open a section in un-marked-up native
+# text, so the keyword is real evidence. The branch was UNBOUNDED, and worse than
+# the ALL-CAPS one ever was: `[0-9IVXLA-Z]` under `re.I` matches ANY letter, so the
+# designator slot accepted the next ordinary word and every one of these was
+# published as a LEVEL-1 heading that reparented the rest of the document —
+#     "Section prose."
+#     "Section 4 describes the reset sequence in detail."
+#     "Part of the clock tree is duplicated for the display pipe."
+#     "Chapter references appear at the end of the document."
+# Bounded on the same grammatical principle: a heading is a noun-phrase LABEL.
+#
+#   1. The DESIGNATOR is matched case-SENSITIVELY — a digit run, a roman numeral,
+#      or a single capital letter — so `Part of`, `Chapter references` and
+#      `Section prose` no longer have one, and the keyword alone can no longer
+#      carry a sentence into the tree.
+#   2. What follows it must READ as a label. The decisive test is capitalisation:
+#      every convention for writing a title capitalises its first word (title case
+#      and sentence case alike), while a sentence that runs on past "Section 4"
+#      continues in lower case — `describes`, `covers`, `lists`. Plus the same
+#      shape bounds the ALL-CAPS branch uses: no terminal punctuation, no run-on
+#      length, no clause word.
+#
+# HONEST ABOUT WHAT REMAINS: a title-cased sentence with a capitalised verb and no
+# clause word ("Section 4 Covers Reset") is still promoted, and a genuine heading
+# written in lower case after its number ("Section 4 reset sequence") is now
+# missed. The second error costs a node; the first costs the whole tree below it,
+# which is why the bound leans this way.
+_KEYWORDS = frozenset(("chapter", "section", "appendix", "part"))
+_DESIGNATOR = re.compile(r'^(?:\d+(?:\.\d+)*|[IVXLCDM]+|[A-Z])(?![0-9A-Za-z])')
+_KEY_MAX_CHARS = 80           # a label plus a title, not a sentence
+_KEY_MAX_WORDS = 10           # "Chapter 7 Design of the Memory Subsystem Controller"
+_KEY_LEAD = re.compile(r'^[^0-9A-Za-z]*(.)')   # first alphanumeric of the remainder
+# Auxiliaries, modals, negations and pronouns. Articles and prepositions are
+# deliberately ABSENT here (unlike the ALL-CAPS list): a mixed-case chapter title
+# carries them freely — "Chapter 7 Design of the Memory Subsystem Controller".
+_VERBAL_WORDS = frozenset((
+    "IS", "ARE", "WAS", "WERE", "BE", "BEEN", "BEING", "AM",
+    "HAS", "HAVE", "HAD", "DOES", "DID",
+    "WILL", "WOULD", "SHALL", "SHOULD", "CAN", "COULD", "MIGHT",
+    "MUST", "CANNOT", "NOT", "NEVER",
+    "IT", "ITS", "YOU", "YOUR", "WE", "OUR", "THEY", "THEIR",
+))
+
+
+def _is_keyword_heading(s):
+    # type: (str) -> bool
+    """True when ``s`` is a ``Chapter 4`` / ``Appendix A: Register map`` LABEL."""
+    parts = s.split(None, 2)
+    if len(parts) < 2 or parts[0].lower() not in _KEYWORDS:
+        return False
+    if not _DESIGNATOR.match(parts[1]):
+        return False
+    if len(s) > _KEY_MAX_CHARS or s[-1] in _CAPS_TERMINAL:
+        return False
+    if len(s.split()) > _KEY_MAX_WORDS:
+        return False
+    rest = parts[2] if len(parts) > 2 else ""
+    lead = _KEY_LEAD.match(rest)
+    if lead and lead.group(1).isalpha() and not lead.group(1).isupper():
+        return False                      # a lower-case continuation is a clause
+    for w in rest.split():
+        if _CAPS_WORD.sub("", w.upper()) in _VERBAL_WORDS:
+            return False
+    return True
+
+
+# --- bounds on the NUMBERED heuristic (the third branch; P4.6/P4.7 bounded the other two)
+# "1.2 Reference documents" opens a section in un-marked-up native text, so a leading
+# section number is real evidence. This was the ONE of the three heuristic branches
+# left unbounded, and it failed in exactly the way the other two did: ANY short line
+# opening with a digit run, a space and a letter became a heading that REPARENTED
+# every section printed after it —
+#     "2024 replaced the manual failover script with the supervisor."   -> level 1
+#     "3.3 V is the nominal supply for the IO ring."                    -> level 2
+#     "16 bytes are reserved at the head of every descriptor."          -> level 1
+#     "5 minutes after boot the watchdog is armed."                     -> level 1
+# — each publishing an ``anchor``/``section_id`` for a fragment no heading in
+# document.md makes addressable, with the recall, structure-fidelity and coverage
+# gates all green because every word is still present and only the SHAPE is wrong.
+#
+# Bounded on the same grammatical principle as the ALL-CAPS and keyword branches, and
+# deliberately with the KEYWORD branch's constants: the thing being tested is the same
+# thing — "does what follows the designator read as a noun-phrase LABEL, or as the
+# rest of a sentence?" Four shape tests, no word list of its own, no model:
+#
+#   * no terminal ``.!?,;:`` — a label does not end in a full stop or a comma;
+#   * inside the keyword branch's length and word caps;
+#   * the first word after the number is CAPITALISED. Every convention for writing a
+#     title capitalises it (title case and sentence case alike), while a sentence that
+#     runs on past its opening numeral continues in lower case — "replaced", "bytes",
+#     "minutes", "uplinks", "tolerance";
+#   * no auxiliary/modal/pronoun (``_VERBAL_WORDS``) — that is what stops
+#     "3.3 V is the nominal supply", whose first word IS capitalised.
+#
+# ...and one bound the keyword branch does not need, because this branch's evidence is
+# the WEAKEST of the three: a bare digit run. "Chapter"/"Appendix" is a word that only
+# ever opens a section; a digit opens sentences all day ("10 GbE uplinks connect the
+# top-of-rack switches to the spine"). ``_KEY_MAX_WORDS`` = 10 budgets a keyword, a
+# designator and an eight-word TITLE; strip the keyword and the title budget is what
+# is left, so the numbered form gets those same eight words and no free ride for the
+# word it does not have to spend. Every numbered heading in this repo's own corpus
+# ("1.2 Reference documents", "2.1.1 Lock detection", "4 Verification plan") is three.
+#
+# HONEST ABOUT WHAT REMAINS, in both directions: a bare capitalised measurement with
+# no verb and no stop — "100 MHz", "8 GB DDR4" — still reads as a label by shape and
+# is still promoted, because nothing in its SHAPE separates it from the real heading
+# "5 V rail"; and a genuine heading written in lower case after its number ("4.2 reset
+# sequence") is now missed. The second error costs one node, the first costs the whole
+# tree below it, which is why the bound leans this way — the same trade P4.7 recorded
+# for the keyword branch. A numbered heading whose TITLE runs past eight words is also
+# missed now; when the converter marked such a heading up as ATX it is untouched,
+# because the ``#`` form is tested first and carries no bound at all.
+_NUM_MAX_TITLE_WORDS = _KEY_MAX_WORDS - 2     # the keyword branch's title budget
+
+
+def _is_numbered_heading(s, rest):
+    # type: (str, str) -> bool
+    """True when ``s`` — a line of the form ``1.2 <rest>`` — is a section LABEL."""
+    if len(s) > _KEY_MAX_CHARS or s[-1] in _CAPS_TERMINAL:
+        return False
+    if len(rest.split()) > _NUM_MAX_TITLE_WORDS:
+        return False
+    if not rest[0].isupper():             # a lower-case continuation is a clause
+        return False
+    for w in rest.split():
+        if _CAPS_WORD.sub("", w.upper()) in _VERBAL_WORDS:
+            return False
+    return True
 
 
 def is_heading(s):
     # type: (str) -> int
-    """Heading level (1-4) or 0. Recognizes ATX (`#`), numbered, keyword, and ALL-CAPS forms."""
+    """Heading level (1-6) or 0. Recognizes ATX (`#`), numbered, keyword, and ALL-CAPS forms."""
     s = s.strip()
-    if not s or len(s) > 120:
+    if not s:
         return 0
-    if re.match(r'^#{1,6}\s+\S', s):
-        return s.count("#") if s.startswith("#") else 1
-    if re.match(r'^(chapter|section|appendix|part)\s+[0-9IVXLA-Z]', s, re.I):
-        return 1
-    m = re.match(r'^(\d+(?:\.\d+){0,3})\.?\s+[A-Za-z]', s)
+    # THE ATX FORM IS TESTED BEFORE THE LENGTH BOUND, on purpose. A leading `##` is
+    # EXPLICIT markup — the document itself says "this is a heading" — and evidence
+    # that strong does not weaken at 121 characters. The bound below used to sit
+    # above this branch, and a 132-char `## Reset and Initialisation Sequence …`
+    # (routine in standards and databook text) was silently DELETED from
+    # structure.json while document.md still rendered it: its whole body was
+    # re-attributed to the preceding node, whose fingerprint, tables, images and
+    # links then described a section that was not its own, with every gate green.
+    # The length bound belongs only on the un-marked-up HEURISTICS below, which is
+    # where a run-on line is genuine evidence AGAINST a heading.
+    #
+    # The LEADING RUN of hashes, never ``count("#")``: a Word heading reading
+    # "Issue #42 metastability on the strap bus" is one `#` plus a body hash, and
+    # counting them published it at level 2 — so the next real H1 became its
+    # sibling and the whole tree below shifted. The same bug demoted an ATX-closed
+    # "## Level Two ##" to level 4.
+    m = re.match(r'^(#{1,6})\s+\S', s)
     if m:
+        return len(m.group(1))
+    if len(s) > 120:
+        return 0                          # bounds the three heuristic branches only
+    if _is_keyword_heading(s):
+        return 1
+    m = re.match(r'^(\d+(?:\.\d+){0,3})\.?\s+([A-Za-z].*)$', s)
+    if m and _is_numbered_heading(s, m.group(2)):
         return 1 + m.group(1).count(".")
     letters = [c for c in s if c.isalpha()]
-    if letters and len(s) <= 70 and len(s.split()) <= 10 and sum(c.isupper() for c in letters) / len(letters) > 0.85:
+    if (letters and sum(c.isupper() for c in letters) / len(letters) > 0.85
+            and not _looks_like_a_sentence(s)):
         return 1
     return 0
 
@@ -91,8 +344,8 @@ def _is_separator_row(s):
     return all(c in "|:-" or c.isspace() for c in s)
 
 
-def _table_headers(lines):
-    # type: (list) -> dict
+def _table_headers(lines, fenced=None):
+    # type: (list, list) -> dict
     """Map each table DATA-row line index -> its ``"header\\nseparator"`` block.
 
     A markdown table is a header row, a ``|---|`` separator, then data rows. When a
@@ -100,15 +353,21 @@ def _table_headers(lines):
     the resulting chunk would otherwise be headerless rows the carder can't interpret.
     This lets ``chunk_sections`` PREPEND the header block so every chunk is self-describing.
     Header/separator rows themselves are not mapped (their header is already in-body).
+
+    ``fenced`` is ``fenced_lines(lines)``: pipe art inside a code transcript is code,
+    not a table, so it never contributes a header to prepend.
     """
     hdr = {}
     n = len(lines)
+    if fenced is None:
+        fenced = fenced_lines(lines)
     i = 0
     while i < n - 1:
-        if _is_table_row(lines[i]) and _is_separator_row(lines[i + 1]):
+        if (not fenced[i] and not fenced[i + 1]
+                and _is_table_row(lines[i]) and _is_separator_row(lines[i + 1])):
             block = lines[i] + "\n" + lines[i + 1]
             j = i + 2
-            while j < n and _is_table_row(lines[j]):
+            while j < n and not fenced[j] and _is_table_row(lines[j]):
                 hdr[j] = block
                 j += 1
             i = max(j, i + 1)
@@ -120,8 +379,66 @@ def _table_headers(lines):
 _DOT_LEADER_TOC = re.compile(r'\.{4,}\s*\d+\s*$')   # "1.2 Overview .......... 7"
 _ATX_HEADING = re.compile(r'^\s{0,3}#{1,6}\s+\S')
 _IMG_LINK = re.compile(r'!\[[^\]]*\]\([^)]+\)')
-_CODE_FENCE = re.compile(r'^\s{0,3}(```|~~~)')
+# The run is captured whole, and the tail with it: a CLOSER must repeat the opener's
+# character with a run at least as long and carry nothing after it but spaces, so a
+# three-character match is not enough to decide anything.
+_CODE_FENCE = re.compile(r'^\s{0,3}(`{3,}|~{3,})(.*)$')
 _TOC_HEADER = re.compile(r'^\s*(table of contents|contents)\s*$', re.I)
+
+
+def fenced_lines(lines):
+    # type: (list) -> list
+    """Per-line ``True`` for "this line is CODE, not prose" (docs/quality-plan.md P4.8).
+
+    A fenced block is a verbatim transcript, and every heading/table heuristic in
+    this package is a prose heuristic. Without this, a shell comment inside a
+    command transcript —
+
+        ```
+        # reset the board
+        kestrelctl board reset --wait
+        ```
+
+    — was published as a section, and because the section's span runs to the next
+    heading it SWALLOWED the closing fence: the outline claimed a heading the
+    document never had, over a body whose code block no longer terminates. The same
+    hole let a ``|`` table drawn inside a fence be reported as a real GFM table.
+
+    ``_links_in`` has tracked fences since links were harvested; this is that same
+    state, computed once and shared, so links, headings and tables agree on where
+    the code is. The delimiter lines themselves are marked too (they are the fence,
+    not prose), and an UNCLOSED fence runs to the end of the document — which is
+    what CommonMark does with one, so the mask matches the renderer.
+    """
+    mask = [False] * len(lines)
+    open_fence = None            # (char, length) of the fence currently open
+    for i, line in enumerate(lines):
+        m = _CODE_FENCE.match(line)
+        if open_fence is None:
+            if m:
+                run = m.group(1)
+                open_fence = (run[0], len(run))
+                mask[i] = True
+            continue
+        # Inside a fence, ONLY a matching closer ends it: same character, a run at
+        # least as long as the opener, and nothing after it but spaces. Toggling on
+        # any fence-looking line meant a `~~~` inside a ``` block closed it — so the
+        # rest of the code became prose (a `# comment` was published as a heading)
+        # and the prose after the real closer became code (a real heading vanished
+        # from the outline entirely). A transcript that mentions the other fence
+        # character is ordinary, which is what made this reachable.
+        mask[i] = True
+        if m and _closes(m.group(1), m.group(2), open_fence):
+            open_fence = None
+    return mask
+
+
+def _closes(run, tail, open_fence):
+    # type: (str, str, tuple) -> bool
+    """CommonMark 4.5: a closer repeats the opener's character with a run at least as
+    long, and carries nothing after it but spaces (an info string opens, never closes)."""
+    char, length = open_fence
+    return run[0] == char and len(run) >= length and not tail.strip()
 
 
 def content_start(lines):
@@ -267,11 +584,14 @@ def chunk_sections(doc_id, text, token_count=None):
         csum.append(csum[-1] + sz)
     span_size = lambda a, b: csum[b] - csum[a]  # noqa: E731
     start = content_start(lines)
+    # Fenced lines are code: a chunk must never break on a shell comment, which
+    # would cut a transcript in half and leave the tail with no opening fence.
+    fenced = fenced_lines(lines)
     heads = set(i for i in range(start, n)
-                if is_heading(lines[i]) and not is_toc_line(lines[i]))
+                if not fenced[i] and is_heading(lines[i]) and not is_toc_line(lines[i]))
 
     spans = _size_driven_spans(lines, start, n, span_size, heads, target, min_sec)
-    tbl = _table_headers(lines)  # data-row line -> repeated header block (table-aware split)
+    tbl = _table_headers(lines, fenced)  # data-row line -> repeated header block
     # prefix for a chunk opening at line ``a``: the table header to prepend, or "".
     prefix_for = lambda a: (tbl[a] + "\n") if a in tbl else ""  # noqa: E731
     counts = Counter()          # disambiguate repeated opening titles within a doc

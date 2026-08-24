@@ -98,7 +98,12 @@ zip part the converter does not read (currently: none).
 
 - `mc:Fallback` subtrees skipped — they duplicate `mc:Choice`.
 - Page furniture excluded: docx header/footer parts, pptx slide-number/date/
-  footer placeholders and layout/master templates, xlsx print headers.
+  footer placeholders and layout/master templates, xlsx print headers. The docx
+  header/footer parts are read *once, separately*, purely to **measure** the drop
+  and name it (`dropped_headers_footers`, with a part count and a char count) —
+  they never enter `parts`, so neither the converter nor the ground truth can see
+  them and the exclusion stays symmetric. A drop this lane makes by policy is
+  never a silent one, and never degrades `status`.
 - `w:delText` (tracked deletions) and `w:instrText` (field code source)
   excluded; the field's *result* text is kept.
 - SmartArt `diagrams/drawingN.xml` excluded — verified character-identical
@@ -109,9 +114,24 @@ zip part the converter does not read (currently: none).
   comments, speaker notes, text boxes, SmartArt labels, chart titles + cached
   series/category values, xlsx cell comments, chartsheet names.
 - Formulas: the cached **result** is converted, not the formula source.
-- All literal text is markdown-escaped (`\_`, `\<`, `\[`, leading `15\.` …) so
-  a GFM renderer shows the source characters exactly; silicon docs are full of
-  `__paths__` and `<signal[31:0]>` that would otherwise be eaten as syntax.
+- Literal text is markdown-escaped **by position, not by character class**
+  (`\<`, `\[`, leading `15\.`, `\_\_` …) so a GFM renderer shows the source
+  characters exactly; silicon docs are full of `__paths__` and `<signal[31:0]>`
+  that would otherwise be eaten as syntax. The one exception is a **single**
+  underscore flanked by word characters: CommonMark's flanking rule means it can
+  neither open nor close emphasis (and `markdown_to_text`'s `_ITALIC` already
+  mirrors that), so escaping it bought no safety and put backslashes into the
+  bytes a BM25 index and a human grep search — `DB_MAX_CONN_LIMIT` is stored
+  verbatim. A run of two or more stays escaped: `__x__` *is* strong emphasis to
+  `_BOLD`, which carries no flanking guard, so unescaping there would move the
+  recall gate.
+- **List nesting follows the parent's content column, never a fixed indent.**
+  CommonMark nests a child item only at the column after its parent's marker and
+  the space following it — 2 under `- ` but **3** under `1. `. A fixed two-space
+  indent closed the parent item and rendered the child as its sibling, silently
+  **renumbering** every subsequent step of an ordered procedure. Indentation is
+  not a token, so no recall or coverage gate could object; `docs/quality-plan.md`
+  P3 adds the structural gate that can.
 
 ## Layout produced
 

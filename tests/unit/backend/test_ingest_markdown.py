@@ -122,3 +122,75 @@ def test_escaped_punctuation_unescaped():
 def test_empty_input():
     assert markdown_to_text("") == ""
     assert markdown_to_text(None) == ""
+
+
+# ---------------------------------------------------------------------------
+# EMPHASIS: CommonMark's intraword ban belongs to `_` alone (finding idx 19).
+#
+# The office converter emits mid-word emphasis on purpose — Word stores a partly
+# formatted word as two adjacent runs — and the recorded `Dma**ArbiterUnit**`
+# deviation is justified BY this stripper undoing it before the recall gate
+# tokenises. That justification was only true for `**`: `_ITALIC` applied the `_`
+# rule to `*` as well, so `*n*th` kept its markers, the token `nth` went missing and
+# a correctly converted document was thrown away at recall 0.667.
+# Every expectation below was rendered through marko 2.2.3 and markdown-it-py 4.2.0.
+# ---------------------------------------------------------------------------
+
+def test_intraword_italic_is_unwrapped_the_way_a_renderer_shows_it():
+    # <em> in both reference parsers, so the token the source held is `nth`.
+    assert markdown_to_text("Set the *n*th bit.") == "Set the nth bit."
+    assert markdown_to_text("two *Foo*s here.") == "two Foos here."
+    assert markdown_to_text("re*start* now.") == "restart now."
+    assert markdown_to_text("The MODE*MODE* end.") == "The MODEMODE end."
+    # `*` between digits emphasises too — 2<em>3</em>4 — however little it looks it.
+    assert markdown_to_text("2*3*4") == "234"
+    assert markdown_to_text("a*b*c*d*e") == "abcde"
+
+
+def test_the_intraword_ban_still_holds_for_underscore():
+    # P0.3's contract, and the reason the fix had to be per-delimiter: one
+    # identifier must reach the KB and the BM25 index as one token, not fused.
+    assert markdown_to_text("DB_MAX_CONN_LIMIT") == "DB_MAX_CONN_LIMIT"
+    assert markdown_to_text("snake_case_helper") == "snake_case_helper"
+    assert markdown_to_text("pass --dry_run=true to the runner") == \
+        "pass --dry_run=true to the runner"
+    assert markdown_to_text("_x_y and *n*th") == "_x_y and nth"
+
+
+def test_whitespace_flanked_asterisks_are_still_literal():
+    # `(?=\S)` / `(?<=\S)` are load-bearing: neither reference parser emphasises
+    # here, so neither may this.
+    assert markdown_to_text("2 * 3 * 4") == "2 * 3 * 4"
+    assert markdown_to_text("a * b * c") == "a * b * c"
+    assert markdown_to_text("one*two") == "one*two"
+    assert markdown_to_text("***all*** of it") == "all of it"
+    assert markdown_to_text(r"\*not\* emphasis") == "*not* emphasis"
+    assert markdown_to_text("use `a * b` and `c * d` here") == "use a * b and c * d here"
+
+
+# ---------------------------------------------------------------------------
+# MARKER RUNS: only delete what a renderer deletes (finding idx 35, reader half).
+# ---------------------------------------------------------------------------
+
+def test_a_marker_run_with_no_paragraph_above_it_is_prose_not_an_underline():
+    # `===` is a setext UNDERLINE only under a paragraph. Standing alone it is an
+    # ordinary paragraph (`<p>===</p>` in marko), and deleting it removed real
+    # characters from the text layer while recall read a vacuous 1.0 — a marker run
+    # carries no ASCII token to go missing.
+    assert markdown_to_text("===") == "==="
+    assert markdown_to_text("==") == "=="
+    assert markdown_to_text("a\n\n===\n\nb") == "a\n\n===\n\nb"
+    # An ATX heading is a closed block: the `===` beneath it is a paragraph.
+    assert markdown_to_text("# H\n===\n") == "H\n==="
+    # Two hyphens are neither a rule nor a table delimiter row.
+    assert markdown_to_text("--") == "--"
+
+
+def test_real_furniture_is_still_dropped():
+    # The converse direction: everything a renderer really does swallow.
+    assert markdown_to_text("Title\n===\n\nbody\n\n---") == "Title\n\nbody"
+    assert markdown_to_text("Sub\n---\n") == "Sub"
+    assert markdown_to_text("-----") == ""          # a thematic break, <hr />
+    assert markdown_to_text("* * *") == ""
+    assert markdown_to_text("___") == ""
+    assert markdown_to_text("| a | b |\n| --- | --- |\n| 1 | 2 |") == "a b\n\n1 2"

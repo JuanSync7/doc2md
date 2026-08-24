@@ -5,7 +5,8 @@ layer: backend
 summary: Size-driven, heading-anchored chunking — bounded section counts, stable ids, content fingerprints.
 """
 import pytest
-from backend.sections import chunk_sections, normalize_title, is_heading
+from backend.sections import (chunk_sections, fenced_lines, is_heading,
+                              normalize_title)
 
 pytestmark = pytest.mark.unit
 
@@ -162,3 +163,61 @@ def test_is_heading_levels():
     assert is_heading("### Deep") == 3
     assert is_heading("1.2.3 Something Here") == 3
     assert is_heading("just a normal sentence that goes on for a while") == 0
+
+
+def test_the_length_bound_stops_the_heuristics_and_not_the_explicit_markup():
+    # The bound used to sit above every branch, so an ATX heading over 120 chars was
+    # rejected — deleting from the chunker's `heads` set a boundary the document had
+    # marked up itself, which merged two sections into one chunk.
+    long_title = ("Reset and Initialisation Sequence for the Kestrel Fabric Bridge, "
+                  "Including the Optional Retry Path and the Timeout Handling Rules")
+    assert len("## " + long_title) > 120
+    assert is_heading("## " + long_title) == 2
+    # ...while a run-on line with no markup is still evidence AGAINST a heading.
+    assert is_heading(long_title) == 0
+    assert is_heading("4.2 " + long_title) == 0
+
+
+def test_a_body_sentence_that_opens_with_a_number_is_not_a_heading():
+    # The third heuristic branch, bounded like the other two: a short paragraph
+    # opening with a numeral used to be published as a heading that reparented every
+    # section after it, with all three gates green.
+    assert is_heading("2024 replaced the manual failover script with the supervisor.") == 0
+    assert is_heading("3.3 V is the nominal supply for the IO ring.") == 0
+    assert is_heading("16 bytes are reserved at the head of every descriptor.") == 0
+    # ...and the real numbered labels the branch exists for still are.
+    assert is_heading("1.2 Reference documents") == 2
+    assert is_heading("2.1 The system context") == 2
+    assert is_heading("4 Verification plan") == 1
+
+
+# ------------------------------------------------- fenced code is not prose
+
+def test_fenced_lines_marks_the_delimiters_and_everything_between():
+    lines = ["prose", "```sh", "# reset", "code", "```", "after"].copy()
+    assert fenced_lines(lines) == [False, True, True, True, True, False]
+
+
+def test_an_unclosed_fence_runs_to_the_end_like_commonmark():
+    assert fenced_lines(["a", "~~~", "b", "c"]) == [False, True, True, True]
+
+
+def test_a_chunk_never_breaks_on_a_shell_comment():
+    # A size-driven break lands AT a heading, and a shell comment inside a
+    # transcript used to be one — so a chunk could open on the middle of a code
+    # block, with no opening fence and no way for a carder to know it was code.
+    body = "filler prose line that carries some weight\n" * 500
+    text = ("# Runbook\n" + body
+            + "```sh\n# reset the board\nkestrelctl board reset\n```\n"
+            + body)
+    secs = chunk_sections("d", text)
+    lines = text.split("\n")
+    fenced = fenced_lines(lines)
+    for s in secs:
+        assert not fenced[s.l0], "chunk opened inside a code fence: %r" % lines[s.l0]
+
+
+def test_pipe_art_inside_a_fence_is_not_a_table_header_to_repeat():
+    from backend.sections._chunk import _table_headers
+    lines = ("```\n| col |\n| --- |\n| 1 |\n```\n").split("\n")
+    assert _table_headers(lines) == {}

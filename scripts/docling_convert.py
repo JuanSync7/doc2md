@@ -3,12 +3,14 @@
 
 Runs UNDER PYTHON 3.12 with docling installed — NOT the 3.6 pipeline. It walks the
 source corpus and writes data/markdown/<doc_id>.md, using the SAME id hashing as
-build_index.py (backend.ingest.doc_id) so the two halves agree on filenames. The
-3.6 pipeline (build_index.py --backend docling) then consumes these markdown files.
+every other stage (backend.ingest.doc_id) so the two halves agree on filenames.
+The consumer is scripts/build_pdf_bundle.py, which assembles the bundle.
 
 Idempotent: skips docs whose .md already exists (use --force to rebuild). Per-doc
-failures are logged and skipped — build_index.py falls back to native extraction
-for any doc without markdown, so a failure never loses content.
+failures are logged and skipped, and the consumer falls back to native extraction
+for any doc without markdown, so a failure never loses content. NOTE the main path
+returns 0 unconditionally: CI cannot detect conversion failures from this script's
+exit status, only from the coverage records (docs/quality-plan.md P2.7).
 
 See docs/design/docling-ingestion.md.
 
@@ -1099,7 +1101,7 @@ def main(argv=None):
 
     # Crash recovery: if a previous run died mid-document (e.g. OS OOM-kill on a huge
     # page that docling can't catch), the marker names the victim. If it still has no
-    # .md, blacklist it so we don't loop-crash on it forever -> build_index uses native.
+    # .md, blacklist it so we don't loop-crash on it forever -> the writer uses native.
     crashed = set()
     if args.queue or args.only:
         # Queue workers share the out dir: any worker's crash knowledge applies to all.
@@ -1121,7 +1123,7 @@ def main(argv=None):
             with open(crashed_file, "a") as f:
                 f.write(stuck + "\n")
             print("  [recover] %s crashed the converter last run -> blacklisted "
-                  "(native fallback at build_index)" % stuck, file=sys.stderr)
+                  "(native fallback at the bundle writer)" % stuck, file=sys.stderr)
         try: os.remove(cur_file)
         except OSError: pass
 
@@ -1317,9 +1319,9 @@ def main(argv=None):
                     print("  retry %s (%s)" % (r["rel"], e), file=sys.stderr)
                 else:
                     bad += 1
-                    # No .md written -> build_index step 2 falls back to native
+                    # No .md written -> the bundle writer falls back to native
                     # extraction for this doc, so content is never lost.
-                    print("  FAIL %s (%s) -> native fallback at build_index"
+                    print("  FAIL %s (%s) -> native fallback at the bundle writer"
                           % (r["rel"], e), file=sys.stderr)
         if md is None:
             pass                          # failed after retries (counted above)

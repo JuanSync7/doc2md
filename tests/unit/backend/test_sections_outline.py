@@ -117,19 +117,59 @@ def test_bulleted_lists_do_not_become_headings():
     assert out["outline"][0]["children"] == []
 
 
-def test_tables_counted_in_owning_section():
+def test_tables_are_addressable_nodes_in_their_owning_section():
     text = ("# T\n| Bits | Name |\n|------|------|\n| 0 | A |\n| 1 | B |\n"
             "## Sub\nno table here\n")
     out = document_outline(text)
-    assert out["outline"][0]["tables"] == 1
-    assert out["outline"][0]["children"][0]["tables"] == 0
+    tables = out["outline"][0]["tables"]
+    assert len(tables) == 1
+    tbl = tables[0]
+    assert tbl["line"] == 1                       # the header row, body-relative
+    assert tbl["rows"] == 3 and tbl["cols"] == 2  # header + 2 data rows
+    assert tbl["has_header"] is True
+    assert tbl["table_id"].startswith("tbl-")
+    assert out["outline"][0]["children"][0]["tables"] == []
+
+
+def test_table_id_is_content_derived_not_positional():
+    # The point of C5: a table must stay citable across an edit above it. Inserting a
+    # paragraph moves `line`; it must NOT move `table_id`.
+    before = "# T\nintro\n| Role | Contact |\n|---|---|\n| Lead | Ravi |\n"
+    after = "# T\nintro\nA NEW paragraph lands here.\n| Role | Contact |\n|---|---|\n| Lead | Ravi |\n"
+    a = document_outline(before)["outline"][0]["tables"][0]
+    b = document_outline(after)["outline"][0]["tables"][0]
+    assert a["table_id"] == b["table_id"]
+    assert a["line"] != b["line"]                 # position moved, identity did not
+
+
+def test_two_tables_are_distinguished_by_header_then_by_ordinal():
+    text = ("# One\n| Role | Contact |\n|---|---|\n| Lead | Ravi |\n"
+            "| Sev | Action |\n|---|---|\n| 1 | Page |\n"
+            "| Role | Contact |\n|---|---|\n| Deputy | Mira |\n"
+            "## Two\n| Role | Contact |\n|---|---|\n| Lead | Ravi |\n")
+    out = document_outline(text)
+    first = [t["table_id"] for t in out["outline"][0]["tables"]]
+    second = [t["table_id"] for t in out["outline"][0]["children"][0]["tables"]]
+    assert len(first) == 3 and len(set(first)) == 3      # same header, different ids
+    # ...and the same header in a DIFFERENT section is a different table.
+    assert second[0] not in first
 
 
 def test_anchors_disambiguate_repeats():
+    # The RENDERER's suffix (`-1`, `-2`), not an invented one: this is what
+    # kb.body_anchors publishes and what a `#fragment` has to match.
     text = "# Overview\na\n# Details\nb\n# Overview\nc\n"
     out = document_outline(text)
     anchors = [n["anchor"] for n in out["outline"]]
-    assert anchors == ["overview", "details", "overview#2"]
+    assert anchors == ["overview", "details", "overview-1"]
+
+
+def test_anchor_keeps_the_section_number():
+    # "1.2 Scope" is addressable as "#12-scope" in every common renderer, so that is
+    # what structure.json advertises — dropping the number would advertise a fragment
+    # no renderer emits (quality-plan C3).
+    out = document_outline("# 1.2 Scope\nbody\n")
+    assert out["outline"][0]["anchor"] == "12-scope"
 
 
 def test_ids_are_sequential_and_unique():
@@ -247,6 +287,62 @@ def test_outline_coverage_detects_a_dropped_region():
     assert cov["uncovered_lines"] == 2                    # "# Lost" + "lost body"
     assert cov["first_uncovered"] == [0, 1]
     assert cov["covered_lines"] == 2
+
+
+def test_a_heading_swallowed_by_its_ancestors_span_is_not_covered():
+    """THE reason line coverage alone was unfalsifiable: when a builder drops a
+    heading node, the ancestor's span still tiles every one of those lines, so
+    ``uncovered_lines`` stayed 0 over a document that had lost a whole section.
+
+    Asking whether a node OPENS on the marked-up heading line is the question the
+    ancestor cannot backfill, and it is what makes this a measurement rather than
+    arithmetic.
+    """
+    text = "# Top\nintro\n## Lost\nlost body\n"
+    swallowed = [{"line_span": [0, 4], "children": []}]   # "## Lost" has no node
+    cov = outline_coverage(text, swallowed)
+    assert cov["uncovered_lines"] == 1
+    assert cov["first_uncovered"] == [2]
+    # the rest of the document is still accounted for, so the number is a count of
+    # the loss and not a blanket failure
+    assert cov["covered_lines"] == cov["content_lines"] - 1
+
+
+def test_the_real_builder_covers_every_marked_up_heading_including_a_long_one():
+    """The counter-direction, driven through the REAL builder rather than a
+    hand-built or monkeypatched node list: an ordinary document — including a
+    heading well past the old 120-char cutoff — must come out fully covered."""
+    long_title = ("Reset and Initialisation Sequence for the Kestrel Fabric Bridge, "
+                  "Including the Optional Retry Path and the Timeout Handling Rules")
+    text = ("Contents\n"
+            "Intro .......... 1\n"
+            "\n"
+            "# Kestrel Databook\n"
+            "intro prose\n"
+            "## %s\n"
+            "The bridge asserts nreset for eight cycles.\n"
+            "```sh\n"
+            "# reset the board\n"
+            "kestrelctl board reset\n"
+            "```\n"
+            "## Clocking\n"
+            "The reference clock runs at one hundred megahertz.\n" % long_title)
+    out = document_outline(text)
+    cov = outline_coverage(text, out["outline"])
+    assert cov["uncovered_lines"] == 0, cov
+    assert cov["first_uncovered"] == []
+    # the three real headings are nodes; the shell comment inside the fence is not,
+    # and is not counted against coverage either — the outline is right to skip it.
+    assert cov["covered_lines"] + cov["toc_lines"] == cov["content_lines"]
+    assert out["has_toc"] is True
+
+
+def test_a_shell_comment_inside_a_fence_is_not_an_uncovered_heading():
+    # The exclusion, on its own: a `#` line inside a transcript is code. Counting it
+    # as a lost heading would degrade every document that ships a shell transcript.
+    text = "# Runbook\n```sh\n# reset the board\nkestrelctl reset\n```\n"
+    out = document_outline(text)
+    assert outline_coverage(text, out["outline"])["uncovered_lines"] == 0
 
 
 def test_line_span_covers_whole_subtree():

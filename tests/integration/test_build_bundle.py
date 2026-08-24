@@ -74,6 +74,14 @@ def _bundle_dirs(out):
                   if os.path.isdir(os.path.join(out, d)))
 
 
+def rep_of_first_bundle(out):
+    """The report of the first bundle directory under ``out`` (order-stable)."""
+    d = sorted(n for n in os.listdir(str(out))
+               if os.path.isdir(os.path.join(str(out), n)))[0]
+    with open(os.path.join(str(out), d, "report.json"), encoding="utf-8") as fh:
+        return json.load(fh)
+
+
 def test_build_bundle_end_to_end(tmp_path):
     bb = _mod("build_bundle")
     src = tmp_path / "srcdocs"
@@ -118,15 +126,35 @@ def test_build_bundle_end_to_end(tmp_path):
     assert 'source_title: "Radar Spec"' in blob
     assert 'source_author: "A. Engineer"' in blob
 
-    # manifest has a row per doc
+    # the manifest is a RUN LOG: a row per document per run, every row stamped with
+    # the run that wrote it
     manifest = [json.loads(l) for l in open(os.path.join(str(out), "manifest.jsonl"))]
     assert len(manifest) == 2 and all(m["status"] == "ok" for m in manifest)
+    assert all(m["run_id"] == "RUN1" and m["action"] == "built" and m["ts"]
+               for m in manifest)
+    assert all(len(m["source_sha256"]) == 64 for m in manifest)
 
-    # idempotent: a second run rebuilds nothing (both bundles already ok)
-    rc2 = bb.main(["--src", str(src), "--out", str(out)])
+    # idempotent: a second run rebuilds nothing (both bundles already ok) -- but it
+    # still SAYS so. A skipped document that writes no row makes the number of runs
+    # unrecoverable from disk, which is what stops a manifest being a run log.
+    rc2 = bb.main(["--src", str(src), "--out", str(out), "--run-id", "RUN2"])
     assert rc2 == 0
     manifest2 = [json.loads(l) for l in open(os.path.join(str(out), "manifest.jsonl"))]
-    assert len(manifest2) == 2                              # no new manifest rows appended
+    assert len(manifest2) == 4
+    second = [m for m in manifest2 if m["run_id"] == "RUN2"]
+    assert len(second) == 2 and all(m["action"] == "skipped" for m in second)
+    assert all(m["status"] == "ok" for m in second)          # the bundle's own status
+
+    # runs.jsonl carries one row per RUN, joined to the manifest by run_id
+    runs = [json.loads(l) for l in open(os.path.join(str(out), "runs.jsonl"))]
+    assert [r["run_id"] for r in runs] == ["RUN1", "RUN2"]
+    assert runs[0]["counts"]["ok"] == 2 and runs[1]["counts"]["skipped"] == 2
+    assert runs[0]["corpus_sha256"] == runs[0]["corpus_sha256"]
+    assert runs[0]["entrypoint"] == "build_bundle"
+    # the full resolved configuration lives here, not duplicated into every bundle
+    assert runs[0]["config"]
+    assert "config" not in rep_of_first_bundle(out)["run"]
+    assert rep_of_first_bundle(out)["run"]["config_ref"] == "runs.jsonl#RUN1"
 
 
 def test_docx_structure_outline_nests_by_level(tmp_path):
@@ -142,6 +170,32 @@ def test_docx_structure_outline_nests_by_level(tmp_path):
     assert top["title"] == "Radar Overview" and top["level"] == 1
     assert [c["title"] for c in top["children"]] == ["Channels"]
     assert top["subtree_tokens"] >= top["self_tokens"]
+
+
+def test_dropped_page_furniture_is_named_in_the_report(tmp_path):
+    # A deliberate drop must be visible in the artifact (end-goal.md §1). The
+    # converter never walks header/footer parts, so before this the banner and the
+    # document that never had one produced the identical report: warnings: [].
+    bb = _mod("build_bundle")
+    src = tmp_path / "s"
+    out = tmp_path / "o"
+    src.mkdir()
+    doc = ('<w:document %s><w:body><w:p><w:r><w:t>Body prose.</w:t></w:r></w:p>'
+           "</w:body></w:document>" % W)
+    hdr = ('<w:hdr %s><w:p><w:r><w:t>Nimbus Confidential</w:t></w:r></w:p></w:hdr>' % W)
+    _zip(str(src / "banner.docx"),
+         {"word/document.xml": doc, "word/header1.xml": hdr})
+    assert bb.main(["--src", str(src), "--out", str(out), "--run-id", "RUN1"]) == 0
+    d = [os.path.join(str(out), n) for n in os.listdir(str(out))
+         if os.path.isdir(os.path.join(str(out), n))][0]
+    rep = json.load(open(os.path.join(d, "report.json"), encoding="utf-8"))
+    w = [x for x in rep["warnings"] if x["code"] == "dropped_headers_footers"]
+    assert len(w) == 1 and w[0]["parts"] == 1 and w[0]["chars"] > 0
+    # a policy drop is not a defect: it must not degrade an otherwise clean document,
+    # and the banner must not have leaked into the body either.
+    assert rep["status"] == "ok"
+    md = open(os.path.join(d, "document.md"), encoding="utf-8").read()
+    assert "Confidential" not in md
 
 
 def test_failed_conversion_records_failed_report_only(tmp_path):
@@ -388,3 +442,75 @@ def test_image_filenames_are_deterministic_across_force_rebuild(tmp_path):
     assert bb.main(["--src", str(src), "--out", str(out), "--run-id", "R", "--force"]) == 0
     files2 = sorted(os.listdir(os.path.join(d, "images")))
     assert files1 == files2 and len(files1) == 1             # content-addressed = stable
+
+
+def test_a_failed_rebuild_withdraws_the_bundle_the_last_run_published(tmp_path):
+    """The invariant is written down — *a failed document publishes `report.json`
+    only* — and the failure branches only honoured it on a FIRST build, where there
+    is nothing to leave behind.
+
+    On a rebuild they rewrote `report.json` to `status: failed` and returned, so the
+    previous run's `document.md`, `structure.json` and `images/` stayed on disk: a
+    bundle asserting `lossless: "true"` over the OLD source, under the OLD
+    `source_sha256`, beside a report saying the conversion failed. Everything
+    downstream keys off "does document.md exist", so enrichment then published a
+    fresh `knowledge.json` describing the stale body and `kb_lint` graded it clean.
+    """
+    bb = _mod("build_bundle")
+    src = tmp_path / "s"
+    out = tmp_path / "o"
+    src.mkdir()
+    _docx(str(src / "spec.docx"))
+    assert bb.main(["--src", str(src), "--out", str(out), "--run-id", "R1"]) == 0
+    d = os.path.join(str(out), _bundle_dirs(str(out))[0])
+    good = open(os.path.join(d, "document.md"), encoding="utf-8").read()
+    assert 'lossless: "true"' in good
+
+    # the source is replaced by something the reader rejects, and the doc rebuilt
+    (src / "spec.docx").write_bytes(b"not a zip at all")
+    assert bb.main(["--src", str(src), "--out", str(out), "--run-id", "R2",
+                    "--force"]) == 1
+
+    rep = json.load(open(os.path.join(d, "report.json"), encoding="utf-8"))
+    assert rep["status"] == "failed"
+    for name in ("document.md", "structure.json"):
+        assert not os.path.exists(os.path.join(d, name)), (
+            "%s from the last successful run is still published beside a failed "
+            "report" % name)
+    assert not os.path.isdir(os.path.join(d, "images"))
+    # withdrawn, not destroyed: an environmental failure must not cost the only
+    # good copy of a bundle
+    assert open(os.path.join(d, "document.md.stale"), encoding="utf-8").read() == good
+    assert os.path.isfile(os.path.join(d, "structure.json.stale"))
+    assert os.path.isdir(os.path.join(d, "images.stale"))
+
+    # a second failing rebuild is not an error either (the withdrawal is atomic)
+    assert bb.main(["--src", str(src), "--out", str(out), "--run-id", "R3",
+                    "--force"]) == 1
+    assert not os.path.exists(os.path.join(d, "document.md"))
+
+    # ...and once the document converts again the withdrawn copies are superseded
+    _docx(str(src / "spec.docx"))
+    assert bb.main(["--src", str(src), "--out", str(out), "--run-id", "R4",
+                    "--force"]) == 0
+    assert os.path.isfile(os.path.join(d, "document.md"))
+    assert not os.path.exists(os.path.join(d, "document.md.stale"))
+    assert not os.path.exists(os.path.join(d, "structure.json.stale"))
+    assert not os.path.isdir(os.path.join(d, "images.stale"))
+
+
+def test_an_empty_source_still_publishes_its_vacuous_bundle_on_a_rebuild(tmp_path):
+    # The other direction. `empty-source-file` is deliberately NOT a failure — it is
+    # a vacuous pass that legitimately publishes — so a withdrawal keyed on anything
+    # broader than the failure branches would delete a bundle that is doing its job.
+    bb = _mod("build_bundle")
+    src = tmp_path / "s"
+    out = tmp_path / "o"
+    src.mkdir()
+    (src / "empty.docx").write_bytes(b"")
+    assert bb.main(["--src", str(src), "--out", str(out), "--run-id", "R1"]) == 0
+    d = os.path.join(str(out), _bundle_dirs(str(out))[0])
+    assert bb.main(["--src", str(src), "--out", str(out), "--run-id", "R2",
+                    "--force"]) == 0
+    assert os.path.isfile(os.path.join(d, "document.md"))
+    assert not os.path.exists(os.path.join(d, "document.md.stale"))

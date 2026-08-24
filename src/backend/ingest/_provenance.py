@@ -17,6 +17,8 @@ summary: Pull title/author/version/dates out of OOXML core props or pdfinfo and 
 import re
 from collections import OrderedDict
 
+from ._yamlblock import render_front_matter
+
 __all__ = ["core_properties", "pdf_info_meta", "front_matter"]
 
 
@@ -93,30 +95,21 @@ def _is_junk_title(title):
     return low.endswith(_JUNK_TITLE_EXT)
 
 
-def _yaml_scalar(val):
-    # type: (object) -> str
-    """Double-quote a scalar, escaping so it stays a single valid YAML line.
-
-    Backslash and quote are escaped; control chars that would break the one-line
-    block (newline/carriage-return/tab) become their ``\\n``/``\\t`` escapes.
-    """
-    s = "%s" % (val,)
-    s = s.replace("\\", "\\\\").replace('"', '\\"')
-    s = s.replace("\r\n", "\\n").replace("\n", "\\n").replace("\r", "\\n").replace("\t", "\\t")
-    return '"%s"' % s
-
-
 def front_matter(meta):
     # type: (dict) -> str
     """Render an ordered mapping as a YAML front-matter block (``---`` fenced).
 
     Returns ``""`` for an empty mapping so callers can unconditionally prepend it.
     Iterates ``meta`` in its own order (pass an OrderedDict for a stable layout).
+
+    Delegates to the block codec so there is exactly ONE emitter: front matter that
+    stayed flat and string-only for years now shares its renderer with the nested
+    metadata block, and both are parseable by ``split_front_matter``.
+
+    Output is byte-identical to the original flat renderer for a flat ``str -> str``
+    mapping whose values carry no carriage return and no other control character —
+    which is everything the two converter lanes pass. Those characters now round-trip
+    faithfully (``\r`` stays ``\r``) instead of being folded into ``\n``, and native
+    ints/bools/None render as themselves rather than as quoted strings.
     """
-    if not meta:
-        return ""
-    lines = ["---"]
-    for k, v in meta.items():
-        lines.append("%s: %s" % (k, _yaml_scalar(v)))
-    lines.append("---")
-    return "\n".join(lines) + "\n"
+    return render_front_matter(meta)

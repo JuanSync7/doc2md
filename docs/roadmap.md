@@ -11,11 +11,19 @@ summary: The living plan toward docs/end-goal.md — sequenced milestones broken
 
 # Roadmap
 
-Serves `docs/end-goal.md`. The office lane is a **closed chapter** (recall ==
-1.0, 544/544): no new work there except regressions the eval catches, and any
-change to shared metric code (`tokenize`, `coverage`) re-runs the office
-corpus before merge. This document plans the rest: a properly implemented,
+Serves `docs/end-goal.md`. This document plans a properly implemented,
 maximally lossless PDF lane; doc2md as an SDK; keel-template compliance.
+
+**Correction (2026-08-21): the office lane is not a closed chapter.** It was
+recorded here as closed on `token_recall == 1.0, 544/544`, which remains true
+and unweakened — but list nesting, emphasis and code fences are not tokens, so
+that gate is structurally blind to them. A live run proved a nested numbered
+procedure comes out **renumbered**. `end-goal.md` §1 already binds us ("structure
+**is** content"); the gate never implemented it. The chapter reopens to *widen*
+the gate, never to relax it — see **[`quality-plan.md`](quality-plan.md)**, which
+owns output quality (body fidelity, run provenance, the outline, metadata) and
+its own A-grade rubric. Changes to shared metric code (`tokenize`, `coverage`)
+still re-run the office corpus before merge.
 
 ## How to execute (the loop)
 
@@ -274,6 +282,12 @@ host (which runs from a checkout and can't pip-install modern wheels anyway)
       `config/project.json`, whose `backend.python` must match pyproject);
       replace the placeholder LICENSE (release blocker — the TODO text is
       already baked into built metadata).
+- [ ] Ship `config/vocab.yaml` as package data (or an importable default).
+      `backend.kb.vocab_path()` resolves it four directories up from the
+      module, which is the repo root in a checkout and site-packages in a
+      wheel — so an installed `load_vocab()` fails unless `$DOC2MD_VOCAB`
+      is set. It fails loud, not silently, but the default is broken
+      off-tree and packaging is the right place to fix it.
 
 ## M6 — Keel compliance
 
@@ -326,4 +340,9 @@ documented". Backend-only instantiation is first-class in keel
 | Wheel python floor | `>=3.6` (true but useless — no 3.6 consumer can install a modern wheel) vs `>=3.9` | `>=3.9`; 3.6 remains CI-enforced for the checkout host |
 | Transposed figure content | caption-only (invisible to md consumers) vs inlined into `document.md` | inline, marked as VLM-derived, hallucination-gated (M4) |
 | Table spans | HTML islands vs flattened pipes + recorded loss | decide with M3 fixtures in hand |
-| `schema_version` in bundle files | parked earlier — revisit when the SDK (M5) freezes the contract for external consumers | park until M5 |
+| `schema_version` in bundle files | parked earlier — revisit when the SDK (M5) freezes the contract for external consumers | park until M5, but note the METADATA block now carries its own `schema_version` + `vocab_version` (they invalidate different work); a bundle-wide version is still open |
+| Metadata registry seeding | seed `tags`/`topics`/`audience` from a first corpus pass vs ship empty and promote at >= 3 documents | ship empty — seeding guesses the corpus shape at document zero, which is what the registry regime exists to avoid |
+| Entity spelling collisions | ERROR (two graph nodes for one thing) vs WARN (two real paths can differ only in punctuation) | ERROR, with `lint.similar_ok` as the recorded escape hatch — an un-silenceable false positive would fail every build with nothing a person could do about it |
+| Corpus-wide cardinality | re-grade `distinct/used` across the corpus vs measure the mirror question | measure the mirror: every graded facet is closed-governed, so membership is already the stricter test. `vocabulary_usage` reports terms no document draws on instead |
+| Where the knowledge payload lives | one `meta:` block in front matter vs a `knowledge.json` sidecar | **split (schema v2)** — measured ~5:1 knowledge:descriptors on a real document, so front matter charged every body-only consumer for a relation table it discards. Every other derived artefact in the bundle was already a sibling JSON file; this was the only one that was not |
+| Seam between descriptor and knowledge | curate a hand-picked field list vs derive it from the inventory | derive it: `records`/`groups` and not `authored_only`. Mechanical so it cannot drift into taste, with one carve-out — `accountable_roles` is a record list but an accountability statement, so it stays with the document |

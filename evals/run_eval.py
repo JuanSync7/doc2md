@@ -124,6 +124,47 @@ class Checker(object):
 
 # ----------------------------------------------------------- expectation kinds
 
+# Every expectation key any checker actually reads, PER KIND. A key outside its
+# kind's set is a TYPO — or a probe written for the wrong lane — that would
+# otherwise sit in expectations.json looking like a check and proving nothing: the
+# same vacuous pass the report's `n_source_tokens` exists to prevent. The sets are
+# per kind because `check_text` never opens a `report.json` and `check_bundle`
+# never builds an outline over the converted text: `has_toc` in a text expectation
+# and `outline_probe` in a bundle one are read by nobody, and a global set called
+# them both fine. Adding a probe means adding its key to the kinds whose checker
+# reads it, in the same change.
+_KEYS_ROUTE = frozenset(("kind", "requires"))            # read by main(), any kind
+_KEYS_BY_KIND = {
+    "bundle": _KEYS_ROUTE | frozenset((
+        "lane", "status",
+        "losslessness_gate", "losslessness_method", "token_recall_min",
+        "structure_fidelity_gate",
+        "coverage_gate", "toc_lines_min", "has_toc", "max_depth",
+        "savings_ratio_min", "content_links_min",
+        "images_gate", "images_referenced",
+        "warning_codes", "warning_codes_absent",
+        "md_contains", "md_not_contains", "md_min_count",
+        "outline_titles", "structure_links_contains",
+    )),
+    "text": _KEYS_ROUTE | frozenset(("lane", "md_contains", "outline_probe")),
+    # check_unsupported asks the ROUTER, never an artifact: it reads no probe at
+    # all, so any probe here would be a check nobody runs.
+    "unsupported": _KEYS_ROUTE,
+}
+
+
+def unknown_keys(exp, kind=None):
+    # type: (dict, str) -> list
+    """Expectation keys no checker reads FOR THIS KIND. `_`-prefixed keys are notes."""
+    if kind is None:
+        kind = exp.get("kind", "bundle")
+    known = _KEYS_BY_KIND.get(kind)
+    if known is None:
+        # An unknown kind has no checker either; main() reports the kind itself.
+        return []
+    return sorted(k for k in exp if not k.startswith("_") and k not in known)
+
+
 def check_bundle(rel, exp, bundles_dir):
     # type: (str, dict, str) -> list
     """Checks for an office/pdf BUNDLE expectation; returns failure strings."""
@@ -176,6 +217,14 @@ def check_bundle(rel, exp, bundles_dir):
         c.check(isinstance(got, int) and got >= exp["content_links_min"],
                 "content.links: got %r, want >= %d"
                 % (got, exp["content_links_min"]))
+    if "structure_fidelity_gate" in exp:
+        # The SECOND hard gate. Pinned separately from losslessness because they
+        # answer different questions and can disagree: a renumbered procedure is
+        # token-lossless and structurally wrong.
+        fid = rep.get("structure_fidelity", {})
+        c.eq(fid.get("gate"), exp["structure_fidelity_gate"], "structure_fidelity.gate")
+        if fid.get("deltas"):
+            c.check(False, "structure_fidelity.deltas: %r" % (fid["deltas"],))
     if "images_gate" in exp:
         c.eq(rep.get("images", {}).get("gate"), exp["images_gate"], "images.gate")
     if "images_referenced" in exp:
@@ -337,7 +386,8 @@ def main(argv=None):
     ap.add_argument("--text-out",
                     default=os.path.join(_REPO, "data", "eval_bundles_text"),
                     help="text-lane output dir (default data/eval_bundles_text)")
-    ap.add_argument("--expectations", default=EXPECTATIONS)
+    ap.add_argument("--expectations", default=EXPECTATIONS,
+                    help="expectations file (default evals/expectations.json)")
     ap.add_argument("--regen", action="store_true",
                     help="regenerate the corpus even if it exists")
     ap.add_argument("--skip-pdf", action="store_true",
@@ -347,7 +397,11 @@ def main(argv=None):
                          "expectations against existing outputs")
     args = ap.parse_args(argv)
 
-    failures = 0
+    # THE ONLY tally. There is no second `failures` counter: the exit code is
+    # computed at the bottom from these rows, so a FAIL row cannot be printed
+    # without gating. It was possible — the stray-expectation-key guard appended
+    # its FAIL and forgot to increment the counter, so a typo'd expectation key
+    # printed `1 fail` and exited 0, which is a gate that does not gate.
     results = []  # type: list  # (verdict, rel, detail)
 
     manifest_path = args.corpus.rstrip("/\\") + ".manifest.json"
@@ -374,7 +428,6 @@ def main(argv=None):
     if det:
         for d in det:
             results.append(("FAIL", "(determinism)", d))
-        failures += len(det)
     else:
         results.append(("PASS", "(determinism)",
                         "hand-built sources byte-identical on regeneration"))
@@ -388,13 +441,11 @@ def main(argv=None):
             "--run-id", RUN_ID])
         if rc != 0:
             results.append(("FAIL", "(office lane)", "exit code %d" % rc))
-            failures += 1
         rc = run_lane("text lane", [
             sys.executable, os.path.join(_REPO, "scripts", "text_convert.py"),
             "--src", args.corpus, "--out", args.text_out, "--force"])
         if rc != 0:
             results.append(("FAIL", "(text lane)", "exit code %d" % rc))
-            failures += 1
         if pdf_env and not args.skip_pdf:
             # exit code is NOT gated here: per-document expectations judge the
             # PDF lane (a truthfully-encoded failed doc would flip the rc).
@@ -422,6 +473,12 @@ def main(argv=None):
         if exp.get("requires") == "pdf-lane" and not pdf_ran:
             results.append(("SKIP", rel, "pdf lane did not run"))
             continue
+        stray = unknown_keys(exp, kind)
+        if stray:
+            results.append(("FAIL", rel,
+                            "expectation keys no %r checker reads (typo?): %s"
+                            % (kind, ", ".join(stray))))
+            continue
         if kind == "bundle":
             fails = check_bundle(rel, exp, args.bundles)
         elif kind == "text":
@@ -431,7 +488,6 @@ def main(argv=None):
         else:
             fails = ["unknown expectation kind %r" % kind]
         if fails:
-            failures += 1
             results.append(("FAIL", rel, "; ".join(fails)))
         else:
             results.append(("PASS", rel, "%d check(s)" % max(1, len(exp) - 1)))
@@ -445,7 +501,10 @@ def main(argv=None):
     n_fail = sum(1 for v, _, _ in results if v == "FAIL")
     print("-" * 100)
     print("eval: %d pass, %d fail, %d skip" % (n_pass, n_fail, n_skip))
-    return 0 if failures == 0 else 1
+    # The exit code IS the printed table: every FAIL row gates, and no row can
+    # gate that was not printed. CI reads only this number, so a table that says
+    # `1 fail` next to an exit 0 is worse than no eval at all.
+    return 0 if n_fail == 0 else 1
 
 
 if __name__ == "__main__":

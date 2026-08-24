@@ -60,6 +60,7 @@ sys.path.insert(0, _HERE)                        # import the sibling lane scrip
 
 import docling_convert as dc                     # noqa: E402  (converters + measurement)
 import build_bundle as bb                        # noqa: E402  (shared writer helpers)
+from backend.provenance import compact_run, decision, stamp_stage  # noqa: E402
 from backend.bundle import assemble_bundle       # noqa: E402  (pure assembler)
 from backend.ingest import (doc_id, tokenize,    # noqa: E402
                             image_markdown, inline_image_captions,
@@ -70,7 +71,13 @@ from backend.ingest import (doc_id, tokenize,    # noqa: E402
                             normalize_accept)
 from backend.validate import image_report, caption_report   # noqa: E402  (report policy)
 
-CONVERTER = "doc2md-docling/0.1.0"
+# This lane's name in `run.entrypoint`, in every `decisions[].stage` and in
+# every manifest row it appends — one string for one thing (see build_bundle).
+ENTRYPOINT = "build_pdf_bundle"
+
+# Derived, never a literal (see build_bundle._converter_id): two builds from
+# different code must never be able to claim the same converter stamp.
+CONVERTER = bb._converter_id("docling")
 _PLACEHOLDER = "<!-- image -->"
 
 _TOOLCHAIN_VERSIONS = {}  # memoized probes: one process, one answer
@@ -197,30 +204,43 @@ def _pdf_losslessness(src_stripped, md, furniture, image_text, cfg):
     return loss, lossy
 
 
-def _failure_report(row, lane, error, warnings):
-    # type: (dict, str, str, list) -> dict
-    """A report for a document that FAILED conversion — recorded, never silent."""
+def _failure_report(row, lane, error, warnings, run_id="", run=None, decisions=None):
+    # type: (dict, str, str, list, str, dict, list) -> dict
+    """A report for a document that FAILED conversion — recorded, never silent.
+
+    Carries the run block for the same reason the office lane does: a failed
+    document publishes report.json and nothing else, so this is the only place the
+    run that produced the failure can be recorded."""
     rep = OrderedDict()
     rep["doc_id"] = row["id"]
     rep["lane"] = lane
     rep["source_format"] = row["ext"]
     rep["converter"] = CONVERTER
+    if run_id:
+        rep["generated_run"] = run_id
     rep["source_relpath"] = row["rel"]
     rep["status"] = "failed"
     rep["losslessness"] = {"method": "pdf-text-coverage", "gate": "best-effort",
                            "error": error}
     rep["warnings"] = list(warnings or [])
+    rep["decisions"] = stamp_stage(decisions, ENTRYPOINT)
+    if run:
+        bb.record_stage_run(rep, run, writer=True)
     return rep
 
 
 def build_one(row, conv, ocr_conv, ocr_mode, out_root, run_id, cfg,
-              token_count=None, token_model=None, captions_enabled=False):
-    # type: (dict, object, object, str, str, str, object, object, str, bool) -> dict
+              token_count=None, token_model=None, captions_enabled=False, run=None):
+    # type: (dict, object, object, str, str, str, object, object, str, bool, dict) -> dict
     """Convert + measure + assemble + write one docling-lane document's bundle."""
     lane = "pdf" if row["ext"] == "pdf" else "html"
     doc_dir = os.path.join(out_root, row["id"])
     # Provenance first: the stamp rides every report, including failure reports.
     warnings = [_toolchain_warning(lane)]
+    decisions = [decision("lane_selected", lane, "routed by source extension",
+                          {"ext": row.get("ext", "")}),
+                 decision("tokenizer_selected", token_model or "char-estimate/4",
+                          "resolved from --tokenizer / config.settings")]
 
     use_ocr = False
     if row["ext"] == "pdf":
@@ -228,6 +248,11 @@ def build_one(row, conv, ocr_conv, ocr_mode, out_root, run_id, cfg,
             use_ocr = True
         elif ocr_mode == "auto":
             use_ocr = not dc.pdf_has_text_layer(row["src"])
+        decisions.append(decision(
+            "ocr_routed", "ocr" if use_ocr else "text-layer",
+            "forced by --ocr on" if ocr_mode == "on" else
+            ("no usable text layer" if use_ocr else "a usable text layer was found"),
+            {"ocr_mode": ocr_mode}))
 
     t0 = time.time()
     try:
@@ -240,8 +265,13 @@ def build_one(row, conv, ocr_conv, ocr_mode, out_root, run_id, cfg,
     except Exception as e:
         os.makedirs(doc_dir, exist_ok=True)
         err = "%s: %s" % (type(e).__name__, e)
+        # Same rule as the office lane: a conversion this run could not do must not
+        # leave the LAST one's bundle standing as if it were current, or the metadata
+        # pass republishes and `kb_lint` certifies a document that failed.
+        bb._announce_withdrawn(row, bb._withdraw_published(doc_dir))
         bb._write_json(os.path.join(doc_dir, "report.json"),
-                       _failure_report(row, lane, err, warnings))
+                       _failure_report(row, lane, err, warnings, run_id, run,
+                                       decisions))
         return {"doc_id": row["id"], "source_relpath": row["rel"], "lane": lane,
                 "status": "failed", "markdown_sha256": "", "error": err}
     t_convert = int((time.time() - t0) * 1000)
@@ -332,6 +362,7 @@ def build_one(row, conv, ocr_conv, ocr_mode, out_root, run_id, cfg,
 
     os.makedirs(doc_dir, exist_ok=True)
     if rep["status"] == "failed":
+        bb._announce_withdrawn(row, bb._withdraw_published(doc_dir))
         bb._write_json(os.path.join(doc_dir, "report.json"), rep)
         return {"doc_id": row["id"], "source_relpath": row["rel"], "lane": lane,
                 "status": "failed", "markdown_sha256": rep["markdown_sha256"],
@@ -352,7 +383,8 @@ def build_one(row, conv, ocr_conv, ocr_mode, out_root, run_id, cfg,
              "detail": "%d stale image file(s) removed on rebuild" % removed})
     im = rep["images"]
     rep["images"] = image_report(im["referenced"], im["extracted"],
-                                 im["unique_files"], im["missing"], 0, verified)
+                                 im["unique_files"], im["missing"], 0, verified,
+                                 removed)
     if rep["images"]["gate"] != "pass" and rep["status"] == "ok":
         rep["status"] = "degraded"
 
@@ -363,20 +395,40 @@ def build_one(row, conv, ocr_conv, ocr_mode, out_root, run_id, cfg,
              "detail": "%d referenced image(s) fall outside the heading outline and "
                        "cannot be captioned" % (rep["images"]["referenced"] - attached)})
 
-    bb._carry_captions(doc_dir, bundle["structure"])
+    carried = bb._carry_captions(doc_dir, bundle["structure"])
     captioned = bb._count_captioned(bundle["structure"])
+    prior = bb._prior_captions(doc_dir)
     rep["captions"] = caption_report(captions_enabled, im["unique_files"], captioned,
-                                     0, 0, im["unique_files"] - captioned)
+                                     0, 0, im["unique_files"] - captioned,
+                                     prior.get("model", ""), prior.get("prompt_sha", ""))
+    if carried:
+        decisions.append(decision("captions_carried", carried,
+                                  "unchanged images kept their prior caption",
+                                  {"images": carried}))
+    # The report structurally coerces any non-office gate off "pass"; record that as
+    # a CHOICE so the lane asymmetry is visible in the artifact, not only in the docs.
+    decisions.append(decision("gate_coerced", rep["losslessness"].get("gate"),
+                              "no ground-truth semantic tree exists for this lane, "
+                              "so a pass is not claimable",
+                              {"method": rep["losslessness"].get("method", "")}))
+    rep["decisions"] = stamp_stage(decisions, ENTRYPOINT)
+    if run:
+        bb.record_stage_run(rep, run, writer=True)
 
     bb._write_json(os.path.join(doc_dir, "report.json"), rep)
     bb._write_atomic(os.path.join(doc_dir, "document.md"), bundle["document_md"])
     bb._write_json(os.path.join(doc_dir, "structure.json"), bundle["structure"])
+    # Current again, so anything a previous failure withdrew is superseded rather
+    # than salvage — and a `document.md.stale` next to a fresh `document.md` invites
+    # somebody to read the wrong one.
+    bb._clear_withdrawn(doc_dir)
     return {"doc_id": row["id"], "source_relpath": row["rel"], "lane": lane,
             "status": rep["status"], "markdown_sha256": rep["markdown_sha256"],
             "error": ""}
 
 
 def main(argv=None):
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
     ap = argparse.ArgumentParser(
         description="Emit the doc2md output bundle (document.md + structure.json + "
                     "report.json + images/) for each PDF/HTML document. Python 3.12 "
@@ -422,7 +474,7 @@ def main(argv=None):
         rows = [r for r in rows if r["id"] in want or os.path.basename(r["rel"]) in want]
 
     os.makedirs(args.out, exist_ok=True)
-    done = set() if args.force else bb._done(args.out)
+    done = {} if args.force else bb._done(args.out)
     todo_all = [r for r in rows if r["id"] not in done]
     todo = todo_all[:args.limit] if args.limit else todo_all
     capped = len(todo_all) - len(todo)
@@ -432,6 +484,27 @@ def main(argv=None):
         msg += "  (--limit deferred %d more)" % capped     # never a silent cap
     print(msg + "  -> %s" % args.out, file=sys.stderr)
     if not todo:
+        # Nothing to convert, but a run that did nothing still happened: log the
+        # skips and the run row, or the number of runs is unrecoverable from disk.
+        run = bb._run_context(ENTRYPOINT, args, raw_argv, run_id)
+        rows_written = []
+        with open(os.path.join(args.out, bb.MANIFEST), "a", encoding="utf-8") as mf:
+            for r in rows:
+                lane_r = "pdf" if r["ext"] == "pdf" else "html"
+                m = {"doc_id": r["id"], "source_relpath": r["rel"], "lane": lane_r,
+                     "status": done.get(r["id"], ""), "markdown_sha256": "",
+                     "source_sha256": "", "error": "", "run_id": run_id,
+                     "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                     "action": "skipped" if r["id"] in done else "deferred",
+                     "stage": ENTRYPOINT}
+                mf.write(json.dumps(m) + "\n")
+                rows_written.append(m)
+        bb._append_run(args.out, run, rows_written,
+                       {"ok": 0, "degraded": 0, "failed": 0,
+                        "skipped": sum(1 for m in rows_written
+                                       if m["action"] == "skipped"),
+                        "deferred": sum(1 for m in rows_written
+                                        if m["action"] == "deferred")})
         return 0
 
     conv = dc._make_caption_converter(args.threads)   # image export ON, captioning OFF
@@ -443,27 +516,44 @@ def main(argv=None):
             state["ocr"] = dc._make_converter(True, args.threads)
         return state["ocr"]
 
+    started = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    run = bb._run_context(ENTRYPOINT, args, raw_argv, run_id,
+                          {"docling": _toolchain_warning("pdf").get("detail", "")})
+    run_doc = compact_run(run, "%s#%s" % (bb.RUNS, run_id))
+
     ok = degraded = failed = 0
     t0 = time.time()
     manifest_path = os.path.join(args.out, bb.MANIFEST)
+    rows_written = []
+    todo_ids = set(r["id"] for r in todo)
     with open(manifest_path, "a", encoding="utf-8") as mf:
+        def log(m, action):
+            m["run_id"] = run_id
+            m["ts"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            m["action"] = action
+            m["stage"] = ENTRYPOINT
+            mf.write(json.dumps(m) + "\n")
+            mf.flush()
+            rows_written.append(m)
+
         for i, r in enumerate(todo):
             td = time.time()
             try:
                 m = build_one(r, conv, ocr_conv, args.ocr, args.out, run_id, cfg,
-                              token_count, token_model, captions_enabled)
+                              token_count, token_model, captions_enabled, run_doc)
             except Exception as e:                     # never lose the whole run
                 err = "%s: %s" % (type(e).__name__, e)
                 lane_r = "pdf" if r["ext"] == "pdf" else "html"
                 os.makedirs(os.path.join(args.out, r["id"]), exist_ok=True)
                 bb._write_json(os.path.join(args.out, r["id"], "report.json"),
                                _failure_report(r, lane_r, err,
-                                               [_toolchain_warning(lane_r)]))
+                                               [_toolchain_warning(lane_r)],
+                                               run_id, run_doc))
                 m = {"doc_id": r["id"], "source_relpath": r["rel"],
                      "lane": lane_r,
                      "status": "failed", "markdown_sha256": "", "error": err}
-            mf.write(json.dumps(m) + "\n")
-            mf.flush()
+            m.setdefault("source_sha256", bb.sha256_file(r["src"]))
+            log(m, "forced" if args.force else "built")
             print("  [%d/%d] %s %s (%.1fs)" % (i + 1, len(todo), m["status"],
                                                r["rel"], time.time() - td),
                   file=sys.stderr)
@@ -475,6 +565,21 @@ def main(argv=None):
             else:
                 failed += 1
                 print("  FAIL %s %s" % (r["rel"], m["error"]), file=sys.stderr)
+        for r in rows:
+            if r["id"] in todo_ids:
+                continue
+            action = "skipped" if r["id"] in done else "deferred"
+            lane_r = "pdf" if r["ext"] == "pdf" else "html"
+            log({"doc_id": r["id"], "source_relpath": r["rel"], "lane": lane_r,
+                 "status": done.get(r["id"], ""), "markdown_sha256": "",
+                 "source_sha256": "", "error": ""}, action)
+
+    run["started_at"] = started
+    run["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    bb._append_run(args.out, run, rows_written,
+                   {"ok": ok, "degraded": degraded, "failed": failed,
+                    "skipped": sum(1 for m in rows_written if m["action"] == "skipped"),
+                    "deferred": sum(1 for m in rows_written if m["action"] == "deferred")})
     print("bundles: ok=%d degraded=%d failed=%d in %.1fs -> %s"
           % (ok, degraded, failed, time.time() - t0, args.out), file=sys.stderr)
     return 0 if failed == 0 else 1

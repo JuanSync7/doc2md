@@ -77,11 +77,37 @@ def test_structure_summary_depth_and_largest():
     b = _office()
     summ = b["report"]["structure"]
     top = b["structure"]["outline"]
-    assert summ["max_depth"] == 2                # H1 + H2
+    assert summ["max_depth"] == 2                # the H2 nests under the H1: 2 deep
     # largest_section_tokens is the biggest subtree in the whole outline (here the H1)
     assert summ["largest_section_tokens"] == max(n["subtree_tokens"] for n in top)
     assert summ["largest_section_tokens"] > 0
     assert summ["has_toc"] is False
+
+
+def test_max_depth_is_tree_depth_not_the_deepest_heading_level():
+    # quality-plan C4. A flat extractor emits siblings whose LEVELS go to 4 and whose
+    # TREE is one deep. max(level) would report 4 and hide the missing hierarchy.
+    body = ("#### Alpha\nintro\n"
+            "#### Beta\nscope\n"
+            "#### Gamma\ndetail\n")
+    b = _office(body_md=body, source_text=body)
+    outline = b["structure"]["outline"]
+    assert len(outline) == 3 and all(n["children"] == [] for n in outline)
+    assert max(n["level"] for n in outline) == 4          # the levels say "deep"
+    assert b["report"]["structure"]["max_depth"] == 1     # the tree says "flat"
+
+
+def test_largest_leaf_tokens_excludes_the_root():
+    # The single-H1 case the plan names: largest_section_tokens is the whole document
+    # (the root's subtree), so on its own it can never answer "is any retrievable unit
+    # over budget?". largest_leaf_tokens is the number that can.
+    body = "# Only Root\n" + ("root prose " * 40) + "\n## Child\n" + ("kid " * 5) + "\n"
+    b = _office(body_md=body, source_text=body)
+    summ = b["report"]["structure"]
+    root = b["structure"]["outline"][0]
+    assert summ["largest_section_tokens"] == root["subtree_tokens"]
+    assert summ["largest_leaf_tokens"] == root["children"][0]["subtree_tokens"]
+    assert summ["largest_leaf_tokens"] < summ["largest_section_tokens"]
 
 
 def test_structure_summary_carries_a_passing_coverage_gate():
