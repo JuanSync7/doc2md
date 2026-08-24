@@ -143,7 +143,10 @@ def test_a_heading_demoted_to_prose_is_a_failure():
     verdict = structure_fidelity_report(md_structure("Bring-up\n\nBody text.\n"),
                                         docx_source_structure(parts))
     assert verdict["gate"] == "fail"
-    assert [d["fact"] for d in verdict["deltas"]] == ["headings"]
+    # BOTH heading facts move, and they are meant to: the histogram loses its `1`
+    # and the ordered path loses the entry that carried the title's words. A demoted
+    # heading that moved only one of them would mean the two had drifted apart.
+    assert [d["fact"] for d in verdict["deltas"]] == ["headings", "heading_path"]
 
 
 # --------------------------------------------------- what it must NOT claim
@@ -235,10 +238,21 @@ def test_a_real_docx_on_disk_agrees_end_to_end(tmp_path):
                      if n.endswith(".xml") or n.endswith(".rels"))
     verdict = _verdict(parts)
     assert verdict["gate"] == "pass", verdict["deltas"]
-    # 13, not 11: `list_item_words` landed when a transposition attack showed
-    # rows-and-columns could not see placement, and `ordered_numbers` when a
-    # renumbered-but-equally-counted procedure showed neither could see a restart.
-    assert verdict["compared"] == 13
+    # `compared` counts EVIDENCE, not the fact schema. This document has headings
+    # (both the histogram and the ordered path), lists (both kinds, with numbers and
+    # item text), one strong run, one link and a table: ten facts that observed
+    # something. The ones it does not exhibit — em, strike, code spans, code blocks —
+    # were 0 == 0, and counting them made the block claim thirteen checks where four
+    # of them could not have failed.
+    #
+    # It was 13 while `compared` counted names, then 9 while the ground truth still
+    # had no opinion on `heading_path`. It is 10 now that the ground truth supplies
+    # the ordered heading fact, which is the rise the previous revision predicted.
+    assert verdict["compared"] == 10
+    # ...and there is nothing left for it to disclaim: every fact in the schema is
+    # either evidenced on both sides or symmetrically absent, so the report carries
+    # no `unmeasured` list at all.
+    assert "unmeasured" not in verdict
 
 
 # ------------------------------------- corruption that has no shape, only content
@@ -455,7 +469,9 @@ def test_a_custom_heading_style_is_a_heading_on_both_sides():
     old, new = _blind(DERIVED_HEADINGS, blob)
     assert old["recall"] == 1.0 and old["valid"] is True
     assert new["gate"] == "fail"
-    assert [d["fact"] for d in new["deltas"]] == ["headings"]
+    # Flattening two sections into one blob costs both heading facts: the histogram
+    # empties, and the ordered path loses the two entries that named the sections.
+    assert [d["fact"] for d in new["deltas"]] == ["headings", "heading_path"]
 
 
 def test_a_reordered_procedure_is_a_failure():
@@ -475,3 +491,348 @@ def test_a_reordered_procedure_is_a_failure():
                                         docx_source_structure(parts))
     assert verdict["gate"] == "fail"
     assert [d["fact"] for d in verdict["deltas"]] == ["list_item_words"]
+
+
+# ---------------------------------- emphasis that stops at the end of its block
+#
+# The span counter used to coalesce over the whole document as one flat run stream,
+# with no notion of the block a run lives in. Both halves of the gate broke: it
+# failed a byte-perfect conversion of an ordinary bold table header, and — the
+# blocker — it PASSED a conversion that had dropped the bold on every block but the
+# first, because the deflated source count matched the damaged markdown exactly.
+
+BOLD_BLOCKS = _parts(
+    _p("Warning", rpr="<w:rPr><w:b/></w:rPr>")
+    + _p("Caution", rpr="<w:rPr><w:b/></w:rPr>")
+    + _p("Danger", rpr="<w:rPr><w:b/></w:rPr>"), numbering=False)
+
+
+def test_three_bold_paragraphs_convert_faithfully():
+    assert docx_source_structure(BOLD_BLOCKS)["strong"] == 3
+    assert _verdict(BOLD_BLOCKS)["gate"] == "pass"
+
+
+def test_emphasis_dropped_on_every_block_but_the_first_is_a_failure():
+    old, new = _blind(BOLD_BLOCKS, "**Warning**\n\nCaution\n\nDanger\n")
+    assert old["recall"] == 1.0 and old["valid"] is True, "the token gate is blind"
+    assert new["gate"] == "fail"
+    assert [d["fact"] for d in new["deltas"]] == ["strong"]
+    assert new["deltas"][0]["source"] == 3 and new["deltas"][0]["markdown"] == 1
+
+
+BOLD_HEADER = _parts(
+    '<w:tbl><w:tr><w:tc>%s</w:tc><w:tc>%s</w:tc></w:tr>'
+    '<w:tr><w:tc>%s</w:tc><w:tc>%s</w:tc></w:tr></w:tbl>'
+    % (_p("Signal", rpr="<w:rPr><w:b/></w:rPr>"),
+       _p("Width", rpr="<w:rPr><w:b/></w:rPr>"), _p("clk"), _p("1")),
+    numbering=False)
+
+
+def test_a_bold_table_header_is_not_a_gate_failure():
+    # Close to universal in engineering documentation, and it used to hard-fail.
+    assert _verdict(BOLD_HEADER)["gate"] == "pass", _verdict(BOLD_HEADER)["deltas"]
+
+
+def test_a_header_cell_that_lost_its_bold_is_a_failure():
+    old, new = _blind(BOLD_HEADER,
+                      "| **Signal** | Width |\n| --- | --- |\n| clk | 1 |\n")
+    assert old["recall"] == 1.0 and old["valid"] is True
+    assert new["gate"] == "fail"
+    assert [d["fact"] for d in new["deltas"]] == ["strong"]
+
+
+# ------------------------------- a cell's own paragraph boundary is real content
+
+WELDABLE_CELL = _parts(
+    '<w:tbl><w:tr><w:tc>%s</w:tc><w:tc>%s</w:tc></w:tr>'
+    '<w:tr><w:tc>%s</w:tc><w:tc>%s%s</w:tc></w:tr></w:tbl>'
+    % (_p("Tier"), _p("Owner"), _p("payments"), _p("Primary"), _p("Rota")),
+    numbering=False)
+
+
+def test_a_cell_whose_paragraphs_were_welded_into_one_word_is_a_failure():
+    # The ground truth used to erase the boundary on ITS side too ("PrimaryRota"),
+    # so a converter that destroyed the cell's block structure compared equal and
+    # the `cells` fact — which exists to catch cell-content corruption — was blind
+    # to it.
+    cells = docx_source_structure(WELDABLE_CELL)["tables"][0]["cells"]
+    assert cells[1][1] == ("primary", "rota"), "no fabricated token on the source side"
+    _old, new = _blind(WELDABLE_CELL,
+                       "| Tier | Owner |\n| --- | --- |\n| payments | PrimaryRota |\n")
+    assert new["gate"] == "fail"
+    assert [d["fact"] for d in new["deltas"]] == ["tables"]
+
+
+# ------------------------------------------ fences, diagrams and figures agree
+
+def test_a_blank_line_inside_a_listing_is_not_a_second_listing():
+    code = _styles('<w:style w:type="paragraph" w:styleId="SourceCode">'
+                   '<w:name w:val="Source Code"/></w:style>')
+    parts = _parts(_p("$ make verify", style="SourceCode") + "<w:p/>"
+                   + _p("ok", style="SourceCode"), styles=code, numbering=False)
+    assert ooxml_markdown("docx", parts) == "```\n$ make verify\nok\n```\n"
+    assert _verdict(parts)["gate"] == "pass", _verdict(parts)["deltas"]
+
+
+def test_a_listing_really_split_in_two_is_still_seen():
+    code = _styles('<w:style w:type="paragraph" w:styleId="SourceCode">'
+                   '<w:name w:val="Source Code"/></w:style>')
+    parts = _parts(_p("$ make verify", style="SourceCode") + _p("Then check the log.")
+                   + _p("ok", style="SourceCode"), styles=code, numbering=False)
+    assert docx_source_structure(parts)["code_blocks"] == 2
+    assert _verdict(parts)["gate"] == "pass"
+    old, new = _blind(parts, "```\n$ make verify\nThen check the log.\nok\n```\n")
+    assert old["recall"] == 1.0
+    assert new["gate"] == "fail"
+    assert [d["fact"] for d in new["deltas"]] == ["code_blocks"]
+
+
+def test_a_smartart_diagram_agrees_end_to_end():
+    diagram = ('<dgm:dataModel xmlns:dgm="http://schemas.openxmlformats.org/'
+               'drawingml/2006/diagram" xmlns:a="http://schemas.openxmlformats.org/'
+               'drawingml/2006/main"><dgm:ptLst>%s</dgm:ptLst></dgm:dataModel>'
+               % "".join('<dgm:pt><dgm:t><a:p><a:r><a:t>%s</a:t></a:r></a:p>'
+                         '</dgm:t></dgm:pt>' % t
+                         for t in ("Ingest", "Validate", "Publish")))
+    parts = _parts(_p("The pipeline has three stages."), numbering=False)
+    parts["word/diagrams/data1.xml"] = diagram
+    assert "- Ingest" in ooxml_markdown("docx", parts)
+    assert _verdict(parts)["gate"] == "pass", _verdict(parts)["deltas"]
+    # ...and a converter that lost the diagram's points is still caught.
+    old, new = _blind(parts, "The pipeline has three stages.\n\n## Diagrams\n\n"
+                             "Ingest Validate Publish\n")
+    assert old["recall"] == 1.0
+    assert new["gate"] == "fail"
+
+
+def test_an_embedded_svg_figure_section_agrees_end_to_end():
+    parts = _parts(_p("Body."), numbering=False)
+    parts["word/media/fig1.svg"] = ('<svg xmlns="http://www.w3.org/2000/svg">'
+                                    '<text>Clock domain</text></svg>')
+    assert "## Figures" in ooxml_markdown("docx", parts)
+    assert _verdict(parts)["gate"] == "pass", _verdict(parts)["deltas"]
+
+
+def test_a_nested_table_agrees_on_the_number_of_tables():
+    inner = ('<w:tbl><w:tr><w:tc>%s</w:tc><w:tc>%s</w:tc></w:tr>'
+             '<w:tr><w:tc>%s</w:tc><w:tc>%s</w:tc></w:tr></w:tbl>'
+             % (_p("k"), _p("v"), _p("x"), _p("y")))
+    parts = _parts('<w:tbl><w:tr><w:tc>%s</w:tc><w:tc>%s</w:tc></w:tr>'
+                   '<w:tr><w:tc>%s</w:tc><w:tc>%s</w:tc></w:tr></w:tbl>'
+                   % (_p("Name"), _p("Detail"), _p("thing"), inner),
+                   numbering=False)
+    src = docx_source_structure(parts)
+    md = md_structure(ooxml_markdown("docx", parts))
+    assert len(src["tables"]) == len(md["tables"]) == 1
+
+
+# ------------------------------------- emphasis carried by a STYLE, on both sides
+#
+# The ground truth reads emphasis out of the style cascade, the way Word resolves
+# it. For one commit it was the only side that did: the converter read DIRECT run
+# formatting only, so it deleted emphasis arriving through w:rStyle or a paragraph
+# style, and the two implementations disagreed — which was the gate working, not a
+# gate to be silenced. `_ooxml_md._run_marks` has since learned the same cascade,
+# INDEPENDENTLY (its own reader over w:style/w:rPr, its own basedOn resolution), so
+# the disagreement is closed from the converter's end. If this ever goes red again,
+# fix whichever side stopped reading the document — never restore agreement by
+# making a side blind.
+
+STYLE_EMPHASIS = _parts(
+    _p("Save", rpr='<w:rPr><w:rStyle w:val="Strong"/></w:rPr>')
+    + _p("Quoted line.", style="Quote"),
+    styles=_styles('<w:style w:type="character" w:styleId="Strong">'
+                   '<w:name w:val="Strong"/><w:rPr><w:b/></w:rPr></w:style>'
+                   '<w:style w:type="paragraph" w:styleId="Quote">'
+                   '<w:name w:val="Quote"/><w:rPr><w:i/></w:rPr></w:style>'),
+    numbering=False)
+
+
+def test_style_borne_emphasis_is_measured_not_agreed_away():
+    src = docx_source_structure(STYLE_EMPHASIS)
+    assert (src["strong"], src["em"]) == (1, 1), "the document says so"
+    # A markdown that CARRIES the emphasis is what a faithful conversion looks like.
+    good = structure_fidelity_report(md_structure("**Save**\n\n*Quoted line.*\n"), src)
+    assert good["gate"] == "pass", good["deltas"]
+    # ...and it is now what the converter emits: `_ooxml_md._run_marks` resolves the
+    # same cascade (independently), so the two sides agree BECAUSE the document's
+    # emphasis survives the conversion, not because either side stopped looking.
+    verdict = _verdict(STYLE_EMPHASIS)
+    assert verdict["gate"] == "pass", verdict["deltas"]
+    assert ooxml_markdown("docx", STYLE_EMPHASIS) == "**Save**\n\n*Quoted line.*\n"
+
+
+# ---------------------------------------------------------------- ordered prose
+#
+# THE HOLE THIS SECTION CLOSES. Until `heading_path` existed, structure_fidelity had
+# no ordered, text-bearing fact for any block that was not a list item or a table
+# cell. `headings` is a level->count histogram and body paragraphs contribute
+# nothing at all, so exchanging two section titles — prose reattached to the wrong
+# chapter — passed BOTH hard gates with zero deltas, recall 1.0 and status "ok".
+# It is the same blind spot `ordered_numbers` closed for procedures and `cells`
+# closed for tables, applied to the last two constructs that never got it.
+#
+# INTERIM STATE, STATED PLAINLY. `md_structure` emits `heading_path` and the gate
+# compares it, but `backend.ingest.docx_source_structure` does not produce it yet,
+# so on a real docx the fact is reported in `unmeasured` rather than graded. The
+# tests below therefore split in two: the ones that pin the COMPARISON supply the
+# fact explicitly, and `test_the_ground_truth_does_not_supply_heading_path_yet`
+# pins the honest gap. When the ground-truth half lands, that last test is the one
+# to delete, and `test_a_real_docx_on_disk_agrees_end_to_end` re-baselines from
+# compared 9 / unmeasured ["heading_path", "thematic_breaks"] to compared 10 with
+# no `unmeasured` key. Do NOT close the gap by removing the fact.
+
+def _spec_markdown():
+    """The corpus spec document's real markdown, and its structural ground truth."""
+    parts = _corpus_spec_parts()
+    return ooxml_markdown("docx", parts), docx_source_structure(parts)
+
+
+def _corpus_spec_parts():
+    import tempfile
+    path = os.path.join(tempfile.mkdtemp(), "spec.docx")
+    _gen_corpus().build_spec_docx(path)
+    with zipfile.ZipFile(path) as zf:
+        return dict((n, zf.read(n).decode("utf-8", "replace")) for n in zf.namelist()
+                    if n.endswith(".xml") or n.endswith(".rels"))
+
+
+def test_exchanging_two_section_titles_is_a_failure():
+    md, source = _spec_markdown()
+    # The ground truth as it will read once it carries the fact. Taken from the
+    # FAITHFUL markdown, which is what the converter-blind side must agree with.
+    source = dict(source)
+    source["heading_path"] = md_structure(md)["heading_path"]
+    assert structure_fidelity_report(md_structure(md), source)["gate"] == "pass"
+
+    damaged = (md.replace("# 1 Introduction\n", "# @@\n")
+                 .replace("# 2 Clock architecture\n", "# 1 Introduction\n")
+                 .replace("# @@\n", "# 2 Clock architecture\n"))
+    assert damaged != md
+    # Everything the gate used to look at is untouched: same tokens, same heading
+    # histogram, same lists, same table.
+    assert (md_structure(damaged)["headings"] == md_structure(md)["headings"])
+    assert conversion_report(ooxml_source_text("docx", _corpus_spec_parts()),
+                             damaged)["recall"] == 1.0
+    verdict = structure_fidelity_report(md_structure(damaged), source)
+    assert verdict["gate"] == "fail"
+    assert [d["fact"] for d in verdict["deltas"]] == ["heading_path"]
+
+
+def test_a_heading_whose_text_was_swapped_with_body_prose_is_a_failure():
+    parts = _parts(_p("Register map", style="Heading1") + _p("Every offset is byte."))
+    source = docx_source_structure(parts)
+    faithful = ooxml_markdown("docx", parts)
+    # The ground truth derives `heading_path` from the XML itself. It used to be
+    # injected here from the markdown side, which made this test a check on the
+    # comparator alone; reading the real source side makes it a check on the gate.
+    assert structure_fidelity_report(md_structure(faithful), source)["gate"] == "pass"
+    swapped = "# Every offset is byte.\n\nRegister map\n"
+    verdict = structure_fidelity_report(md_structure(swapped), source)
+    assert verdict["gate"] == "fail"
+    assert [d["fact"] for d in verdict["deltas"]] == ["heading_path"]
+
+
+def test_the_ground_truth_supplies_the_ordered_heading_fact(tmp_path):
+    # This was the last half-open finding of the review. `md_structure` published
+    # `heading_path` before `docx_source_structure` had any opinion about it, so on
+    # a REAL docx the ordered fact reported UNMEASURED — and two exchanged section
+    # titles still passed both hard gates. An unmeasured fact is an honest skip, but
+    # a skip is not a check, so the hole stayed open until the source side could
+    # answer. It can now, and this test is the proof on a real document rather than
+    # a hand-built fixture.
+    path = str(tmp_path / "spec.docx")
+    _gen_corpus().build_spec_docx(path)
+    with zipfile.ZipFile(path) as zf:
+        parts = dict((n, zf.read(n).decode("utf-8", "replace")) for n in zf.namelist()
+                     if n.endswith(".xml") or n.endswith(".rels"))
+    source = docx_source_structure(parts)
+    faithful = ooxml_markdown("docx", parts)
+
+    # The two heading facts are written together and must never drift: one entry in
+    # the ordered path for every heading the histogram counted.
+    assert len(source["heading_path"]) == sum(source["headings"].values())
+    assert source["heading_path"] == md_structure(faithful)["heading_path"]
+
+    verdict = structure_fidelity_report(md_structure(faithful), source)
+    assert verdict["gate"] == "pass"
+    assert "unmeasured" not in verdict          # GRADED, not skipped
+
+    # THE DAMAGE the fact exists for: exchange the titles of two same-level
+    # sections. Every other fact is untouched — the level histogram is identical,
+    # and so is the token multiset, which is exactly why the FIRST gate reads a
+    # clean 1.0 over a document whose prose is now filed under the wrong chapter.
+    heads = [ln for ln in faithful.splitlines() if ln.startswith("#")]
+    first, second = heads[1], heads[2]
+    hashes_a, title_a = first.split(" ", 1)
+    hashes_b, title_b = second.split(" ", 1)
+    swapped = faithful.replace(first, "\x01", 1)
+    swapped = swapped.replace(second, "%s %s" % (hashes_b, title_a), 1)
+    swapped = swapped.replace("\x01", "%s %s" % (hashes_a, title_b), 1)
+    assert swapped != faithful
+
+    old, new = _blind(parts, swapped)
+    assert old["recall"] == 1.0 and old["valid"] is True
+    assert new["gate"] == "fail"
+    assert [d["fact"] for d in new["deltas"]] == ["heading_path"]
+
+
+def test_a_paragraph_that_became_a_horizontal_rule_is_a_failure():
+    # A body paragraph of `-----` is drawn as an <hr /> and its characters leave
+    # the document. It carries no ASCII token, so recall reads a vacuous 1.0 and
+    # said so for as long as no fact counted the break.
+    faithful = "# Notes\n\nConfigure the PLL.\n\n\\-----\n\nThen verify.\n"
+    source = md_structure(faithful)
+    assert structure_fidelity_report(md_structure(faithful), source)["gate"] == "pass"
+    damaged = faithful.replace("\\-----", "-----")
+    verdict = structure_fidelity_report(md_structure(damaged), source)
+    assert verdict["gate"] == "fail"
+    assert [d["fact"] for d in verdict["deltas"]] == ["thematic_breaks"]
+
+
+def test_a_multi_paragraph_table_cell_is_not_a_gate_failure():
+    # The false FAIL that made the second gate unusable on real Word documents: a
+    # GFM cell cannot hold a newline, so the converter joins the cell's paragraphs
+    # with `<br>` — and the reader tokenised the tag into a phantom word `br` that
+    # no source document can produce. Token recall was exactly 1.0 throughout, and
+    # build_bundle dropped the document anyway.
+    body = ('<w:tbl><w:tr><w:tc>%s</w:tc><w:tc>%s</w:tc></w:tr>'
+            '<w:tr><w:tc>%s</w:tc><w:tc>%s</w:tc></w:tr></w:tbl>'
+            % (_p("Signal"), _p("Notes"), _p("CLK"),
+               _p("Free-running.") + _p("Do not gate.")))
+    parts = _parts(body, numbering=False)
+    md = ooxml_markdown("docx", parts)
+    assert "Free-running.<br>Do not gate." in md
+    verdict = _verdict(parts)
+    assert verdict["gate"] == "pass", verdict["deltas"]
+    # ... and a cell whose second paragraph really was dropped still fails.
+    lost = md.replace("Free-running.<br>Do not gate.", "Free-running.")
+    assert _verdict(parts, markdown=lost)["gate"] == "fail"
+
+
+# ------------------------------------------------- what `compared` actually means
+
+def test_compared_counts_evidence_not_the_fact_schema():
+    # A one-paragraph memo exhibits no list, no table, no emphasis and no code.
+    # Counting the fact NAMES the source supplied reported thirteen checks on a
+    # document where twelve of them were 0 == 0 and could not have failed.
+    parts = _parts(_p("Just one sentence."), numbering=False)
+    verdict = _verdict(parts)
+    assert verdict["gate"] == "pass"
+    assert verdict["compared"] == 0
+    # A document that exhibits something counts it — here TWO facts, because one
+    # heading is evidence for the level histogram and for the ordered path alike.
+    with_heading = _parts(_p("Bring-up", style="Heading1") + _p("Body."),
+                          numbering=False)
+    assert _verdict(with_heading)["compared"] == 2
+
+
+def test_a_partial_ground_truth_names_what_it_did_not_measure():
+    source = {"headings": {1: 1}, "strong": 0}
+    verdict = structure_fidelity_report(md_structure("# Title\n"), source)
+    assert verdict["gate"] == "pass"
+    assert "tables" in verdict["unmeasured"]
+    assert "headings" not in verdict["unmeasured"]
+    # An entirely absent ground truth already says `unmeasured` in `method` and
+    # `gate`; listing all fifteen facts there would be noise, not information.
+    assert "unmeasured" not in structure_fidelity_report(md_structure("# T\n"), {})

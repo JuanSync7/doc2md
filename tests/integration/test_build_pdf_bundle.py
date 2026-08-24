@@ -121,3 +121,63 @@ def test_toolchain_warning_names_the_external_tools(bpb):
     # stable across calls (the probes memoize; equality alone doesn't prove the
     # cache, but a changing stamp within one process would be a bug either way)
     assert bpb._toolchain_warning("pdf") == w
+
+
+def test_every_failure_branch_withdraws_the_bundle_the_last_run_published():
+    """The PDF lane's copy of the office lane's stale-bundle defect.
+
+    `build_bundle` was fixed so a failed rebuild takes the PREVIOUS run's
+    `document.md` out of publication — otherwise enrichment republishes a
+    `knowledge.json` describing the stale body and `kb_lint` grades it clean, with
+    every gate green over a document whose conversion failed. `build_pdf_bundle`
+    had the same two branches and neither withdrew anything.
+
+    This is a source-level invariant rather than an end-to-end run because the PDF
+    lane needs docling (~2 GB, nightly ring only), and a check that silently skips
+    on every ring is not a check. It is written against the AST, so it sees a NEW
+    failure branch added later — which is the case that matters, and the one a
+    fixture pinned to today's two branches would miss.
+    """
+    import ast
+
+    src = open(os.path.join(REPO, "scripts", "build_pdf_bundle.py"),
+               encoding="utf-8").read()
+    tree = ast.parse(src)
+
+    def _calls(node):
+        return set(
+            n.func.attr for n in ast.walk(node)
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute))
+
+    def _returns_failed(node):
+        for n in ast.walk(node):
+            if not isinstance(n, ast.Return) or not isinstance(n.value, ast.Dict):
+                continue
+            for k, v in zip(n.value.keys, n.value.values):
+                if (isinstance(k, ast.Str) and k.s == "status"
+                        and isinstance(v, ast.Str) and v.s == "failed"):
+                    return True
+        return False
+
+    # Every enclosing statement that returns a failed row must also withdraw.
+    unguarded = []
+    for fn in [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)]:
+        for stmt in ast.walk(fn):
+            if not isinstance(stmt, (ast.If, ast.ExceptHandler)):
+                continue
+            if _returns_failed(stmt) and "_withdraw_published" not in _calls(stmt):
+                unguarded.append("%s:%d" % (fn.name, stmt.lineno))
+    assert not unguarded, (
+        "these PDF failure branches return status=failed without withdrawing the "
+        "previous run's artifacts, so a failed rebuild leaves a stale document.md "
+        "that enrichment will republish: %s" % ", ".join(unguarded))
+
+    # ...and a run that succeeds again supersedes what a failure withdrew, or the
+    # marker outlives the failure and someone reads document.md.stale by mistake.
+    assert "_clear_withdrawn" in src
+
+    # One mechanism, shared with the office lane — not a second implementation that
+    # can drift out of step with it.
+    bpb_mod = _mod("build_pdf_bundle")
+    for helper in ("_withdraw_published", "_clear_withdrawn", "_announce_withdrawn"):
+        assert hasattr(bpb_mod.bb, helper)

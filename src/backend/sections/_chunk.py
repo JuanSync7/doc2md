@@ -220,12 +220,87 @@ def _is_keyword_heading(s):
     return True
 
 
+# --- bounds on the NUMBERED heuristic (the third branch; P4.6/P4.7 bounded the other two)
+# "1.2 Reference documents" opens a section in un-marked-up native text, so a leading
+# section number is real evidence. This was the ONE of the three heuristic branches
+# left unbounded, and it failed in exactly the way the other two did: ANY short line
+# opening with a digit run, a space and a letter became a heading that REPARENTED
+# every section printed after it —
+#     "2024 replaced the manual failover script with the supervisor."   -> level 1
+#     "3.3 V is the nominal supply for the IO ring."                    -> level 2
+#     "16 bytes are reserved at the head of every descriptor."          -> level 1
+#     "5 minutes after boot the watchdog is armed."                     -> level 1
+# — each publishing an ``anchor``/``section_id`` for a fragment no heading in
+# document.md makes addressable, with the recall, structure-fidelity and coverage
+# gates all green because every word is still present and only the SHAPE is wrong.
+#
+# Bounded on the same grammatical principle as the ALL-CAPS and keyword branches, and
+# deliberately with the KEYWORD branch's constants: the thing being tested is the same
+# thing — "does what follows the designator read as a noun-phrase LABEL, or as the
+# rest of a sentence?" Four shape tests, no word list of its own, no model:
+#
+#   * no terminal ``.!?,;:`` — a label does not end in a full stop or a comma;
+#   * inside the keyword branch's length and word caps;
+#   * the first word after the number is CAPITALISED. Every convention for writing a
+#     title capitalises it (title case and sentence case alike), while a sentence that
+#     runs on past its opening numeral continues in lower case — "replaced", "bytes",
+#     "minutes", "uplinks", "tolerance";
+#   * no auxiliary/modal/pronoun (``_VERBAL_WORDS``) — that is what stops
+#     "3.3 V is the nominal supply", whose first word IS capitalised.
+#
+# ...and one bound the keyword branch does not need, because this branch's evidence is
+# the WEAKEST of the three: a bare digit run. "Chapter"/"Appendix" is a word that only
+# ever opens a section; a digit opens sentences all day ("10 GbE uplinks connect the
+# top-of-rack switches to the spine"). ``_KEY_MAX_WORDS`` = 10 budgets a keyword, a
+# designator and an eight-word TITLE; strip the keyword and the title budget is what
+# is left, so the numbered form gets those same eight words and no free ride for the
+# word it does not have to spend. Every numbered heading in this repo's own corpus
+# ("1.2 Reference documents", "2.1.1 Lock detection", "4 Verification plan") is three.
+#
+# HONEST ABOUT WHAT REMAINS, in both directions: a bare capitalised measurement with
+# no verb and no stop — "100 MHz", "8 GB DDR4" — still reads as a label by shape and
+# is still promoted, because nothing in its SHAPE separates it from the real heading
+# "5 V rail"; and a genuine heading written in lower case after its number ("4.2 reset
+# sequence") is now missed. The second error costs one node, the first costs the whole
+# tree below it, which is why the bound leans this way — the same trade P4.7 recorded
+# for the keyword branch. A numbered heading whose TITLE runs past eight words is also
+# missed now; when the converter marked such a heading up as ATX it is untouched,
+# because the ``#`` form is tested first and carries no bound at all.
+_NUM_MAX_TITLE_WORDS = _KEY_MAX_WORDS - 2     # the keyword branch's title budget
+
+
+def _is_numbered_heading(s, rest):
+    # type: (str, str) -> bool
+    """True when ``s`` — a line of the form ``1.2 <rest>`` — is a section LABEL."""
+    if len(s) > _KEY_MAX_CHARS or s[-1] in _CAPS_TERMINAL:
+        return False
+    if len(rest.split()) > _NUM_MAX_TITLE_WORDS:
+        return False
+    if not rest[0].isupper():             # a lower-case continuation is a clause
+        return False
+    for w in rest.split():
+        if _CAPS_WORD.sub("", w.upper()) in _VERBAL_WORDS:
+            return False
+    return True
+
+
 def is_heading(s):
     # type: (str) -> int
     """Heading level (1-6) or 0. Recognizes ATX (`#`), numbered, keyword, and ALL-CAPS forms."""
     s = s.strip()
-    if not s or len(s) > 120:
+    if not s:
         return 0
+    # THE ATX FORM IS TESTED BEFORE THE LENGTH BOUND, on purpose. A leading `##` is
+    # EXPLICIT markup — the document itself says "this is a heading" — and evidence
+    # that strong does not weaken at 121 characters. The bound below used to sit
+    # above this branch, and a 132-char `## Reset and Initialisation Sequence …`
+    # (routine in standards and databook text) was silently DELETED from
+    # structure.json while document.md still rendered it: its whole body was
+    # re-attributed to the preceding node, whose fingerprint, tables, images and
+    # links then described a section that was not its own, with every gate green.
+    # The length bound belongs only on the un-marked-up HEURISTICS below, which is
+    # where a run-on line is genuine evidence AGAINST a heading.
+    #
     # The LEADING RUN of hashes, never ``count("#")``: a Word heading reading
     # "Issue #42 metastability on the strap bus" is one `#` plus a body hash, and
     # counting them published it at level 2 — so the next real H1 became its
@@ -234,10 +309,12 @@ def is_heading(s):
     m = re.match(r'^(#{1,6})\s+\S', s)
     if m:
         return len(m.group(1))
+    if len(s) > 120:
+        return 0                          # bounds the three heuristic branches only
     if _is_keyword_heading(s):
         return 1
-    m = re.match(r'^(\d+(?:\.\d+){0,3})\.?\s+[A-Za-z]', s)
-    if m:
+    m = re.match(r'^(\d+(?:\.\d+){0,3})\.?\s+([A-Za-z].*)$', s)
+    if m and _is_numbered_heading(s, m.group(2)):
         return 1 + m.group(1).count(".")
     letters = [c for c in s if c.isalpha()]
     if (letters and sum(c.isupper() for c in letters) / len(letters) > 0.85

@@ -66,7 +66,46 @@ def test_every_row_is_answerable():
         if row.kind == "suite":
             assert row.target and not row.check, row
         else:
-            assert row.check and not row.target, row
+            assert row.check and not row.target and not row.selector, row
+
+
+def test_every_suite_row_names_the_specific_checks_that_demonstrate_it():
+    # A row graded by "did this pytest FILE exit 0?" cannot tell "the condition I
+    # assert is checked" from "that file is green for unrelated reasons": delete
+    # the demonstration and the row keeps saying pass; add an unrelated green test
+    # and it earns the row on the condition's behalf. Fifteen of the thirty-three
+    # rows were graded that way, which is why P6.3 stayed open.
+    for row in RUBRIC_ROWS:
+        if row.kind == "suite":
+            assert row.selector, "%s names no specific evidence" % row.rid
+
+
+def test_no_two_suite_rows_are_graded_by_the_same_evidence():
+    # E2, E3 and E4 all pointed at tests/integration/test_docs_parity.py, so ONE
+    # green file supplied three separate A-grades in a five-row dimension.
+    owner = {}
+    for row in RUBRIC_ROWS:
+        if row.kind != "suite":
+            continue
+        for name in row.selector:
+            key = (row.target, name)
+            assert key not in owner, ("%s and %s are both graded by %s::%s"
+                                      % (owner.get(key), row.rid, key[0], key[1]))
+            owner[key] = row.rid
+
+
+def test_a_suite_row_records_what_the_runner_OBSERVED_not_an_exit_code():
+    # A pytest target whose tests were all skipped exits 0. The runner reports what
+    # it saw and the rubric records it verbatim, because "unknown" and "passing"
+    # are the two things this module exists to keep apart.
+    seen = {r.rid: r for r in grade(
+        {"bundles": [], "suites": {"A2": (SKIP, "test_x was skipped in y")}})}
+    assert seen["A2"].status == SKIP
+    assert "skipped" in seen["A2"].evidence
+    seen = {r.rid: r for r in grade(
+        {"bundles": [], "suites": {"A2": (FAIL, "test_x no longer exists in y")}})}
+    assert seen["A2"].status == FAIL
+    assert "no longer exists" in seen["A2"].evidence
 
 
 def test_row_ids_are_unique():
@@ -212,12 +251,134 @@ def test_real_siblings_at_one_depth_are_not_a_flattened_hierarchy():
 def test_the_cross_check_cannot_pass_by_having_nothing_to_read():
     # The failure this row actually shipped with: a bundle carrying no anchor data
     # made the check vacuous and the row still said PASS. A body the rubric cannot
-    # read is now an unproven row, not a passing one.
+    # read is now an unproven row, not a passing one — and the bundle that
+    # published the unresolvable anchor is named, because "nothing was
+    # cross-checked anywhere" was the wrong denominator for a per-document fault.
     from backend.validate._rubric import _c3_anchors
     status, evidence = _c3_anchors(_one_bundle(
         [_node("Scope", "scope", "s1")], markdown=""))
     assert status == FAIL
-    assert "cross-checked" in evidence
+    assert "scope" in evidence
+
+
+def test_a_hash_inside_a_fenced_block_makes_no_anchor_addressable():
+    # `# reset the board` in a shell transcript is a comment, not a heading: no
+    # renderer emits a fragment for it, so it cannot vouch for a published anchor.
+    from backend.validate._rubric import _c3_anchors
+    status, evidence = _c3_anchors(_one_bundle(
+        [_node("Reset the board", "reset-the-board", "s1")],
+        markdown="```\n# Reset the board\nkestrelctl board reset --wait\n```\n"))
+    assert status == FAIL
+    assert "reset-the-board" in evidence
+
+
+# ------------------------------------------- dimension C grades PER DOCUMENT
+#
+# The failure every test below guards is one shape: a corpus-wide denominator lets
+# a healthy sibling stand in for the document that lost everything the row grades.
+# That is how all 32 rows once passed over a document with every heading deleted,
+# and each of these rows had its own version of it.
+
+_TABLE = "| pin | net |\n|---|---|\n| A1 | clk |\n"
+
+
+def _b(did, markdown, nodes, lane="office"):
+    """One bundle, complete enough for any dimension-C row to grade it."""
+    return {"doc_id": did, "markdown": markdown,
+            "structure": {"outline": nodes},
+            "report": {"lane": lane,
+                       "structure": {"max_depth": 1, "largest_leaf_tokens": 3}}}
+
+
+def _healthy(did="aaaaaaaa"):
+    node = _node("Overview", "overview", "s1")
+    node["tables"] = [{"table_id": "t1", "line": 3, "rows": 2, "cols": 2}]
+    return _b(did, "## Overview\n\n" + _TABLE, [node])
+
+
+def test_a_bundle_whose_body_renders_no_heading_is_not_covered_by_a_sibling():
+    # The unstyled .docx: `is_heading` reads its ALL-CAPS/numbered paragraphs as
+    # sections, so structure.json advertises `1-scope` and `2-register-map` over a
+    # body that renders not one `#`. Both anchors resolve nowhere. Alone, the
+    # bundle failed; beside a healthy sibling it used to be skipped outright and
+    # the row printed "every one of them resolves in the body of its own bundle".
+    from backend.validate._rubric import _c3_anchors
+    damaged = _b("bbbbbbbb",
+                 "**1 Scope**\n\nbody\n\n**2 Register map**\n\nbody\n",
+                 [_node("1 Scope", "1-scope", "s1"),
+                  _node("2 Register map", "2-register-map", "s2")])
+    status, evidence = _c3_anchors({"bundles": [_healthy(), damaged]})
+    assert status == FAIL, evidence
+    assert "bbbbbbbb" in evidence and "1-scope" in evidence
+
+
+def test_an_ordinary_two_document_corpus_still_passes_the_anchor_row():
+    # The other direction: a gate that starts rejecting valid input is worse than
+    # the bug it fixed.
+    from backend.validate._rubric import _c3_anchors
+    second = _b("bbbbbbbb", "## Scope\n\nbody\n\n### Limits\n\nbody\n",
+                [_node("Scope", "scope", "s1"), _node("Limits", "limits", "s2")])
+    status, evidence = _c3_anchors({"bundles": [_healthy(), second]})
+    assert status == PASS, evidence
+
+
+def test_a_bundle_with_no_outline_at_all_is_not_counted_as_inspected():
+    # C1's evidence said "3 bundle(s) inspected" over a corpus in which one bundle
+    # published no structure.json at all. Both numbers are reported now.
+    from backend.validate._rubric import _c1_hierarchy
+    status, evidence = _c1_hierarchy(
+        {"bundles": [_healthy(), _b("bbbbbbbb", "## Scope\n\nbody\n", [])]})
+    assert status == PASS, evidence
+    assert "1 of 2" in evidence
+
+
+def test_a_document_that_lost_its_whole_outline_is_not_covered_by_a_sibling():
+    from backend.validate._rubric import _c4_summary_numbers
+    status, evidence = _c4_summary_numbers(
+        {"bundles": [_healthy(), _b("bbbbbbbb", "## Scope\n\nbody\n", [])]})
+    assert status == FAIL, evidence
+    assert "bbbbbbbb" in evidence
+
+
+def test_a_bundle_with_no_body_to_build_a_tree_from_stays_exempt():
+    from backend.validate._rubric import _c4_summary_numbers
+    status, evidence = _c4_summary_numbers(
+        {"bundles": [_healthy(), _b("bbbbbbbb", "", [])]})
+    assert status == PASS, evidence
+
+
+def test_a_document_whose_tables_lost_their_nodes_is_not_covered_by_a_sibling():
+    # The bundle still RENDERS a GFM table; its outline addresses none of it. The
+    # row used to pass on the strength of a different bundle's table.
+    from backend.validate._rubric import _c5_table_nodes
+    damaged = _b("bbbbbbbb", "## Registers\n\n" + _TABLE,
+                 [_node("Registers", "registers", "s1")])
+    status, evidence = _c5_table_nodes({"bundles": [_healthy(), damaged]})
+    assert status == FAIL, evidence
+    assert "bbbbbbbb" in evidence
+
+
+def test_pipe_art_inside_a_fence_does_not_demand_a_table_node():
+    # `_tables_in` deliberately excludes pipe art inside a fenced block, so a
+    # rubric that demanded a node for a shell transcript's ASCII art would fail a
+    # bundle the producer handled correctly.
+    from backend.validate._rubric import _c5_table_nodes
+    transcript = _b("bbbbbbbb", "## Transcript\n\n```\n" + _TABLE + "```\n",
+                    [_node("Transcript", "transcript", "s1")])
+    status, evidence = _c5_table_nodes({"bundles": [_healthy(), transcript]})
+    assert status == PASS, evidence
+
+
+def test_a_lane_with_no_semantic_tree_is_unmeasured_rather_than_failed():
+    # The same asymmetry structure_fidelity already records: the office lane has a
+    # converter-blind ground truth and hard-fails; docling's flat outline may
+    # legitimately be unable to address a table, and unmeasured is not a pass.
+    from backend.validate._rubric import _c5_table_nodes
+    pdf = _b("bbbbbbbb", "## Registers\n\n" + _TABLE,
+             [_node("Registers", "registers", "s1")], lane="pdf")
+    status, evidence = _c5_table_nodes({"bundles": [_healthy(), pdf]})
+    assert status == PASS, evidence
+    assert "unmeasured" in evidence
 
 
 # ------------------------------------------------------------- the slug we share

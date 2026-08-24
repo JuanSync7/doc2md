@@ -58,10 +58,52 @@ def test_equals_form_is_redacted_too():
 
 
 def test_an_unnamed_path_flag_still_never_leaks():
-    # The default redaction set is what makes this safe by omission rather than by
-    # the caller remembering every flag.
+    # Safe by the SHAPE of the value, not by anyone remembering to list the flag.
+    # `--vocab` is on no list any more and the path is redacted all the same — to
+    # the `<path:id>` form, which still answers "was it the same file?".
     out = redact_argv(["--vocab", "/etc/doc2md/vocab.yaml", "--strict"])
-    assert out == ["--vocab", "<path>", "--strict"]
+    assert out == ["--vocab", "<path:%s>" % path_id("/etc/doc2md/vocab.yaml"),
+                   "--strict"]
+
+
+def test_an_ordinary_switch_is_never_rewritten_into_a_path_placeholder():
+    """A flag list expanded against argparse prefixes corrupted the record.
+
+    `--ex` is argparse's own unambiguous abbreviation of `enrich_metadata`'s
+    `--excerpt-chars`, and it is a 4-character prefix of the listed `--expectations`,
+    so the NUMBER was overwritten with `<path>` — a wrong `run.argv` in every
+    report.json, and `replay_run` then refusing to reconstruct a run it could have.
+    Nothing about the flag decides this; only the value can.
+    """
+    assert redact_argv(["--ex", "4000"]) == ["--ex", "4000"]
+    assert redact_argv(["--excerpt-chars", "4000"]) == ["--excerpt-chars", "4000"]
+    # a relative path discloses nothing, so it is not blanked either
+    assert redact_argv(["--vocab", "config/vocab.yaml"]) == ["--vocab",
+                                                             "config/vocab.yaml"]
+    # ...while the roots a replay must be handed back still get their placeholder
+    assert redact_argv(["--sr", "/vols/x"], {"--src": "<src>"}) == ["--sr", "<src>"]
+
+
+def test_a_file_url_is_an_absolute_path_wearing_a_scheme():
+    """`//` was waved through as "a scheme-relative URL, not a path". It is both.
+
+    `file:///vols/private/corpus/` reached `runs.jsonl` and every `report.json`
+    verbatim, and so did a bare `//vols/private/spec.docx`, which Linux resolves
+    exactly like `/vols/private/spec.docx`. A real network URL still survives whole:
+    `--source-base-url https://wiki/docs` decided every permalink in the bundle.
+    """
+    assert redact_argv(["--source-base-url", "file:///vols/private/corpus/"]) == [
+        "--source-base-url", "file://<path:%s>" % path_id("/vols/private/corpus/")]
+    assert redact_argv(["--only", "//vols/private/spec.docx"]) == [
+        "--only", "<path:%s>" % path_id("//vols/private/spec.docx")]
+    assert redact_argv(["--source-base-url", "https://wiki.example.com/docs/"]) == [
+        "--source-base-url", "https://wiki.example.com/docs/"]
+
+
+def test_a_home_directory_is_a_host_path_even_without_a_leading_slash():
+    # `~someone/models/tok` names the user, which this layer must never record.
+    assert safe_value("~/models/tok") == "<path:%s>" % path_id("~/models/tok")
+    assert "someone" not in safe_value("~someone/models/tok")
 
 
 def test_no_absolute_path_survives_redaction():
@@ -74,8 +116,12 @@ def test_no_absolute_path_survives_redaction():
     ["--ou=/vols/private/out"],                           # abbreviated, = form
     ["--only", "/vols/private/docs/spec.docx"],           # unlisted flag
     ["--tokenizer", "char:/vols/private/models/tok"],     # path inside a value
-    ["--expectations", "/vols/private/e.json"],           # listed flag
+    ["--expectations", "/vols/private/e.json"],           # once a listed flag
     ["--anything-at-all", "/vols/private/x"],             # a flag nobody listed
+    ["--source-base-url", "file:///vols/private/corpus/"],  # a path wearing a scheme
+    ["--only", "//vols/private/spec.docx"],               # `//abs` resolves as `/abs`
+    ["--vocab", "~/vols/private/vocab.yaml"],             # a home directory
+    ["--worker-cmd", "python3 w.py --out=/vols/private/x"],  # buried `k=/abs`
 ])
 def test_no_flag_spelling_can_carry_an_absolute_path_out(argv):
     # The one invariant: whatever the switch, whatever its abbreviation, the VALUE
@@ -92,6 +138,24 @@ def test_safe_value_hides_a_path_but_keeps_it_comparable():
     assert safe_value("/vols/two") != a
     assert safe_value(["/vols/one", 7, "cl100k_base"])[1:] == [7, "cl100k_base"]
     assert safe_value("data/bundles") == "data/bundles"   # relative discloses nothing
+
+
+def test_safe_value_walks_a_mapping_too():
+    # The public helper every artifact writer is told to use returned a dict
+    # untouched, so the one container a caller reaches for when it has several
+    # paths to publish was the one container that published them.
+    got = safe_value({"vocab": "/vols/private/vocab.yaml",
+                      "roots": ["/vols/private/a", "rel/b"], "n": 7})
+    assert "/vols/private" not in repr(got)
+    assert got["roots"][1] == "rel/b" and got["n"] == 7
+    assert list(got) == ["vocab", "roots", "n"]           # order is not disturbed
+
+
+def test_a_path_buried_in_an_equals_pair_inside_a_compound_value_is_redacted():
+    # One argv element can be a whole command line, and `--out=/abs/x` at word three
+    # leaks exactly as much as `/abs/x` at word one.
+    assert "/vols/private" not in safe_value("run --a=1 --out=/vols/private/x")
+    assert safe_value("run --a=1 --out=/vols/private/x").startswith("run --a=1 ")
 
 
 def test_decision_evidence_can_never_publish_a_host_path():

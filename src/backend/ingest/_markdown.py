@@ -42,7 +42,17 @@ _REF_LINK = re.compile(r"\[([^\]]*)\]\[[^\]]*\]")
 _AUTOLINK = re.compile(r"<((?:https?://|mailto:)[^>]+)>")
 _INLINE_CODE = re.compile(r"`+([^`]*)`+")
 _BOLD = re.compile(r"(\*\*|__)(.+?)\1", re.S)
-_ITALIC = re.compile(r"(?<![\w*_])([*_])(?=\S)(.+?)(?<=\S)\1(?![\w*_])", re.S)
+# EMPHASIS IS ASYMMETRIC IN COMMONMARK, and this stripper has to be asymmetric with
+# it. The intraword ban belongs to `_` ALONE: `DB_MAX_CONN_LIMIT` and
+# `snake_case_helper` are one identifier each and must reach the KB and the BM25
+# index unfused (docs/quality-plan.md P0.3). `*` has no such rule — `*n*th`,
+# `two *Foo*s`, `re*start*` and even `2*3*4` all render as emphasis in marko and
+# markdown-it — so applying the `_` guard to `*` left the markers in the text layer
+# and reported a correct conversion as a 0.667-recall failure. `(?=\S)`/`(?<=\S)`
+# are what keeps `2 * 3 * 4` literal, and `(?<!\*)`/`(?!\*)` keep `**bold**` for
+# `_BOLD`, which must run first.
+_ITALIC_STAR = re.compile(r"(?<!\*)\*(?=\S)(.+?)(?<=\S)\*(?!\*)", re.S)
+_ITALIC_US = re.compile(r"(?<![\w*_])_(?=\S)(.+?)(?<=\S)_(?![\w*_])", re.S)
 _STRIKE = re.compile(r"~~(.+?)~~", re.S)
 # CommonMark: a backslash before ASCII punctuation makes it LITERAL text. These
 # must be hidden BEFORE the link/emphasis strips run — "\[SA,TD\](zero,SDF)" is
@@ -97,7 +107,8 @@ def _inline(text):
     text = _AUTOLINK.sub(lambda m: m.group(1), text)
     text = _BOLD.sub(lambda m: m.group(2), text)
     text = _STRIKE.sub(lambda m: m.group(1), text)
-    text = _ITALIC.sub(lambda m: m.group(2), text)
+    text = _ITALIC_STAR.sub(lambda m: m.group(1), text)
+    text = _ITALIC_US.sub(lambda m: m.group(1), text)
     text = _CODE_SLOT.sub(lambda m: stash[int(m.group(1))], text)
     return _PLACEHOLDER.sub(lambda m: chr(int(m.group(1), 16)), text)
 
@@ -174,27 +185,51 @@ def markdown_to_text(md):
     md = _BR.sub(" ", md)
     out = []
     in_code = False
+    para_open = False       # is there a paragraph a setext underline could attach to?
     for raw in md.split("\n"):
         if _FENCE.match(raw):
             in_code = not in_code
+            para_open = False
             continue  # drop the fence marker line itself
         if in_code:
             out.append(raw.rstrip())  # keep code content verbatim (tokens may be entities)
             continue
         line = raw
-        if _HR.match(line) or _SETEXT.match(line) or _TABLE_SEP.match(line):
+        # WHAT A RENDERER REALLY DELETES. A thematic break, a setext UNDERLINE and a
+        # GFM delimiter row draw furniture and contribute no text, so dropping them
+        # keeps this shadow faithful. The two guards are what stop it dropping text
+        # that a renderer DOES show:
+        #   * `===` (or `--`) with no paragraph above it is not an underline, it is
+        #     an ordinary paragraph — deleting it silently removed real characters
+        #     from the text layer the KB and the BM25 index read, at recall 1.0,
+        #     because a marker run carries no ASCII token to miss. A lone `-` is the
+        #     one exception: that is an empty bullet, and it really does render blank.
+        #   * a delimiter row needs a PIPE. `_TABLE_SEP` is deliberately loose (it
+        #     also serves collapse_table_padding, which only ever shows it rows it
+        #     already knows are table rows); without the pipe it swallows any short
+        #     hyphen run standing on its own.
+        setext = _SETEXT.match(line)
+        if (_HR.match(line)
+                or (setext and (para_open or line.strip() == "-"))
+                or ("|" in line and _TABLE_SEP.match(line))):
             out.append("")
+            para_open = False
             continue
         line = _BLOCKQUOTE.sub("", line)
-        if _ATX.match(line):
+        is_heading = bool(_ATX.match(line))
+        if is_heading:
             line = _ATX.sub("", line)
             line = _ATX_CLOSE.sub("", line)
         line = _LIST.sub("", line)
-        if _TABLE_ROW.match(raw):
+        is_row = bool(_TABLE_ROW.match(raw))
+        if is_row:
             line = _split_cells(line)
         line = _inline(line)
         line = _WS.sub(" ", line).strip()
         out.append(line)
+        # An ATX heading and a table row are closed blocks: a `===` under either is a
+        # paragraph, not an underline.
+        para_open = bool(line) and not is_heading and not is_row
     text = "\n".join(out)
     text = _BLANKS.sub("\n\n", text)
     return text.strip()

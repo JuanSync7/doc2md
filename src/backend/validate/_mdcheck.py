@@ -278,10 +278,26 @@ def _content_metrics(md, token_count=None):
 # The facts the fidelity gate compares. Named explicitly rather than "every key
 # both sides happen to produce", so widening the gate is a deliberate edit with a
 # test behind it — never a silent consequence of adding a field.
-_FIDELITY_FACTS = ("headings", "list_items", "ordered_items", "bullet_items",
-                   "ordered_numbers",
+_FIDELITY_FACTS = ("headings", "heading_path", "list_items", "ordered_items",
+                   "bullet_items", "ordered_numbers",
                    "strong", "em", "strike", "code_spans", "code_blocks",
-                   "links", "tables", "list_item_words")
+                   "links", "tables", "list_item_words", "thematic_breaks")
+
+
+def _has_evidence(value):
+    # type: (object) -> bool
+    """Did this fact actually observe anything, on this document?
+
+    ``compared`` used to count fact NAMES the source supplied, which is the schema,
+    not the evidence: a one-paragraph memo with no list, no table and no emphasis
+    reported ``compared: 13`` and read as thirteen things checked when twelve of them
+    were 0 == 0. Counting only facts with something on at least one side stops the
+    block overstating its own coverage."""
+    if isinstance(value, dict):
+        return any(value.values())
+    if isinstance(value, (list, tuple)):
+        return bool(value)
+    return bool(value)
 
 
 def structure_fidelity_report(emitted, source, lane="office"):
@@ -301,12 +317,29 @@ def structure_fidelity_report(emitted, source, lane="office"):
     broken in two — a screenshot dropped between step 2 and step 3 leaves the item
     count, the depth histogram and the token multiset all untouched while the
     renderer prints 1, 2, 1, 2 — and they cannot see a declared start of 5 being
-    ignored either."""
+    ignored either. ``heading_path`` is the same argument for prose: a histogram of
+    heading LEVELS cannot see two section titles exchanged.
+
+    Two fields keep this block honest about its own reach:
+
+      * ``compared`` counts facts that OBSERVED SOMETHING on this document, not
+        facts the source happened to supply a key for. A memo with no lists and no
+        tables is not thirteen things checked.
+      * ``unmeasured`` names, when a ground truth IS present, every fact it did not
+        supply — so a partial second opinion reads as partial instead of as a clean
+        bill of health. ``gate`` still answers only for what was measured; read the
+        two together."""
     out = OrderedDict()
     out["method"] = "ooxml-structure-ground-truth" if source else "unmeasured"
     deltas = []
+    unmeasured = []
+    compared = 0
     for fact in _FIDELITY_FACTS:
         if fact not in source:
+            # The ground truth has no opinion on this one. Say so by NAME: silently
+            # skipping it is how a gate ends up reporting a confident "pass" over a
+            # fact vector nobody compared.
+            unmeasured.append(fact)
             continue
         want, got = source.get(fact), emitted.get(fact)
         if fact == "tables":
@@ -324,10 +357,14 @@ def structure_fidelity_report(emitted, source, lane="office"):
             keys = set(want) | set(got or {})
             want = dict((k, want.get(k, 0)) for k in keys if want.get(k, 0))
             got = dict((k, (got or {}).get(k, 0)) for k in keys if (got or {}).get(k, 0))
+        if _has_evidence(want) or _has_evidence(got):
+            compared += 1
         if want != got:
             deltas.append(OrderedDict([("fact", fact), ("source", want),
                                        ("markdown", got)]))
-    out["compared"] = sum(1 for f in _FIDELITY_FACTS if f in source)
+    out["compared"] = compared
+    if source and unmeasured:
+        out["unmeasured"] = unmeasured
     out["deltas"] = deltas
     if not source:
         out["gate"] = "unmeasured"

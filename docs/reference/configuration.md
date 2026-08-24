@@ -105,7 +105,7 @@ recoverable from no artifact. `replay_run.py --stage enrich_metadata` replays it
 | Flag | Default | What changes in the output |
 |---|---|---|
 | `--bundles` | `data/bundles` | Bundle root to walk. Also where this stage's `manifest.jsonl` and `runs.jsonl` rows land — the same files the writers append to, since it is the same root. Recorded as `<src>` in `run.argv`, because it is the root a replay must be handed back. |
-| `--vocab` | `$DOC2MD_VOCAB` / `config/vocab.local.yaml` / `config/vocab.yaml` | Which term list values are checked against. Changes `vocab_version` in every written block **and** `prompt_sha`, so it re-asks the model. Recorded as a `vocabulary_selected` decision. Note a path here is redacted to `<path>` in `argv`, so `replay_run.py` refuses to reconstruct that run rather than guessing a vocabulary file — supply it by hand. |
+| `--vocab` | `$DOC2MD_VOCAB` / `config/vocab.local.yaml` / `config/vocab.yaml` | Which term list values are checked against. Changes `vocab_version` in every written block **and** `prompt_sha`, so it re-asks the model. Recorded as a `vocabulary_selected` decision. How a path here reaches `argv` depends on the **value**, never on the flag name: an **absolute** path is redacted to `<path:sha16>` (an identity, so "was this the same file?" stays answerable) and `replay_run.py` then refuses to reconstruct that run rather than guessing a vocabulary file — supply it by hand; a **relative** path (`config/vocab.yaml`) is recorded verbatim and replays fine, because a relative path discloses nothing. The same is true of `--status-file`, `--worker-cmd`, `--expectations` and every other switch: there is no list of "path-ish" flag names any more, and there was never any safety in one. |
 | `--namespace` | `""` | Prefix for the derived `id` (and its `uid` alias) — e.g. an org or corpus name, so ids from two corpora cannot collide. Changing it **rewrites every id in the corpus**, which orphans every `see_also` that used the old one. Recorded verbatim in `run.argv`, as `cli.namespace` in the run row, and as an `identity_namespace` decision in every report — so the corpus can say which namespace produced the ids in it. |
 | `--source-base-url` | `$DOC2MD_SOURCE_BASE_URL` / `""` | Where the source documents are served. Sets `meta.source.url`, the page's link home. With a base it is absolute (`https://intranet/docs/specs/a%20b.docx`); **without one it is still written**, as a relative URI reference — the same information as `source.uri` but percent-encoded and forward-slashed, so it can be pasted into a link instead of only read. Trailing slashes on the base are ignored. Recorded as `cli.source_base_url` in the run row **with the source of the value**, which matters here more than anywhere: taken from the environment it appears in no `argv`, so a run reproduced without it would silently publish a corpus of different links. Also a `permalink_base` decision (`absolute` or `relative`) in every report. |
 | `--only` / `--limit` | (none) / `0` | Narrow the pass. Skipped documents keep whatever they had. |
@@ -132,23 +132,40 @@ compare the result.
 | `--src` | `""` | The root the replay READS: source documents for the writers, the bundle root for `enrich_metadata`. **Always applied, whether or not the recorded run named one.** A run that took the default recorded no `--src` switch at all, so a replay that only filled placeholders printed a command with no `--src` — which reads from whatever `$DOC2MD_SRC` resolves to *now*, silently replaying a different corpus while the divergence list said "different directory". |
 | `--out` | `""` | The root the replay WRITES. Same forcing rule. Stages that rewrite in place (`enrich_metadata`) take none, and the tool does not ask you for one. |
 | `--execute` | off | Actually run it. Without this, nothing is changed — the command and the divergences are printed. |
-| `--compare` | off | After executing, compare `markdown_sha256` with the original and say `REPRODUCED` or `DIFFERENT`. |
+| `--compare` | off | After executing, compare `markdown_sha256` with the original and say `REPRODUCED` or `DIFFERENT`. Needs `--execute` (without it the dry-run line says so instead of silently ignoring the flag), and needs an `--out` that is **not** the root being replayed — comparing a bundle with itself matches by construction and is refused with exit `1`. When either side published no `markdown_sha256` (a failed document publishes none) the answer is **UNVERIFIED** at exit `4`, never `REPRODUCED`: comparing `""` with `""` used to print `REPRODUCED` with an empty hash. |
 
 **What counts as a divergence** — six classes, each a way the replay could produce
-a different answer:
+a different answer. Every one of them can also come back **UNVERIFIED**, meaning
+the class was never compared; that is a third answer, not a quiet pass:
 
 | Kind | Compared against | Why it matters |
 |---|---|---|
 | `code` | `pyproject.toml` + `.git` here | A different commit, or either checkout dirty. |
 | `host` | this interpreter | `python` and `implementation`. |
 | `tools` | a probe per external binary | `run.tools` re-asked here — today `soffice`. A tool with **no probe** on this interpreter is reported as UNVERIFIED, not passed over: "I could not check the toolchain" is not "the toolchain is the same". |
-| `config` | the ingest loader, re-resolved | Any resolved setting whose value moved, or that no longer exists. |
-| `env` | `os.environ` | The `DOC2MD_*` names that were merely **present** (`_env_present`), added or removed — a variable equal to the default moves no value and still changes what a person must set up. Plus any `cli.*` setting whose value came from a variable that now reads differently. |
-| `source` / `corpus` | the tree you passed as `--src` | This document's `source_sha256`, re-hashed; and `corpus_sha256` recomputed over exactly the documents the recorded run read (from its manifest rows, so `--only` and `--limit` runs stay checkable). `source_root_id` only ever answered "same *directory*?"; an edited file in the same directory used to replay clean and then produce different markdown. Skipped for a bundles root, where `source_relpath` does not resolve. |
+| `config` | the ingest loader, re-resolved | Any resolved setting whose value moved, or that no longer exists. **UNVERIFIED** when `runs.jsonl` has no row for this `(run_id, entrypoint)`, or the row carries no config block — the settings were then compared against nothing. |
+| `env` | `os.environ` | The `DOC2MD_*` names that were merely **present** (`_env_present`), added or removed — a variable equal to the default moves no value and still changes what a person must set up. Plus any `cli.*` setting whose value came from a variable that now reads differently. **UNVERIFIED** on a missing run row, for the same reason. |
+| `source` / `corpus` | the tree you passed as `--src` | This document's `source_sha256`, re-hashed; and `corpus_sha256` recomputed over exactly the documents the recorded run read (from its manifest rows, so `--only` and `--limit` runs stay checkable). `source_root_id` only ever answered "same *directory*?"; an edited file in the same directory used to replay clean and then produce different markdown. Both are **UNVERIFIED whenever no `--src` was given** — nothing was opened, so nothing was hashed. Also UNVERIFIED for a bundles read root, where `source_relpath` does not resolve (a correct, documented skip — but now a *reported* one rather than a silent one), for a report recording no `source_sha256`, and for an entrypoint the tool has no table entry for. The `corpus <sha>` header line is labelled `(recorded)` so it stops reading as evidence. |
 
-Exit codes: `0` all clear, `3` divergences found (or the replay produced a
-different hash), `1` a usage or I/O error. Divergences are **reported, never
-auto-corrected** — a silent "close enough" is how a replay comes to mean nothing.
+Exit codes:
+
+| code | meaning |
+|---|---|
+| `0` | everything applicable was compared, and none of it moved. |
+| `3` | a divergence was **demonstrated** — or the replay produced a different `markdown_sha256`, or produced no bundle at all. |
+| `4` | **nothing diverged, but at least one class could not be compared.** Explicitly *not* an all-clear. |
+| `1` | a usage or I/O error, which now includes `--compare` pointed at the root being replayed. |
+
+`4` exists because the two-code scheme had no way to say "I did not check". Folding
+"could not compare" into `3` would call an unchecked class a divergence; folding it
+into `0` is the defect that made a `--report R` run with the losslessness threshold
+halved print `no divergences … same resolved settings` and exit `0`. Note the
+consequence: **`--report R` with no `--src` can never return `0`**, because the two
+byte checks are exactly the ones that need a tree. Pass `--src` to get a `0`.
+Anything treating `rc == 0` as "the bundle is fine" now gets a stronger guarantee;
+anything treating `rc != 0` as failure sees a new value. Divergences are **reported,
+never auto-corrected** — a silent "close enough" is how a replay comes to mean
+nothing.
 
 ### `grade_output.py` — the rubric, as a command
 
@@ -161,7 +178,7 @@ enriches it with **no model**, and evaluates every row of the rubric in
 | `--workdir` | a temp dir | Where the graded corpus is built. Supplying it also **keeps** it — the artifacts are the evidence behind each verdict, so a named workdir is never deleted. |
 | `--keep` | off | Keep a temp workdir too, and print its path. Use when a row fails and you want to read the bundle that failed it. |
 | `--no-suites` | off | Grade artifacts only. The rows backed by a pytest target report `skip` — and **a skip is never an A**, so this is for a fast inner loop, never for claiming a grade. |
-| `--json` | off | Emit `{summary, rows}` instead of the table, for CI. |
+| `--json` | off | Emit `{summary, rows}` instead of the table, for CI. **`--json` owns stdout completely** — every progress, suite and "artifacts kept in …" line goes to stderr, so `--keep --json` is safe and the log and the piped document are the same bytes. On the exit-`2` break path it emits a *different* document: `{"error": {"stage", "message", "detail"}}` and **only** that key — no `summary`, no `rows`. **A consumer must branch on `error` before reading `summary`**, and one that does not will raise rather than read a broken run as "no row failed". Exit `2` now covers any unexpected break (previously a traceback and exit `1`); a real failing grade is still exit `1`, deliberately outside that handler, because a verdict about real output must never be dressed up as a tooling failure. |
 
 Exit codes: `0` every dimension is A, `1` not yet, `2` the graded run itself broke.
 A row whose named test file does not exist yet reports `skip`, not `fail`: an
@@ -195,7 +212,16 @@ the questions a single document structurally cannot answer.
 | `heal_supervisor.py` | Elastic self-healing supervisor for the PDF lane | `--max-workers`, `--ramp-secs`, `--tick`, `--stall-secs`, `--busy-ticks`, `--drain-secs`, `--max-respawns`, `--worker-cmd`, `--status-file`, `--status-only` |
 | `image_enrich.py` | Corpus-global figure captioning, flat layout | `--assets` |
 | `validate_markdown.py` | Second-pass markdown tree validator | `--md-dir`, `--json`, `--strict` |
-| `coverage_report.py` | Corpus-wide coverage summary: worst documents first, with the tokens and the figures actually lost | `--dir`, `--worst`, `--min-tokens` (below this a recall ratio is noise, and the count excluded is reported), `--fail-under` (makes it a CI step), `--json` |
+| `coverage_report.py` | Corpus-wide coverage summary: worst documents first, with the tokens and the figures actually lost | `--dir` (default `data/bundles`, which is **gitignored**), `--worst`, `--min-tokens` (below this a recall ratio is noise, and the count excluded is reported), `--fail-under` (makes it a CI step — see below), `--json` |
+
+`--fail-under` has **two** failure modes, and a CI author needs both. It exits `1`
+when the lossless fraction is below the threshold, **and** it exits `1` when no
+coverage records were found at all: nothing measured is not a pass. That second one
+bites on a fresh clone, where the default `--dir data/bundles` is gitignored and
+empty — `coverage_report.py --fail-under 1.0` there now correctly exits `1` instead
+of reporting a lossless corpus over zero documents. `--fail-under 0.0` still means
+"never fail", including over an empty directory, and `--json` still prints its
+(empty) array on stdout with the reason on stderr.
 | `validate_figures.py` | Second-pass figure auditor | `--assets`, `--explain` |
 | `prefetch_docling_models.py` | Pin and materialise the model weights | `--dest` |
 | `setup_libreoffice.py` | Vendor a relocatable LibreOffice | `--rpms`, `--force`, `--uninstall` |

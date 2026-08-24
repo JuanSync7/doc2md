@@ -329,8 +329,10 @@ enough metrics for a dashboard to triage without opening the markdown.
     "enabled": true,                     // a model was reachable this run
     "schema_version": 3, "vocab_version": 2,   // field inventory / term list revisions
                                          // v3 = one identity, section-anchored records
-    "expected": 16,                      // counted over the MERGED view: 5 of these
-                                         // fields live in knowledge.json, not here
+    "expected": 16,                      // counted over the MERGED view: 6 of these
+                                         // (entities, relations, decisions, risks,
+                                         //  open_questions, links) live in
+                                         //  knowledge.json, not here
     "filled": 14,                        // fields with a valid value
     "authored": 2, "invalid": 0,         // written by a PERSON / present but off-vocabulary
     "pending": 6,                        // still empty — backfillable without re-converting
@@ -443,14 +445,27 @@ captioning stage runs.
   "markdown_sha256": "…",
 
   "entities":       { "hosts": [ … ], "software": [ … ] },
-  "relations":      [ { "s": "arbiter", "p": "requires", "o": "ddr-phy" } ],
+  "relations":      [ { "s": "arbiter", "p": "requires", "o": "ddr-phy",
+                        "ref": "#system-design" } ],   // `ref` is REQUIRED from v3
   "decisions":      [ … ],
   "risks":          [ … ],
   "open_questions": [ … ],
   "links":          { "internal": [ … ] },
-  "_provenance":    { "relations": { "tier": 2, "source": "generated", … } }
+  "_provenance":    { "relations": { "source": "generated", "value_sha": "…", … } }
 }
 ```
+
+**Every record cites the section that asserts it.** From schema v3 a `relations`
+entry requires `s`, `p`, `o` **and** `ref` — a `#fragment` naming a heading anchor
+that `structure.json` publishes (`#system-design` above is the anchor of the
+outline node shown earlier in this file). `accept_model_meta` rejects a record
+without one as `missing-required-ref` and stores nothing, so a producer written
+against an older shape loses every relation silently rather than erroring. The one
+latitude is a harvested link in the lede, above the first heading, where a renderer
+emits no fragment: those carry `source: "extracted"` and the body `line` instead
+(P7.10). `_provenance` carries **no `tier`** — it was a pure function of the field
+name and nothing ever read it back (P5.9); `value_sha` is written for every machine
+source, which is what makes a hand-edited value detectable.
 
 **Why this is a file and not front matter.** The metadata a document carries is two
 different things wearing one name. *Descriptors* — `id`, `title`, `type`, `tags`,

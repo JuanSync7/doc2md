@@ -9,8 +9,21 @@ and grades the merged view with ``backend.kb``:
 PER DOCUMENT
     CARDINALITY      is each facet actually a facet, or is it documentation?
     MEMBERSHIP       is every value a governed term (closed), or a proposal (registry)?
+    REQUIRED KEYS    does every knowledge record carry what makes it a fact — both
+                     endpoints of a relation, and the section anchor that asserts it?
     TYPE HYGIENE     did an unquoted YAML 1.1 keyword get retyped into an enum?
     INTEGRITY        do ``ref``/``backs``/``see_also``/``control`` pointers resolve?
+
+WHAT CARDINALITY CANNOT TELL YOU, said out loud because a gate nobody can fail is
+worse than no gate. ``distinct/used`` is a discovery heuristic for a field somebody
+can invent a new value in. Every facet this tool grades is bound to a CLOSED
+vocabulary, and ``distinct`` can never exceed the term count — so on a sample small
+enough for the ratio to look bad, the verdict is arithmetic rather than evidence, and
+on a sample large enough to be evidence the ratio cannot look bad at all. Those rows
+therefore report ``sparse`` (neither a pass nor a fail, and aggregatable) rather than
+condemning a document for using the terms it was given. Membership answers the
+stricter question for a closed field, and ``vocab-unused``/``vocab-dead`` answer the
+mirror one corpus-wide.
 
 CORPUS-WIDE (nothing below is answerable one document at a time)
     REGISTRY HEALTH  singleton rate, and proposals ready for promotion

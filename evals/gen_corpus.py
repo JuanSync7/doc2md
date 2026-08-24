@@ -662,7 +662,13 @@ ADVERSARIAL_STYLES = (
     '<w:style w:type="character" w:styleId="KestrelLiteral">'
     '<w:name w:val="HTML Code"/><w:qFormat/>'
     '<w:rPr><w:rFonts w:ascii="Liberation Mono" w:hAnsi="Liberation Mono"/>'
-    '</w:rPr></w:style>')
+    '</w:rPr></w:style>'
+    # Emphasis carried by the STYLE, not by the run — Word's own Strong, and what
+    # every pandoc/HTML->Word round trip produces. A converter that reads only a
+    # run's direct w:rPr deletes it, and used to delete it invisibly because the
+    # structural ground truth read the document the same wrong way.
+    '<w:style w:type="character" w:styleId="KestrelEmphasis">'
+    '<w:name w:val="Strong"/><w:qFormat/><w:rPr><w:b/></w:rPr></w:style>')
 
 
 def build_adversarial_docx(path):
@@ -720,6 +726,30 @@ def build_adversarial_docx(path):
                  + fmt_run("kubectl get pods -n payments",
                            '<w:rStyle w:val="KestrelLiteral"/>')
                  + w_run(" and wait for every replica to report ready.")))
+    # (16) Emphasis carried by a character STYLE. Nothing in the run's own w:rPr
+    # says bold; the style does, the way Word's Strong does.
+    b.append(w_p(w_run("The ")
+                 + fmt_run("payments rota", '<w:rStyle w:val="KestrelEmphasis"/>')
+                 + w_run(" owns the escalation path out of hours.")))
+    # (17) Two shapes a RUN BOUNDARY turns into markdown that cannot mean what it
+    # says. A bolded bit-slice glued to the word before it emits `**` with a word
+    # character outside and punctuation inside, which CommonMark cannot open — the
+    # asterisks print literally and the bold is gone. And a bracketed citation whose
+    # parenthetical is a separate run (an rsid split, a cross-reference bookmark, a
+    # REF field: Word makes all three constantly) fabricates a link whose
+    # destination a renderer then eats.
+    b.append(w_p(w_run("Field MODE")
+                 + fmt_run("(2:0)", "<w:b/>")
+                 + w_run(" is read-only; see ")
+                 + w_run("[3]")
+                 + w_run("(page 12)")
+                 + w_run(" for the drain timing.")))
+    # (18) A pasted README fragment and a typed divider, both PLAIN body paragraphs.
+    # Emitted raw the first becomes a real H2 the document never had, and the second
+    # renders away to a horizontal rule — and because a rule carries no tokens and no
+    # heading fact, BOTH gates certified a paragraph that had been deleted.
+    b.append(w_text_p("## Restart the drain from a clean slate"))
+    b.append(w_text_p("-----"))
 
     b.append(w_text_p("Drain procedure", style="Heading2"))
     # (3) Three-level ORDERED list (ilvl 0/1/2) with a BULLET sub-list under it.
@@ -777,6 +807,23 @@ def build_adversarial_docx(path):
                       style="KestrelTranscript"))
     b.append(w_text_p("kestrelctl writes enable --tier=payments",
                       style="KestrelTranscript"))
+    # (19) The same transcript continues with COLUMN-ALIGNED output, a BLANK LINE
+    # (Enter pressed inside the listing) and an INDENTED helper. Every one of those
+    # is whitespace, and whitespace is not a token, so a converter that collapsed
+    # them published a differently-indented program — `if tier.ready:` with no body
+    # and an unconditional `return tier` — at token_recall 1.0 with the fence count
+    # still matching.
+    b.append(w_text_p("kestrelctl status --tier=payments --wide",
+                      style="KestrelTranscript"))
+    b.append(w_text_p("TIER        REPLICAS   QUEUE   STATE",
+                      style="KestrelTranscript"))
+    b.append(w_text_p("payments           6       0   draining",
+                      style="KestrelTranscript"))
+    b.append(w_p("", style="KestrelTranscript"))
+    b.append(w_text_p("def kestrel_drain(tier):", style="KestrelTranscript"))
+    b.append(w_text_p("    if tier.ready:", style="KestrelTranscript"))
+    b.append(w_text_p("        tier.write(0x04, 1)", style="KestrelTranscript"))
+    b.append(w_text_p("    return tier", style="KestrelTranscript"))
 
     b.append(w_text_p("Escalation matrix", style="Heading2"))
     b.append(w_text_p(

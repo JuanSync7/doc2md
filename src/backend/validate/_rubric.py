@@ -15,18 +15,30 @@ summary: Pure predicates that grade a built corpus against docs/quality-plan.md,
 #
 # Two kinds of row:
 #   * ARTIFACT rows are answered here, by inspecting what the pipeline wrote.
-#   * SUITE rows are answered by a named pytest target the runner executes; this
-#     module only records the verdict it was handed. A suite that could not be run
-#     is "skip", and a skip is never an A: unknown is not the same as passing.
+#   * SUITE rows are answered by the SPECIFIC tests named in ``selector``, which
+#     the runner executes; this module only records the verdict it was handed. A
+#     suite that could not be run is "skip", and a skip is never an A: unknown is
+#     not the same as passing.
+#
+# A suite row names tests, never just a file. Grading a row by "did this pytest
+# FILE exit 0?" cannot tell "the condition I assert is checked" apart from "that
+# file is green for unrelated reasons": the named demonstration could be deleted
+# and the row would keep reporting pass, and an unrelated green test added to the
+# file would earn the row on its behalf. Naming the tests makes the row fail when
+# its own evidence disappears, which is the only reason the row is worth reading.
 import re
 
 from collections import namedtuple
 
 from backend.provenance import DECISION_CODES
 
+__all__ = ["DIMENSIONS", "ROWS", "gfm_anchor", "grade", "letter", "summarize",
+           "Row", "Result", "PASS", "FAIL", "SKIP"]
+
 # A single graded condition. ``check`` takes the corpus view and returns
-# (status, evidence); ``suite`` names a pytest target the runner must execute.
-Row = namedtuple("Row", "dim rid condition kind target check")
+# (status, evidence); ``target`` + ``selector`` name the pytest file and the
+# tests inside it that demonstrate a suite row's condition.
+Row = namedtuple("Row", "dim rid condition kind target selector check")
 Result = namedtuple("Result", "dim rid condition status evidence")
 
 PASS = "pass"
@@ -124,8 +136,65 @@ def _nothing_to_grade(what):
     A loop over an empty corpus falls through to its `return PASS`, and a grader
     that reports a cheerful A because it was handed no documents is the same
     vacuous pass the report's `n_source_tokens` exists to prevent. Every artifact
-    check states its denominator."""
+    check states its denominator.
+
+    A corpus-wide denominator answers only the corpus-wide question. It cannot
+    stand in for a PER-DOCUMENT one: a row whose only failure is "no bundle
+    anywhere had any", and that quietly excuses the individual bundle that lost
+    everything the row grades, is exactly the shape that once let all 32 rows pass
+    over a document with every heading deleted. Dimension C therefore asks its
+    question of each bundle and reports how many were asked."""
     return (FAIL, "nothing to grade: %s" % what)
+
+
+# ---------------------------------------------------- markdown, read first-hand
+
+# A fence opener/closer as CommonMark defines it: up to three leading spaces then
+# three or more backticks or tildes.
+_CODE_FENCE = re.compile(r"^ {0,3}(?:`{3,}|~{3,})")
+# An unescaped cell divider, and a GFM delimiter-row cell (`---`, `:-:`, `--:`).
+_TABLE_PIPE = re.compile(r"(?<!\\)\|")
+_SEP_CELL = re.compile(r"^:?-+:?$")
+
+
+def _prose_lines(markdown):
+    # type: (str) -> list
+    """``markdown``'s lines, with everything inside a fenced block blanked out.
+
+    Spelled out here rather than imported from ``backend.sections`` on purpose,
+    like every other fact this module grades: the rubric checks what that package
+    produced, and a check that asked the producer where the code is would only be
+    asking a module whether it agrees with itself. A shell transcript's ``# reset
+    the board`` makes no fragment addressable and its pipe art is not a table. An
+    unclosed fence runs to the end of the document, which is what CommonMark does
+    with one, so the mask matches the renderer."""
+    out = []
+    in_fence = False
+    for line in (markdown or "").splitlines():
+        if _CODE_FENCE.match(line):
+            in_fence = not in_fence
+            out.append("")
+            continue
+        out.append("" if in_fence else line)
+    return out
+
+
+def _gfm_tables(markdown):
+    # type: (str) -> int
+    """How many GFM tables the BODY renders — pipe art inside a fence is not one.
+
+    The rubric counts them itself so that "this document has a table" is an
+    observation about the published markdown rather than a claim copied from the
+    structure.json being graded."""
+    lines = _prose_lines(markdown)
+    found = 0
+    for i in range(1, len(lines)):
+        if not _TABLE_PIPE.search(lines[i - 1]):
+            continue
+        cells = [c.strip() for c in _TABLE_PIPE.split(lines[i].strip()) if c.strip()]
+        if cells and all(_SEP_CELL.match(c) for c in cells):
+            found += 1
+    return found
 
 
 # ------------------------------------------------- A. document.md — the body
@@ -320,8 +389,12 @@ def _c1_hierarchy(view):
     says how many bundles were actually looked at."""
     if not _all(view):
         return _nothing_to_grade("no bundles in the corpus under grade")
+    outlined = 0
     for b in _all(view):
         outline = b.get("structure", {}).get("outline") or []
+        if not outline:
+            continue
+        outlined += 1
         flattened = _flattened_children(outline)
         if len(outline) > 2 and len(flattened) >= _C1_FLATTENED_MIN:
             return (FAIL, "%s has %d top-level siblings whose section number makes "
@@ -329,8 +402,15 @@ def _c1_hierarchy(view):
                           "the hierarchy was never inferred"
                     % (b.get("doc_id", "?")[:8], len(flattened),
                        ", ".join(repr(t[:12]) for t in flattened[:4])))
-    return (PASS, "%d bundle(s) inspected; none publishes a numbered outline "
-                  "flattened into siblings" % len(_all(view)))
+    if not outlined:
+        return _nothing_to_grade("no bundle in the corpus publishes an outline, so "
+                                 "no hierarchy was ever inspected")
+    # "N bundle(s) inspected" used to count bundles with no outline at all as
+    # inspected, which is how a corpus with one structure.json missing could read
+    # as three bundles examined. Both numbers are reported now.
+    return (PASS, "%d of %d bundle(s) publish an outline; none of them publishes a "
+                  "numbered outline flattened into siblings"
+            % (outlined, len(_all(view))))
 
 
 # A renderer disambiguates repeated headings by suffixing an ordinal: two
@@ -366,11 +446,13 @@ def _rendered_anchors(markdown):
     structure.json advertises are the ones a reader can actually follow, and a
     grader that asked the producer would only be asking a module whether it agrees
     with itself. Repeats take the renderer's ordinal suffix (``overview``, then
-    ``overview-1``); a heading that slugs to nothing makes nothing addressable.
+    ``overview-1``); a heading that slugs to nothing makes nothing addressable;
+    and a ``#`` inside a fenced block is a shell comment, not a heading, so it
+    offers no fragment for a published anchor to hide behind.
     """
     out = set()
     seen = {}
-    for m in _ATX_HEADING.finditer(markdown or ""):
+    for m in _ATX_HEADING.finditer("\n".join(_prose_lines(markdown))):
         base = gfm_anchor(m.group(2))
         if not base:
             continue
@@ -391,9 +473,22 @@ def _c3_anchors(view):
     It now derives the addressable set from the bundle's own ``document.md``, which
     the view always carries, and reports the denominator for both halves so a
     silent nothing-to-do can never read as a pass again.
+
+    The second thing it got wrong was WHOSE denominator. A bundle whose body held
+    no ATX heading was skipped with a bare ``continue`` while the compensating
+    "nothing to grade" guard stayed corpus-wide, so one healthy sibling covered for
+    every bundle without — and that shape needs no adversarial input: an unstyled
+    .docx whose sections are ALL-CAPS or numbered paragraphs makes ``is_heading``
+    publish anchors over a body that renders not one ``#``. A bundle that publishes
+    anchors nothing in its OWN body can resolve now fails on its own account, and
+    the pass evidence counts anchors against anchors instead of mixing nodes with
+    bundles.
     """
+    bundles = _all(view)
     graded = crossed = 0
-    for b in _all(view):
+    silent = 0
+    for b in bundles:
+        short = b.get("doc_id", "?")[:8]
         nodes = [n for n in _iter_nodes(b.get("structure", {}).get("outline"))
                  if (n.get("title") or "") not in _HEADLESS]
         for node in nodes:
@@ -402,80 +497,143 @@ def _c3_anchors(view):
             if not _anchor_ok(anchor, title):
                 return (FAIL, "%s node %s anchor %r but GFM renders %r "
                               "(an ordinal suffix for a repeated title is fine)"
-                        % (b.get("doc_id", "?")[:8], node.get("id"), anchor,
-                           gfm_anchor(title)))
-        addressable = _rendered_anchors(b.get("markdown", ""))
-        if not addressable:
-            continue
-        crossed += 1
+                        % (short, node.get("id"), anchor, gfm_anchor(title)))
         # A node whose title slugs empty carries the `section` placeholder, which
         # names no fragment in any body; it is outside the question, like the
         # preamble. Everything else must be a fragment the body really offers.
-        missing = set(n.get("anchor") for n in nodes
-                      if gfm_anchor(n.get("title") or "")) - addressable
+        published = set(n.get("anchor") for n in nodes
+                        if gfm_anchor(n.get("title") or ""))
+        if not published:
+            silent += 1
+            continue
+        addressable = _rendered_anchors(b.get("markdown", ""))
+        if not addressable:
+            return (FAIL, "%s publishes %d anchor(s) but its own document.md renders "
+                          "no heading at all, so every one of them is a fragment that "
+                          "resolves nowhere: %s"
+                    % (short, len(published), sorted(published)[:4]))
+        missing = published - addressable
         if missing:
             return (FAIL, "%s publishes anchor(s) no heading in its own document.md "
-                          "makes addressable: %s"
-                    % (b.get("doc_id", "?")[:8], sorted(missing)[:4]))
+                          "makes addressable: %s" % (short, sorted(missing)[:4]))
+        crossed += len(published)
     if not graded:
         return _nothing_to_grade("no outline nodes in the corpus under grade")
     if not crossed:
-        return _nothing_to_grade("no bundle carries a markdown body, so the "
-                                 "published anchors were never cross-checked "
-                                 "against the headings they claim to address")
-    return (PASS, "all %d anchors are the GFM slug of their title, and every one of "
-                  "them resolves in the body of its own bundle (%d cross-checked)"
-            % (graded, crossed))
+        return _nothing_to_grade("no bundle publishes an anchor a renderer could "
+                                 "resolve, so nothing was ever cross-checked against "
+                                 "the headings it claims to address")
+    return (PASS, "all %d outline node(s) across %d bundle(s) carry the GFM slug of "
+                  "their title, and each of the %d anchor(s) that names a fragment "
+                  "resolves in the body of its own bundle (%d bundle(s) publish none)"
+            % (graded, len(bundles), crossed, silent))
 
 
 def _c4_summary_numbers(view):
     # type: (dict) -> tuple
+    """The published summary numbers describe the tree — of every document.
+
+    A bundle with no outline used to be `continue`d, so a document whose whole
+    outline was lost contributed nothing and any sibling that still had one
+    carried the row. A lost outline is precisely the damage dimension C exists to
+    catch, so a bundle that ships a body and no tree now fails. A bundle with no
+    body has nothing to build a tree from and stays exempt."""
+    bundles = _all(view)
     graded = 0
-    for b in _all(view):
+    for b in bundles:
         rep, st = b.get("report", {}), b.get("structure", {})
         outline = st.get("outline") or []
+        short = b.get("doc_id", "?")[:8]
         if not outline:
+            body = (b.get("markdown") or "").strip()
+            if body:
+                return (FAIL, "%s publishes a document.md of %d line(s) and no "
+                              "outline at all — whatever tree it had is gone, and a "
+                              "sibling bundle's outline does not stand in for it"
+                        % (short, len(body.splitlines())))
             continue
         graded += 1
         summary = rep.get("structure") or {}
         want = _tree_depth(outline)
         if summary.get("max_depth") != want:
             return (FAIL, "%s max_depth %r but the tree is %d deep"
-                    % (b.get("doc_id", "?")[:8], summary.get("max_depth"), want))
+                    % (short, summary.get("max_depth"), want))
         if "largest_leaf_tokens" not in summary:
             return (FAIL, "%s publishes no largest_leaf_tokens, so "
                           "largest_section_tokens can still mean 'the whole document'"
-                    % b.get("doc_id", "?")[:8])
+                    % short)
     if not graded:
         return _nothing_to_grade("no bundle in the corpus has an outline")
-    return (PASS, "%d outline(s): max_depth is tree depth and a largest-leaf "
-                  "count is published" % graded)
+    return (PASS, "%d of %d bundle(s) publish an outline; in every one max_depth is "
+                  "the tree depth and a largest-leaf count is published"
+            % (graded, len(bundles)))
 
 
 def _c5_table_nodes(view):
     # type: (dict) -> tuple
-    saw = 0
-    for b in _all(view):
+    """Every table a document RENDERS is a node somebody can cite.
+
+    The existence half of this row was one corpus-wide counter, so a bundle whose
+    outline addressed none of its tables was covered by any sibling that still had
+    one — the row could not fail for the document it was written to police. It is
+    asked per bundle now, against the tables the rubric counts in that bundle's own
+    ``document.md``; asking the producer how many tables it found would only be
+    asking it whether it agrees with itself.
+
+    Lane asymmetry is deliberate and matches ``structure_fidelity``: the office
+    lane has a converter-blind ground truth and hard-fails, while a lane with no
+    semantic tree of its own (PDF) is reported UNMEASURED rather than failed. The
+    negative checks — a legacy integer ``tables``, a table dict missing its
+    coordinates — apply to every lane, as they always did."""
+    bundles = _all(view)
+    saw = required = unmeasured = 0
+    for b in bundles:
+        short = b.get("doc_id", "?")[:8]
+        here = 0
         for node in _iter_nodes(b.get("structure", {}).get("outline")):
             tables = node.get("tables")
             if isinstance(tables, int):
                 if tables:
                     return (FAIL, "%s node %s reports tables as the integer %d — a "
                                   "table cannot be cited or linked"
-                            % (b.get("doc_id", "?")[:8], node.get("id"), tables))
+                            % (short, node.get("id"), tables))
                 continue
             for tbl in tables or []:
                 miss = [k for k in ("table_id", "line", "rows", "cols") if k not in tbl]
                 if miss:
                     return (FAIL, "table node missing %s" % miss)
-                saw += 1
+                here += 1
+        saw += here
+        rendered = _gfm_tables(b.get("markdown", ""))
+        if not rendered:
+            continue
+        if b.get("report", {}).get("lane") != "office":
+            unmeasured += 1
+            continue
+        required += 1
+        if not here:
+            return (FAIL, "%s renders %d GFM table(s) in its own document.md and "
+                          "publishes no table node at all, so not one of them can be "
+                          "cited or linked" % (short, rendered))
     if not saw:
         return (FAIL, "no table nodes anywhere in the corpus under grade")
-    return (PASS, "%d tables are addressable nodes" % saw)
+    return (PASS, "%d table(s) are addressable nodes; every one of the %d office "
+                  "bundle(s) whose body renders a table addresses it (%d non-office "
+                  "bundle(s) with a rendered table: unmeasured)"
+            % (saw, required, unmeasured))
 
 
 def _c6_allcaps(view):
     # type: (dict) -> tuple
+    """The one shouted sentence in the graded corpus stayed body text.
+
+    Named for exactly what it measures. This row greps the adversarial fixture for
+    a single ALL-CAPS literal, so it is a REGRESSION guard over one sentence in one
+    document — it cannot answer "a body sentence cannot become a heading", because
+    the corpus under grade contains no numbered body sentence and no keyword one to
+    ask it of, and the rubric cannot re-derive `is_heading`'s bound without
+    reimplementing the code it is grading. The general claim, over all three
+    branches and in both directions, is the C6s suite row's to make."""
     bundle = _adversarial(view)
     if not bundle:
         return _missing_fixture()
@@ -662,12 +820,18 @@ def _e1_guide(view):
 
 def _artifact(dim, rid, condition, check):
     # type: (str, str, str, object) -> Row
-    return Row(dim, rid, condition, "artifact", "", check)
+    return Row(dim, rid, condition, "artifact", "", (), check)
 
 
-def _suite(dim, rid, condition, target):
-    # type: (str, str, str, str) -> Row
-    return Row(dim, rid, condition, "suite", target, None)
+def _suite(dim, rid, condition, target, selector):
+    # type: (str, str, str, str, tuple) -> Row
+    """A suite row and the specific tests that demonstrate its condition.
+
+    ``selector`` is not decoration. It is the difference between "the condition
+    this row asserts is checked" and "that file is green", and the runner turns it
+    into pytest node ids so the row fails the moment its named demonstration stops
+    existing."""
+    return Row(dim, rid, condition, "suite", target, tuple(selector), None)
 
 
 ROWS = [
@@ -675,13 +839,29 @@ ROWS = [
     _artifact("A", "A1", "structure_fidelity is a second hard gate on the office lane",
               _a1_structure_gate),
     _suite("A", "A2", "body text round-trips as a sequence, not only a multiset",
-           "tests/unit/backend/test_validate_roundtrip.py"),
+           "tests/unit/backend/test_validate_roundtrip.py", (
+               # The three documents that pass the MULTISET gate and must fail the
+               # sequence one. Any other test in that file proves round-tripping,
+               # not that order is graded.
+               "test_swapping_two_body_paragraphs_passes_the_multiset_gate_but_fails_the_sequence",
+               "test_reversing_the_whole_body_passes_the_multiset_gate_but_fails_the_sequence",
+               "test_transposing_a_table_passes_the_multiset_gate_but_fails_the_sequence",
+           )),
     _artifact("A", "A3", "identifiers survive verbatim in the stored bytes",
               _a3_verbatim),
     _suite("A", "A4", "every deliberate drop emits a named warning carrying a count",
-           "tests/unit/backend/test_warning_vocabulary.py"),
+           "tests/unit/backend/test_warning_vocabulary.py", (
+               "test_every_documented_warning_code_has_an_emitter",
+               "test_every_emitted_warning_code_is_documented",
+               "test_a_deliberate_drop_carries_the_size_of_the_loss",
+               "test_a_document_that_loses_nothing_reports_nothing",
+           )),
+    # The eval harness is not pytest, so the row names the FIXTURE it is graded
+    # on. "The adversarial fixture is pinned" is a claim about one expectation:
+    # eighteen other green fixtures do not make it true, and the row must fail if
+    # that expectation is ever dropped from evals/expectations.json.
     _suite("A", "A5", "adversarial fixtures are pinned in the eval corpus",
-           "evals/run_eval.py"),
+           "evals/run_eval.py", ("office/kestrel-adversarial.docx",)),
     # B. report.json
     _artifact("B", "B1", "run{} records argv, resolved config with sources, code, host",
               _b1_run_block),
@@ -691,57 +871,140 @@ ROWS = [
               _b3_decisions),
     _artifact("B", "B4", "manifest.jsonl is a run log joined to runs.jsonl",
               _b4_runlog),
+    # Both halves of the condition, named. "Reproduces the hash" is one test; "or
+    # names every divergence" is the rest, one per kind of thing that can differ.
+    # The row is deliberately silent about `replay --compare`, which the plan's own
+    # P7.12 ledger says can print REPRODUCED for a bundle it did not reproduce:
+    # no test here demonstrates that path, so no row may claim it.
     _suite("B", "B5", "replay_run reproduces markdown_sha256 or names divergences",
-           "tests/integration/test_replay_run.py"),
+           "tests/integration/test_replay_run.py", (
+               "test_replay_reproduces_the_exact_markdown_hash",
+               "test_a_changed_setting_is_named_before_anything_runs",
+               "test_an_edited_source_is_caught_although_the_directory_is_unchanged",
+               "test_a_missing_source_file_is_named_rather_than_read_as_unchanged",
+               "test_a_different_external_tool_version_is_a_divergence",
+               "test_a_tool_this_machine_cannot_probe_is_unverified_not_unchanged",
+           )),
     _artifact("B", "B6", "no vacuous pass: recall is always over a stated token count",
               _b6_no_vacuous_pass),
     _suite("B", "B7", "exit codes distinguish error from pending work",
-           "tests/integration/test_enrich_metadata.py"),
+           "tests/integration/test_enrich_metadata.py", (
+               "test_the_exit_code_says_whether_the_corpus_needs_another_run",
+               "test_a_model_outage_leaves_the_fields_pending_and_the_run_re_runnable",
+           )),
     # C. structure.json
     _artifact("C", "C1", "heading hierarchy is inferred when the extractor is flat",
               _c1_hierarchy),
     _suite("C", "C1s", "heading levels are inferred from numbering on flat input",
-           "tests/unit/backend/test_outline_heuristics.py"),
+           "tests/unit/backend/test_outline_heuristics.py", (
+               "test_a_flat_extractor_gets_its_hierarchy_back_from_the_numbering",
+               "test_a_flat_extractor_that_starts_below_the_top_level_is_still_inferred",
+               "test_a_bundle_with_real_levels_is_never_reshaped",
+               "test_flat_and_unnumbered_headings_are_left_alone",
+               # The inference must also REFUSE: a measurement series is not a tree.
+               "test_measurements_in_titles_cannot_fabricate_a_hierarchy",
+               "test_an_ascending_measurement_series_is_not_a_hierarchy",
+               "test_a_numbering_is_believed_only_when_its_children_start_at_one",
+           )),
     _suite("C", "C2", "node ids are content-derived and stable across an insertion",
-           "tests/unit/backend/test_outline_stability.py"),
+           "tests/unit/backend/test_outline_stability.py", (
+               "test_positional_ids_move_but_content_ids_do_not",
+               "test_the_fingerprint_tracks_the_sections_own_body_only",
+               "test_renaming_a_section_is_the_one_thing_that_moves_its_id",
+           )),
     _artifact("C", "C3", "one anchor scheme, GFM-correct, agreed corpus-wide",
               _c3_anchors),
     _artifact("C", "C4", "max_depth is tree depth; a largest-leaf count is published",
               _c4_summary_numbers),
     _artifact("C", "C5", "tables are first-class nodes, addressable like images",
               _c5_table_nodes),
-    _artifact("C", "C6", "a body sentence cannot become a heading", _c6_allcaps),
+    _artifact("C", "C6", "the shouted callout in the graded corpus stayed body text",
+              _c6_allcaps),
+    # C6 greps one ALL-CAPS literal in one fixture, so it reported PASS over a
+    # numbered body sentence that DID become a heading. The plan's actual C6 —
+    # "a body sentence cannot become a heading, the heuristic is bounded" — is a
+    # claim about three branches in two directions, and this is where it is made:
+    # each shape must stay body text, and its LABEL form must still open a section,
+    # because a bound that never fires would satisfy the negative half by refusing
+    # to recognise anything at all.
+    _suite("C", "C6s", "the heading heuristics are bounded in both directions",
+           "tests/unit/backend/test_outline_heuristics.py", (
+               "test_a_shouted_body_sentence_is_not_a_heading",
+               "test_a_shouted_label_is_still_a_heading",
+               "test_a_numbered_body_sentence_is_not_a_heading",
+               "test_a_numbered_label_is_still_a_heading",
+               "test_a_keyword_sentence_is_not_a_heading",
+               "test_a_keyword_label_is_still_a_heading",
+           )),
     # D. metadata
     _artifact("D", "D1", "a no-model run yields a titled, summarised, linked page",
               _d1_no_model_page),
     _artifact("D", "D2", "every page can link back to its source", _d2_permalink),
     _artifact("D", "D3", "id is unique corpus-wide", _d3_ids_unique),
     _suite("D", "D3s", "id uniqueness holds by construction at corpus scale",
-           "tests/unit/backend/test_id_uniqueness.py"),
+           "tests/unit/backend/test_id_uniqueness.py", (
+               "test_a_thousand_colliding_titles_produce_a_thousand_distinct_ids",
+               "test_two_paths_that_slugify_alike_still_get_different_ids",
+               "test_documents_differing_only_in_extension_or_case_get_different_ids",
+           )),
     _artifact("D", "D4", "one canonical identity", _d4_one_identity),
     _artifact("D", "D5", "every knowledge record present cites its section",
               _d5_records_cite),
     _suite("D", "D5s", "a record that cannot say which section asserts it is refused",
-           "tests/unit/backend/test_kb_enrich.py"),
+           "tests/unit/backend/test_kb_enrich.py", (
+               "test_a_record_that_cannot_say_which_section_asserts_it_is_refused",
+               "test_an_unverifiable_ref_is_skipped_rather_than_passed",
+               "test_a_model_proposed_link_with_no_ref_is_still_dropped_on_revalidation",
+           )),
     _suite("D", "D6", "no field ships that nothing reads and nothing fills",
-           "tests/unit/backend/test_field_inventory.py"),
+           "tests/unit/backend/test_field_inventory.py", (
+               "test_every_field_names_a_consumer_and_the_claim_is_true",
+               "test_every_field_is_filled_by_somebody",
+               "test_the_fields_the_inventory_shed_stay_shed",
+           )),
     _suite("D", "D7", "corpus gates stay sound at scale; truncation is disclosed",
-           "tests/integration/test_kb_lint_corpus.py"),
+           "tests/integration/test_kb_lint_corpus.py", (
+               "test_the_corpus_gates_stay_sound_and_affordable_at_a_thousand_documents",
+               "test_a_narrowed_run_skips_the_gates_that_truncation_would_invert",
+               "test_limit_announces_the_documents_it_deferred_rather_than_capping_silently",
+               "test_a_narrowed_run_names_the_flag_that_narrowed_it",
+           )),
     # E. documentation
     _artifact("E", "E1", "a product guide with a real worked example", _e1_guide),
+    # E2, E3 and E4 all lived on tests/integration/test_docs_parity.py, so ONE
+    # green file supplied three separate A-grades in a five-row dimension and no
+    # row could tell which of the nine tests in it answered the question the row
+    # asks. Each now names its own, and the nine are partitioned between them: no
+    # test backs two rows, and none is left over to back a row by accident.
     _suite("E", "E2", "every switch and env var is documented and cannot drift",
-           "tests/integration/test_docs_parity.py"),
+           "tests/integration/test_docs_parity.py", (
+               "test_every_cli_flag_is_documented",
+               "test_every_documented_flag_exists",
+               "test_every_environment_variable_is_documented",
+           )),
     # Two halves, two targets. "Published and cannot go stale" is proven by the
     # drift test that regenerates vocabulary.md and byte-compares; "the vocabulary
     # itself is sound" is proven by the shipped-vocabulary suite. Naming one target
     # for both meant half the condition was never checked by the row asserting it.
     _suite("E", "E3", "the published vocabulary is generated and cannot go stale",
-           "tests/integration/test_docs_parity.py"),
+           "tests/integration/test_docs_parity.py", (
+               "test_vocabulary_reference_is_not_stale",
+               "test_every_vocabulary_term_appears_in_the_reference",
+           )),
     _suite("E", "E3s", "the shipped vocabulary is internally valid and parses "
                        "under the restricted reader",
-           "tests/integration/test_shipped_vocabulary.py"),
+           "tests/integration/test_shipped_vocabulary.py", (
+               "test_the_shipped_vocabulary_loads_with_no_arguments_and_self_validates",
+               "test_the_file_stays_inside_the_strict_yaml_subset_every_consumer_parses_with",
+               "test_every_vocabulary_the_schema_binds_to_exists_in_the_shipped_file",
+           )),
     _suite("E", "E4", "every artifact key is documented and cannot drift",
-           "tests/integration/test_docs_parity.py"),
+           "tests/integration/test_docs_parity.py", (
+               "test_every_report_and_structure_key_is_documented",
+               "test_every_manifest_and_frontmatter_key_is_documented",
+               "test_every_emitted_warning_code_is_documented",
+               "test_the_decision_vocabulary_is_closed_in_both_directions",
+           )),
 ]
 
 DIMENSIONS = (
@@ -753,25 +1016,43 @@ DIMENSIONS = (
 )
 
 
+def _suite_verdict(row, observed):
+    # type: (Row, object) -> tuple
+    """(status, evidence) for one suite row, from what the runner observed.
+
+    ``observed`` is keyed by ROW ID, not by target, because two rows may name
+    different tests in the same file and must be able to disagree. It is either
+    ``None`` / absent ("not run"), a ``(status, evidence)`` pair from a runner
+    that watched the individual tests, or a bare bool — the old shorthand, kept
+    so a caller with nothing but an exit code can still be graded honestly.
+
+    An exit code is the weakest of the three: a pytest target whose tests were
+    ALL skipped exits 0, and this module's own rule is that a skip is never an A.
+    A runner that hands over a bool is asserting it knows better."""
+    if observed is None:
+        return (SKIP, "%s: %s was not run"
+                % (row.rid, " ".join(row.selector) or row.target))
+    if isinstance(observed, tuple) or isinstance(observed, list):
+        status, evidence = observed[0], observed[1]
+        return (status, evidence)
+    return (PASS if observed else FAIL,
+            "%s %s" % (row.target, "passed" if observed else "FAILED"))
+
+
 def grade(view):
     # type: (dict) -> list
     """Every rubric row, evaluated against ``view``.
 
     ``view`` carries ``bundles`` (each with report/structure/markdown/front/
     knowledge), ``manifest``, ``runs``, ``docs`` and ``suites`` — the last being
-    {target: bool|None} filled in by the runner, where None means "not run"."""
+    {row id: (status, evidence)|bool|None} filled in by the runner, where None
+    means "not run"."""
     results = []
     suites = view.get("suites") or {}
     for row in ROWS:
         if row.kind == "suite":
-            verdict = suites.get(row.target)
-            if verdict is None:
-                results.append(Result(row.dim, row.rid, row.condition, SKIP,
-                                      "%s was not run" % row.target))
-            else:
-                results.append(Result(
-                    row.dim, row.rid, row.condition, PASS if verdict else FAIL,
-                    "%s %s" % (row.target, "passed" if verdict else "FAILED")))
+            status, evidence = _suite_verdict(row, suites.get(row.rid))
+            results.append(Result(row.dim, row.rid, row.condition, status, evidence))
             continue
         try:
             status, evidence = row.check(view)

@@ -324,14 +324,22 @@ def main(argv=None):
                     help="do not write; exit 1 if the committed copy is stale")
     args = ap.parse_args(argv)
 
+    # encoding= on EVERY open: both the vocabulary and the generated reference hold
+    # non-ASCII prose (em dashes, the first at byte 9 of config/vocab.yaml), and a
+    # bare open() decodes with the LOCALE's preferred encoding. On a bare 3.6 host
+    # with no UTF-8 LANG — the exact environment the office lane is specified to run
+    # on — that is ANSI_X3.4-1968 and the read dies with UnicodeDecodeError. Do NOT
+    # "fix" this with errors="replace" or a binary read: --check compares the
+    # rendered text against the committed copy as str, so any lossy decode or
+    # newline translation would report STALE over a file that is current.
     path = args.vocab or vocab_path()
-    with open(path) as fh:
+    with open(path, encoding="utf-8") as fh:
         data = parse_block(fh.read())
     text = render(data)
 
     if args.check:
         try:
-            with open(args.out) as fh:
+            with open(args.out, encoding="utf-8") as fh:
                 current = fh.read()
         except IOError:
             print("MISSING %s — run scripts/render_vocab_doc.py" % args.out,
@@ -347,7 +355,7 @@ def main(argv=None):
     d = os.path.dirname(args.out)
     if d and not os.path.isdir(d):
         os.makedirs(d)
-    with open(args.out, "w") as fh:
+    with open(args.out, "w", encoding="utf-8") as fh:
         fh.write(text)
     print("wrote %s (%d fields, %d vocabularies)"
           % (args.out, len(FIELDS),

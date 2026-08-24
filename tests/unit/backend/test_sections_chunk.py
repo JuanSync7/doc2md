@@ -165,6 +165,32 @@ def test_is_heading_levels():
     assert is_heading("just a normal sentence that goes on for a while") == 0
 
 
+def test_the_length_bound_stops_the_heuristics_and_not_the_explicit_markup():
+    # The bound used to sit above every branch, so an ATX heading over 120 chars was
+    # rejected — deleting from the chunker's `heads` set a boundary the document had
+    # marked up itself, which merged two sections into one chunk.
+    long_title = ("Reset and Initialisation Sequence for the Kestrel Fabric Bridge, "
+                  "Including the Optional Retry Path and the Timeout Handling Rules")
+    assert len("## " + long_title) > 120
+    assert is_heading("## " + long_title) == 2
+    # ...while a run-on line with no markup is still evidence AGAINST a heading.
+    assert is_heading(long_title) == 0
+    assert is_heading("4.2 " + long_title) == 0
+
+
+def test_a_body_sentence_that_opens_with_a_number_is_not_a_heading():
+    # The third heuristic branch, bounded like the other two: a short paragraph
+    # opening with a numeral used to be published as a heading that reparented every
+    # section after it, with all three gates green.
+    assert is_heading("2024 replaced the manual failover script with the supervisor.") == 0
+    assert is_heading("3.3 V is the nominal supply for the IO ring.") == 0
+    assert is_heading("16 bytes are reserved at the head of every descriptor.") == 0
+    # ...and the real numbered labels the branch exists for still are.
+    assert is_heading("1.2 Reference documents") == 2
+    assert is_heading("2.1 The system context") == 2
+    assert is_heading("4 Verification plan") == 1
+
+
 # ------------------------------------------------- fenced code is not prose
 
 def test_fenced_lines_marks_the_delimiters_and_everything_between():

@@ -25,26 +25,40 @@ from collections import OrderedDict
 __all__ = ["code_identity", "host_identity", "git_commit", "package_version"]
 
 _VERSION = re.compile(r'^\s*version\s*=\s*["\']([^"\']+)["\']', re.M)
+_PROJECT = re.compile(r'^\[project\][ \t]*$', re.M)
 
 
 def package_version(root):
     # type: (str) -> str
-    """The distribution version from ``pyproject.toml``, or ``""``.
+    """The distribution version from ``pyproject.toml``'s ``[project]`` table, or ``""``.
 
     Hand-parsed: this module has to import on the bare 3.6 host, which has no
-    ``tomllib`` and no third-party TOML reader (same reason ``_config.py`` hand-parses)."""
+    ``tomllib`` and no third-party TOML reader (same reason ``_config.py`` hand-parses).
+
+    The table is LOCATED, not assumed to be first. The previous guard tested
+    ``text.startswith("[project]")``, which is false for every pyproject that opens
+    with a comment or ``[build-system]`` — including this repo's — so it never fired
+    and the first ``version =`` anywhere in the file won. A ``[tool.commitizen]`` or
+    ``[tool.poetry]`` table above ``[project]`` would have stamped ITS version into
+    every bundle's ``run.code.version`` and into the ``converter`` string the rubric
+    grades, which is exactly what "a dependency pin must never win" forbids.
+
+    A ``[project]`` table that states no version (PEP 621 ``dynamic``) yields ``""``,
+    not some other table's number: the whole-file fallback is for a project that has
+    no ``[project]`` table at all (a poetry layout), where the only version there is
+    is the one in ``[tool.poetry]``."""
     try:
-        with open(os.path.join(root, "pyproject.toml")) as fh:
+        with open(os.path.join(root, "pyproject.toml"), encoding="utf-8") as fh:
             text = fh.read()
     except (IOError, OSError):
         return ""
-    # Only the [project] table's version; a dependency pin must never win.
-    head = text.split("\n[", 1)[0] if text.startswith("[project]") else text
-    for chunk in (head, text):
-        m = _VERSION.search(chunk)
-        if m:
-            return m.group(1)
-    return ""
+    m = _PROJECT.search(text)
+    if m:
+        table = text[m.end():].split("\n[", 1)[0]
+        found = _VERSION.search(table)
+        return found.group(1) if found else ""
+    found = _VERSION.search(text)
+    return found.group(1) if found else ""
 
 
 def _resolve_ref(git_dir, ref):
@@ -52,12 +66,12 @@ def _resolve_ref(git_dir, ref):
     """A ref name -> its sha, via the loose ref file then packed-refs."""
     loose = os.path.join(git_dir, ref)
     try:
-        with open(loose) as fh:
+        with open(loose, encoding="utf-8") as fh:
             return fh.read().strip()
     except (IOError, OSError):
         pass
     try:
-        with open(os.path.join(git_dir, "packed-refs")) as fh:
+        with open(os.path.join(git_dir, "packed-refs"), encoding="utf-8") as fh:
             for line in fh:
                 line = line.strip()
                 if not line or line.startswith(("#", "^")):
@@ -79,7 +93,7 @@ def git_commit(root):
     git_dir = os.path.join(root, ".git")
     if os.path.isfile(git_dir):                      # a linked worktree
         try:
-            with open(git_dir) as fh:
+            with open(git_dir, encoding="utf-8") as fh:
                 line = fh.read().strip()
         except (IOError, OSError):
             return ""
@@ -91,7 +105,7 @@ def git_commit(root):
     if not os.path.isdir(git_dir):
         return ""
     try:
-        with open(os.path.join(git_dir, "HEAD")) as fh:
+        with open(os.path.join(git_dir, "HEAD"), encoding="utf-8") as fh:
             head = fh.read().strip()
     except (IOError, OSError):
         return ""

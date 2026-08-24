@@ -27,6 +27,7 @@ writes that is missing from this file fails CI.
   report.json      # what was measured — validator only, no model output
   knowledge.json   # the extracted graph payload — only once enrichment has run
   images/          # <sha16>.<ext>, byte-verified
+  *.stale          # withdrawn by a FAILED rebuild — see below; not published
 <out>/manifest.jsonl
 ```
 
@@ -35,6 +36,25 @@ Those two are the only join keys.
 
 **A failed document publishes `report.json` only** — no `document.md`. That is why
 run provenance has to live in the report as well as the front matter.
+
+**On a rebuild, that invariant is enforced by withdrawal, not by hope.** A failing
+conversion over a directory that already holds a good bundle **renames** the
+previous run's `document.md`, `structure.json`, `knowledge.json` and `images/` to
+`document.md.stale`, `structure.json.stale`, `knowledge.json.stale` and
+`images.stale/`, and prints a `WITHDRAWN` line. A `.stale` name is matched by no
+selector — `enrich_metadata.py` and `kb_lint.py` walk `document.md`,
+`caption_bundles` walks `structure.json` — so it is unpublished rather than
+published under another name, and a later successful build deletes it. Renamed and
+not deleted on purpose: when the failure is environmental (soffice missing, a
+truncated source copy) deleting would cost the only good copy of the bundle. So you
+will meet `document.md.stale` in a bundle directory, and it means "this bundle's
+last successful body, kept for recovery, not for reading".
+
+**Enrichment refuses a failed bundle.** `scripts/enrich_metadata.py` does not select
+a directory whose own `report.json` says `status: "failed"`; it prints a `REFUSED`
+line to stderr and — exactly like a directory with no `document.md` — gets **no
+`manifest.jsonl` row**. Only an explicit `failed` counts: an absent or unreadable
+report is not a verdict, and a `degraded` bundle is published and still enriched.
 
 ---
 
@@ -66,7 +86,7 @@ could grow two disjoint link graphs that each linted clean. From schema v3:
 
 | Key | Written from | Notes |
 |---|---|---|
-| `id` | the source path, slugified per segment (`specs/Kestrel Clock Spec.docx` → `specs/kestrel-clock-spec-1279fc5e`) | **THE identity.** Unique by construction: a path is unique within a corpus, so two documents cannot collide, and the value depends on nothing but that path — not on the corpus, the iteration order, or which neighbours were present. Slugification is lossy, so a path whose slug is not a faithful lowercase rendering of itself carries an 8-hex fingerprint of the exact path; slug-clean filenames keep a readable id. **Authored wins** — write one by hand and it survives a rename forever. |
+| `id` | the source path, slugified per segment, **extension included** (`specs/Kestrel Clock Spec.docx` → `specs/kestrel-clock-spec.docx-ed1c4542`) | **THE identity.** Unique by construction: a path is unique within a corpus, so two documents cannot collide, and the value depends on nothing but that path — not on the corpus, the iteration order, or which neighbours were present. **The extension is part of the identity** and keeps its dot: stripping it made `spec.docx`, `spec.pptx` and `spec.xlsx` — an ordinary trio in a real corpus — one id (P7.9). Slugification is lossy, so a path whose slug is not a faithful **character-for-character** rendering of itself carries an 8-hex fingerprint — `sha1` of the **exact** path, extension and all, first 8 hex — while slug-clean paths keep a readable id with no suffix (`specs/kestrel-clock-spec.docx` → itself). Faithfulness is compared before lowercasing, because on a case-sensitive filesystem `spec.docx` and `Spec.docx` are two files. **Authored wins** — write one by hand and it survives a rename forever. |
 | `uid` | `id` | A **deprecated alias**, recomputed every run so the two can never drift. Kept so a v2 consumer keeps resolving; it will go at the next schema bump. |
 | `slug` | the title | The title's URL form. **Not an identity** — nothing resolves against it, so two documents called "Overview" sharing a slug costs nothing. |
 | `source.uri` | `source_relpath` | A filesystem path. May contain spaces, `#`, `?` — **not** a URL. |
@@ -118,7 +138,7 @@ indexing the file directly must strip the front matter first.
 | `token_model` | str | The tokenizer behind every count, e.g. `cl100k_base` or `char-estimate/4`. |
 | `total_tokens` | int | Whole-document count under that tokenizer. |
 | `has_toc` | bool | A table-of-contents region was detected and skipped as furniture. |
-| `levels_inferred` | bool | `true` when `level` was read from the titles' section numbering because the extractor emitted **one** level for the whole document (docling always emits `##`). Fires only on ≥ 3 headings, all the same level, ≥ 60% of them numbered, at least one number actually nested, **and the numbers reading as a nested outline** — every number deeper than the document's shallowest one has to extend a number the document already stated. That last guard is what keeps an ordinary docx written with a single heading style out: `1.2` under `1` is an outline, `1.8` under `5` is a voltage, so five sibling power rails stay five siblings instead of being published as a two-level tree the source never asserted. Published because a reshaped tree must not be a silent one. |
+| `levels_inferred` | bool | `true` when `level` was read from the titles' section numbering because the extractor emitted **one** level for the whole document (docling always emits `##`). Fires only on ≥ 3 headings, all the same level, ≥ 60% of them numbered, at least one number actually nested, **and the numbers reading as a nested outline**. That last guard has two halves, and it needs both: (i) every number deeper than the document's shallowest one has to extend a number the document already stated, **and** (ii) every stated parent's children have to start at `1` (`0` is allowed, for `1.0 Introduction`); gaps are fine, so a spec whose `2.3` was deleted still reads `2.1, 2.2, 2.4` as an outline. Half (i) alone was an overclaim: an **ascending series states its own integer parts on the way up**, so `1 GB / 1.5 GB / 2 GB / 2.5 GB`, `2 mm / 2.5 mm / 3 mm / 3.5 mm` and `1 h / 2 h / 2.5 h / 4 h` all satisfied it and were reshaped into two-level trees. Half (ii) is what actually separates them: a numbering's first subsection is `x.1`, while a magnitude's fractional neighbour is whatever the quantity happens to be. Five sibling power rails (`3 V / 3.3 V / 5 V`) stay five siblings. Published because a reshaped tree must not be a silent one. |
 | `outline` | list | The heading tree; node shape below. Built from prose only: a line inside a fenced code block is a transcript, so a shell comment (`# reset the board`) never becomes a node — it used to, and the node's span then ran past the closing fence, publishing a section the document never had over a code block that no longer terminates. An unclosed fence runs to the end of the body, as CommonMark renders it. |
 
 ### Outline node
@@ -212,16 +232,21 @@ token gate trustworthy).
 |---|---|---|---|
 | `method` | str | always | `ooxml-structure-ground-truth` \| `unmeasured`. |
 | `gate` | str | always | `pass` \| `fail` \| `best-effort` \| `unmeasured`. **A hard fail on the office lane**: the markdown and the pixels are withheld, exactly as for a recall miss. Non-office lanes are coerced to `best-effort` for the same reason losslessness is — a PDF has no ground-truth semantic tree, so a match is agreement, not proof. |
-| `compared` | int | always | How many of the facts below the source actually supplied. `0` means nothing was graded, which is why the gate then reads `unmeasured` rather than `pass`. |
+| `compared` | int | always | How many of the facts below **observed something on this document** — evidence, not schema. A fact both sides read as absent-or-zero is not counted, because a number that cannot fall is not a measurement: a one-sentence memo reports `0` and a real office bundle reports around `9` of the fifteen, not `15`. `0` means nothing was graded, which is why the gate then reads `unmeasured` rather than `pass`. |
+| `unmeasured` | list | when a ground truth is present but partial | The names of facts the ground truth did not supply, so they were compared against nothing. Omitted entirely when there is no ground truth at all — `method` and `gate` already read `unmeasured` there. `gate: "pass"` answers only for what was measured, and this list is what makes "everything measured" auditable rather than a claim. |
 | `deltas` | list | always | Every disagreement, as `{fact, source, markdown}`. Empty on a pass. A gate that reported only pass/fail would teach nobody anything; this names what moved. |
 
-The compared facts are a **closed** list: `headings` (count by level),
-`list_items` (count by nesting depth), `ordered_items`, `bullet_items`,
-`ordered_numbers` (the number a renderer **prints** beside each ordered item, in
-order), `strong`, `em`, `strike`, `code_spans`, `code_blocks`, `links`, `tables`
-(rows × cols **and the content of every cell**), and `list_item_words` (the text of
-every list item, in order). Widening it is a deliberate edit with a test behind it,
-never a side effect of adding a field.
+The compared facts are a **closed** list of **fifteen**: `headings` (count by
+level), `heading_path` (the tokens of every heading title, with its level, in
+document order), `list_items` (count by nesting depth), `ordered_items`,
+`bullet_items`, `ordered_numbers` (the number a renderer **prints** beside each
+ordered item, in order), `strong`, `em`, `strike`, `code_spans`, `code_blocks`,
+`links`, `tables` (rows × cols **and the content of every cell**),
+`list_item_words` (the text of every list item, in order), and `thematic_breaks`
+(horizontal rules — a docx paragraph can never legitimately render as one, so any
+count above zero on the markdown side is a substitution). Widening it is a
+deliberate edit with a test behind it, never a side effect of adding a field; the
+executable list is `backend.validate._mdcheck._FIDELITY_FACTS`.
 
 The last three exist because counting is not enough, and that was demonstrated
 rather than assumed. Swap two values between rows of an escalation table, or swap
@@ -313,6 +338,12 @@ Codes: `lane_selected`, `preconvert`, `ocr_routed`, `body_source`,
 `captions_carried`, `skipped_existing`, `metadata_tier`, `vocabulary_selected`,
 `identity_namespace`, `permalink_base`.
 
+`lane_selected` is the conversion stage's and carries one `evidence` sub-key:
+
+| Code | `chose` | `evidence` | What it decided |
+|---|---|---|---|
+| `lane_selected` | `office` \| `pdf` \| `text` \| `legacy` | `ext` | Which converter read the document, and the lower-cased source extension it routed on (`scripts/build_bundle.py`, `scripts/build_pdf_bundle.py`). The lane decides which gates apply at all — the office lane hard-fails `structure_fidelity`, the PDF lane reports `best-effort` — so a bundle whose lane is unexplained cannot be told from one whose gate was never run. |
+
 The last four are the enrichment stage's, and each moves a field the rubric grades:
 
 | Code | `chose` | `evidence` | What it decided |
@@ -346,7 +377,7 @@ markup*, which is not a "before" any consumer would have shipped downstream.
 | `coverage.content_lines` | int | Non-blank body lines. |
 | `coverage.covered_lines` | int | Lines inside some outline node's span. |
 | `coverage.toc_lines` | int | Intentional table-of-contents furniture skip. |
-| `coverage.uncovered_lines` | int | Body lines the outline **lost**. |
+| `coverage.uncovered_lines` | int | Body lines the outline **lost**, counted two ways. A line outside every node's `line_span` is uncovered; **and** a line the body marks up as an ATX heading that no outline node *opens on* is uncovered even when an ancestor node's span contains it. The second half is what makes this number falsifiable at all: line coverage alone was `0` by construction for every possible input, because a dropped heading's lines are re-attributed to its ancestor, whose span already covers them. "Does a node open here?" is the one question an ancestor cannot backfill. Fenced lines and detected TOC furniture are excluded — the outline is right not to open a node on those — so `covered_lines + toc_lines` no longer necessarily equals `content_lines` on a damaged document. |
 | `coverage.ratio` | float | `(covered + toc) / content`. |
 | `coverage.gate` | str | `pass` \| `degraded`. Any uncovered line degrades `status` and adds an `outline_uncovered_content` warning. Never touches losslessness — the text is still whole. |
 
@@ -410,7 +441,7 @@ fallback and every hygiene event is **named, never silent**.
 | `tracked_changes_resolved` | office | `insertions`, `deletions`, `moves` | The source still carries revision marks. The **final** view is taken: insertions are live text, deletions are dropped, `w:moveFrom` is skipped as a stale copy. Correct, and previously silent — a reader had no way to know the document they were handed was still under revision. |
 | `decimalised_list_numbering` | office | `count`, `formats` | CommonMark has exactly one ordered marker, the decimal digit, so a list Word labels `A.` / `iii.` / `01.` can only be written `1.`, `2.`, `3.`. The **position** survives — prose saying "see step B" still lands on the second item — and the label does not. `formats` names the `w:numFmt` values involved. Does not degrade `status`. |
 | `lifted_text_boxes` | office | `count` | Text boxes anchored inside a **numbered step**. A box is always lifted out of its anchor paragraph (a pipe table cannot live inside a sentence); where the lifted content allows it, the converter re-indents it to the step's content column so the step stays whole, and where it does not — the box holds its own list, or a code paragraph whose fence must sit at column 0 — the box is emitted beside the list instead. Either way the reader is not looking at what Word drew, so the anchors are counted. The step numbering is unaffected: the counters survive a list being closed. |
-| `dropped_embedded_objects` | office | `parts` | Embedded OLE objects (`word/embeddings/*`) are not converted: an embedded document is a document, and this lane converts one file at a time. `--audit-parts` cannot see these either — it inspects only members ending in `.xml`. |
+| `dropped_embedded_objects` | office | `parts` | Embedded OLE objects (`word/embeddings/*`) are not converted: an embedded document is a document, and this lane converts one file at a time. `--audit-parts` cannot see these either — it inspects only members ending in `.xml`. Counted from the **effective** package, so this fires on the LibreOffice lane too: the member list is taken from the file the reader actually opened (the soffice-produced sibling for a legacy or ODF source), not from the pre-conversion source — which is an ODF package or a CFB binary and could never contain `word/embeddings/*`, so the check was dead on that whole lane. |
 | `empty_source` | both | `source_tokens` | The source carried no gradeable text, so `token_recall: 1.0` is vacuous rather than evidence. Without this code a zero-byte upload reported in exactly the vocabulary of a real conversion. |
 
 ---

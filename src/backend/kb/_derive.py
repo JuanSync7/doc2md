@@ -24,7 +24,12 @@ __all__ = ["slugify", "derive_uid", "word_count", "reading_time_minutes",
 WORDS_PER_MINUTE = 250
 
 _NON_SLUG = re.compile(r"[^a-z0-9]+")
-_NON_SLUG_U = re.compile(r"[^^\w]+", re.UNICODE)
+# ``\W``, NOT ``[^^\w]``. A ``^`` written after the leading negation of a character
+# class is a LITERAL member of it, so the old spelling read "not a caret and not a
+# word character" and carried carets straight through the unicode fallback into
+# ``slug`` (declared a url form) and into the readable uid. It also stopped an
+# all-symbol title from ever reaching the sha1 fallback below.
+_NON_SLUG_U = re.compile(r"\W+", re.UNICODE)
 _WORD = re.compile(r"[^\W\d_]+", re.UNICODE)
 
 
@@ -108,7 +113,30 @@ _ANCHOR_DROP = re.compile(r"[^\w\s\-]", re.UNICODE)
 # ``docs/reference/output-schema.md``); this is the copy that was wrong.
 _ANCHOR_RUN = re.compile(r"[\s\-]+", re.UNICODE)
 # CommonMark allows up to three leading spaces before the hashes.
-_HEADING = re.compile(r"^ {0,3}(#{1,6})[ \t]+(.+?)[ \t]*#*[ \t]*$", re.M)
+_HEADING = re.compile(r"^ {0,3}(#{1,6})[ \t]+(.+?)[ \t]*#*[ \t]*$")
+# A fence DELIMITER line. Deliberately the same shape the publishing layer uses
+# (``sections.fenced_lines``) and deliberately not an import of it: the two
+# implementations are separate on purpose (see ``heading_anchor``), so this one is
+# written out rather than borrowed — but it has to agree on every input, which means
+# copying the RULE, including its looseness. A run of three of either character
+# toggles the state; the delimiter lines are code themselves; an unclosed fence runs
+# to the end of the document, which is what CommonMark does with one.
+_FENCE_LINE = re.compile(r"^\s{0,3}(```|~~~)")
+
+
+def _fenced_lines(body_md):
+    # type: (str) -> set
+    """Line indices (0-based) the body renders as CODE rather than as prose."""
+    out = set()
+    in_fence = False
+    for i, line in enumerate((body_md or "").splitlines()):
+        if _FENCE_LINE.match(line):
+            out.add(i)
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            out.add(i)
+    return out
 
 
 def heading_anchor(heading_text):
@@ -144,10 +172,23 @@ def body_anchors(body_md):
     ``## Overview`` is addressable as ``overview-1``, the third as ``overview-2``.
     Returning only the bare anchor would report a perfectly valid ``#overview-1``
     reference as a dead link.
+
+    A FENCED BLOCK IS NOT PROSE. ``# Reset the fleet`` inside a shell transcript is a
+    comment, no renderer emits a fragment for it, and the layer that publishes anchors
+    (``sections.document_outline``) masks it. Scanning the raw body made this the
+    laxer of the two, so a ``ref`` to a fragment nothing publishes resolved here — and
+    worse, ``enrich_metadata`` hands this set to the model as "the only legal ``ref``
+    values", so the phantom was advertised before it was accepted.
     """
     out = set()
     seen = {}
-    for m in _HEADING.finditer(body_md or ""):
+    fenced = _fenced_lines(body_md)
+    for i, line in enumerate((body_md or "").splitlines()):
+        if i in fenced:
+            continue
+        m = _HEADING.match(line)
+        if not m:
+            continue
         base = heading_anchor(m.group(2))
         if not base:
             continue          # an anchor-less heading makes nothing addressable

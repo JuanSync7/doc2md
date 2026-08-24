@@ -55,6 +55,25 @@ def _build(tmp_path, name="o", extra=()):
     return str(src), str(out), os.path.join(d, "report.json")
 
 
+def _only_the_class_under_test(rr, report_path, monkeypatch):
+    """Silence the two `code` divergences that depend on the checkout, not the report.
+
+    A working copy is dirty while the suite runs from it, so every bundle built here
+    records `dirty: true` and every replay of one reports two divergences about the
+    checkout. They are correct — and they would mask the exit code of the class each
+    test below is actually about, which is the number those tests exist to pin. This
+    removes only that, and only from the recorded side; every other class is left to
+    answer for itself.
+    """
+    monkeypatch.setattr(rr, "_git_dirty", lambda: False)
+    with open(report_path, encoding="utf-8") as fh:
+        rep = json.load(fh)
+    for block in [rep.get("run") or {}] + list(rep.get("runs") or []):
+        (block.get("code") or {}).pop("dirty", None)
+    with open(report_path, "w", encoding="utf-8") as fh:
+        json.dump(rep, fh)
+
+
 def test_a_report_carries_everything_needed_to_repeat_the_run(tmp_path):
     src, out, report_path = _build(tmp_path)
     with open(report_path, encoding="utf-8") as fh:
@@ -135,8 +154,8 @@ def test_a_default_src_is_not_silently_replayed_from_the_environment(tmp_path,
     assert "--src" in cmd and cmd[cmd.index("--src") + 1] == str(elsewhere)
     assert "--out" in cmd and cmd[cmd.index("--out") + 1] == str(tmp_path / "r")
     # and pointing somewhere else is still called out, not just quietly obeyed
-    assert any(k == "source" and "different directory" in t
-               for k, t in rr.divergences(run, {}, str(elsewhere)))
+    assert any(n.kind == "source" and "different directory" in n.text
+               for n in rr.divergences(run, {}, str(elsewhere)))
 
 
 def test_an_edited_source_is_caught_although_the_directory_is_unchanged(tmp_path):
@@ -155,11 +174,11 @@ def test_an_edited_source_is_caught_although_the_directory_is_unchanged(tmp_path
     assert full.get("corpus_sha256")
 
     clean = rr.divergences(run, full, src, report, report_path)
-    assert not [k for k, _t in clean if k in ("source", "corpus")]
+    assert not [n for n in clean if n.kind in ("source", "corpus")]
 
     _docx(str(os.path.join(src, "spec.docx")), text="A completely different claim.")
     dirty = rr.divergences(run, full, src, report, report_path)
-    kinds = dict((k, t) for k, t in dirty)
+    kinds = dict((n.kind, n.text) for n in dirty if n.compared)
     assert "source" in kinds and "source_sha256" in kinds["source"]
     assert "corpus" in kinds and "no longer hash" in kinds["corpus"]
 
@@ -173,7 +192,8 @@ def test_a_missing_source_file_is_named_rather_than_read_as_unchanged(tmp_path):
     diffs = rr.divergences(report["run"],
                            rr._find_run_row(report, report_path), src, report,
                            report_path)
-    assert any(k == "source" and "not in the tree" in t for k, t in diffs)
+    assert any(n.kind == "source" and "not in the tree" in n.text
+               for n in diffs if n.compared)
 
 
 def test_a_different_external_tool_version_is_a_divergence(tmp_path, monkeypatch):
@@ -187,11 +207,13 @@ def test_a_different_external_tool_version_is_a_divergence(tmp_path, monkeypatch
     monkeypatch.setitem(rr._TOOL_PROBES, "soffice", lambda: "24.2.0.3")
     run = {"code": {}, "host": {}, "tools": {"soffice": "7.6.4.1"}}
     diffs = rr.divergences(run, {}, "")
-    assert any(k == "tools" and "7.6.4.1 -> 24.2.0.3" in t for k, t in diffs)
+    assert any(n.kind == "tools" and "7.6.4.1 -> 24.2.0.3" in n.text
+               for n in diffs if n.compared)
 
     monkeypatch.setitem(rr._TOOL_PROBES, "soffice", lambda: "")
     diffs = rr.divergences(run, {}, "")
-    assert any(k == "tools" and "not installed here" in t for k, t in diffs)
+    assert any(n.kind == "tools" and "not installed here" in n.text
+               for n in diffs if n.compared)
 
 
 def test_a_tool_this_machine_cannot_probe_is_unverified_not_unchanged(tmp_path):
@@ -200,7 +222,10 @@ def test_a_tool_this_machine_cannot_probe_is_unverified_not_unchanged(tmp_path):
     rr = _mod("replay_run")
     run = {"code": {}, "host": {}, "tools": {"docling": "docling 2.55.1"}}
     diffs = rr.divergences(run, {}, "")
-    assert any(k == "tools" and "UNVERIFIED" in t for k, t in diffs)
+    # ...and it is not counted as a divergence either: `compared` is False, so the
+    # exit code says "could not compare" rather than "this machine differs".
+    assert any(n.kind == "tools" and "UNVERIFIED" in n.text and not n.compared
+               for n in diffs)
 
 
 def test_an_environment_variable_that_was_merely_present_is_compared(tmp_path,
@@ -219,13 +244,13 @@ def test_an_environment_variable_that_was_merely_present_is_compared(tmp_path,
     full = rr._find_run_row(report, report_path)
     assert "DOC2MD_MIN_RECALL" in full["config"]["_env_present"]["value"]
     # It moved no value, so the config comparison stays silent about it...
-    assert not [t for k, t in rr.divergences(report["run"], full, "")
-                if k == "config" and "min_recall" in t]
+    assert not [n for n in rr.divergences(report["run"], full, "")
+                if n.kind == "config" and "min_recall" in n.text]
 
     monkeypatch.delenv("DOC2MD_MIN_RECALL")
     diffs = rr.divergences(report["run"], full, "")
-    assert any(k == "env" and "unset here" in t and "DOC2MD_MIN_RECALL" in t
-               for k, t in diffs)
+    assert any(n.kind == "env" and "unset here" in n.text
+               and "DOC2MD_MIN_RECALL" in n.text for n in diffs if n.compared)
 
 
 def test_a_metadata_run_is_replayable_too(tmp_path):
@@ -275,6 +300,181 @@ def test_the_same_run_id_on_two_stages_does_not_cross_the_run_rows(tmp_path):
     assert set(by_stage) == {"build_bundle", "enrich_metadata"}
     for name, run in by_stage.items():
         assert rr._find_run_row(report, report_path, run)["entrypoint"] == name
+
+
+def test_a_run_row_that_cannot_be_joined_is_unverified_not_an_all_clear(
+        tmp_path, monkeypatch, capsys):
+    """Three of the six classes are read from the `runs.jsonl` row, and it can be gone.
+
+    `build_bundle` appends that row only after the whole loop, so any interruption —
+    Ctrl-C, a scheduler's SIGTERM, an OOM kill — leaves every finished bundle
+    pointing at a row that is never written. Replaying one of those (the obvious move
+    when investigating a run that died) skipped the resolved config, the `DOC2MD_*`
+    presence and `corpus_sha256`, and then printed "no divergences: … same resolved
+    settings, same source bytes" and exited 0 — asserting two comparisons it had not
+    performed, with the threshold of the losslessness gate itself set to half.
+    """
+    src, out, report_path = _build(tmp_path)
+    rr = _mod("replay_run")
+    _only_the_class_under_test(rr, report_path, monkeypatch)
+    monkeypatch.setenv("DOC2MD_MIN_RECALL", "0.5")
+
+    # control: with the row, the setting that halves the gate is named, and rc is 3
+    assert rr.main(["--report", report_path, "--src", src,
+                    "--out", str(tmp_path / "r1")]) == 3
+    assert "min_recall" in capsys.readouterr().out
+
+    os.remove(os.path.join(out, "runs.jsonl"))
+    rc = rr.main(["--report", report_path, "--src", src, "--out", str(tmp_path / "r2")])
+    text = capsys.readouterr().out
+    assert rc == 4, "a comparison that did not happen is not an all-clear"
+    assert "UNVERIFIED" in text
+    # the verdict may not claim what it never checked...
+    assert "same resolved settings" not in text
+    assert "same corpus" not in text
+    # ...and it still claims what it did check
+    assert "same source bytes" in text
+
+    notes = rr.divergences(json.load(open(report_path, encoding="utf-8"))["run"],
+                           {}, src, None, report_path)
+    unverified = set(n.kind for n in notes if not n.compared)
+    assert {"config", "env", "corpus"} <= unverified
+
+
+def test_the_inspect_only_call_never_claims_bytes_it_did_not_hash(
+        tmp_path, monkeypatch, capsys):
+    """`--report R` with no `--src` is the advertised "what drifted?" invocation.
+
+    `_source_divergences` returns on its first line without opening a file, so the
+    two byte checks never ran — and the verdict said "same source bytes" and exited
+    0 over a corpus that had been rewritten underneath it.
+    """
+    src, out, report_path = _build(tmp_path)
+    rr = _mod("replay_run")
+    _only_the_class_under_test(rr, report_path, monkeypatch)
+    _docx(os.path.join(src, "spec.docx"), text="TOTALLY DIFFERENT CONTENT at 24 GHz.")
+
+    rc = rr.main(["--report", report_path])
+    text = capsys.readouterr().out
+    assert rc == 4 and "UNVERIFIED" in text
+    assert "same source bytes" not in text and "same corpus" not in text
+    assert "same resolved settings" in text        # that half really was compared
+
+    # ...and handing it the tree turns the same edit into a demonstrated divergence
+    assert rr.main(["--report", report_path, "--src", src,
+                    "--out", str(tmp_path / "r")]) == 3
+    assert "source_sha256" in capsys.readouterr().out
+
+
+def test_a_bundles_root_reports_the_bytes_unprobeable_rather_than_unchanged(
+        tmp_path, monkeypatch, capsys):
+    """The skip itself is correct and documented; claiming a comparison for it is not.
+
+    `enrich_metadata` reads `document.md` from the bundle root, so the source `.docx`
+    bytes genuinely cannot be re-hashed from what it was handed. The tool printed the
+    recorded `corpus` hash as a header — which reads as evidence — and then "same
+    source bytes", for a check that is structurally unreachable on this stage.
+    """
+    src, out, report_path = _build(tmp_path)
+    em = _mod("enrich_metadata")
+    assert em.main(["--bundles", out, "--run-id", "E1"]) in (0, 3)
+    rr = _mod("replay_run")
+    _only_the_class_under_test(rr, report_path, monkeypatch)
+
+    rc = rr.main(["--report", report_path, "--stage", "enrich_metadata", "--src", out])
+    text = capsys.readouterr().out
+    assert rc == 4
+    assert "same source bytes" not in text and "same corpus" not in text
+    assert "same resolved settings" in text
+    assert "(recorded)" in text          # the corpus header is not evidence
+
+
+def test_a_path_argument_that_cannot_be_reconstructed_names_its_switch(tmp_path):
+    # `redact_argv` emits the switch and its placeholder as two argv elements, so
+    # the refusal used to print a bare `<path:...>` and leave the operator guessing
+    # which of the recorded switches it was being asked to supply.
+    rr = _mod("replay_run")
+    run = {"entrypoint": "build_bundle",
+           "argv": ["--src", "<src>", "--vocab", "<path:deadbeef>", "--strict"]}
+    with pytest.raises(ValueError) as exc:
+        rr.command_for(run, str(tmp_path), str(tmp_path / "o"))
+    assert "--vocab" in str(exc.value)
+
+
+def test_compare_never_says_reproduced_over_two_documents_with_no_markdown(
+        tmp_path, monkeypatch, capsys):
+    """`REPRODUCED` was printed when both hashes were the empty string.
+
+    A FAILED document publishes `report.json` alone, with no `markdown_sha256`, so a
+    failure replayed as a failure compared `""` with `""` and announced that it had
+    reproduced the markdown that neither run produced — the strongest claim this
+    tool makes, over nothing at all — and exited 0.
+
+    `subprocess.call` is stubbed because the verdict under test is the COMPARISON,
+    not the conversion: what has to be pinned is what the tool says about two
+    reports, and building a genuinely failing document twice would only be a slower
+    way of putting the same two reports on disk.
+    """
+    src, out, report_path = _build(tmp_path)
+    rr = _mod("replay_run")
+    _only_the_class_under_test(rr, report_path, monkeypatch)
+    with open(report_path, encoding="utf-8") as fh:
+        rep = json.load(fh)
+    did = rep["doc_id"]
+    rep.pop("markdown_sha256")
+    with open(report_path, "w", encoding="utf-8") as fh:
+        json.dump(rep, fh)
+
+    replayed = tmp_path / "r" / did
+    os.makedirs(str(replayed))
+    with open(str(replayed / "report.json"), "w", encoding="utf-8") as fh:
+        json.dump({"doc_id": did, "status": "failed"}, fh)
+    monkeypatch.setattr(rr.subprocess, "call", lambda cmd: 0)
+
+    rc = rr.main(["--report", report_path, "--src", src, "--out", str(tmp_path / "r"),
+                  "--execute", "--compare"])
+    captured = capsys.readouterr()
+    assert "REPRODUCED" not in captured.out
+    assert rc == 4
+    assert "UNVERIFIED" in captured.err
+
+
+def test_compare_says_unverified_rather_than_different_when_one_side_has_no_hash(
+        tmp_path, monkeypatch, capsys):
+    """The other half: `DIFFERENT` also claims a comparison that did not happen.
+
+    "different" says two hashes were compared and disagreed. When the recorded run
+    published none at all there was nothing to disagree with, and the number printed
+    on the left of the arrow was an empty string.
+    """
+    src, out, report_path = _build(tmp_path)
+    with open(report_path, encoding="utf-8") as fh:
+        rep = json.load(fh)
+    rep.pop("markdown_sha256")                       # as a failed document publishes
+    with open(report_path, "w", encoding="utf-8") as fh:
+        json.dump(rep, fh)
+
+    rr = _mod("replay_run")
+    _only_the_class_under_test(rr, report_path, monkeypatch)
+    rc = rr.main(["--report", report_path, "--src", src, "--out", str(tmp_path / "r"),
+                  "--execute", "--compare"])
+    captured = capsys.readouterr()
+    assert rc == 4
+    assert "REPRODUCED" not in captured.out
+    assert "UNVERIFIED" in captured.err
+
+
+def test_compare_refuses_to_compare_a_bundle_with_itself(tmp_path, monkeypatch,
+                                                          capsys):
+    # `--out` pointed at the root being replayed makes the "replayed" report the
+    # same file on disk as the original, so the hashes match by construction.
+    src, out, report_path = _build(tmp_path)
+    rr = _mod("replay_run")
+    _only_the_class_under_test(rr, report_path, monkeypatch)
+    rc = rr.main(["--report", report_path, "--src", src, "--out", out,
+                  "--execute", "--compare"])
+    assert rc == 1
+    assert "with itself" in capsys.readouterr().err
 
 
 def test_a_report_without_run_provenance_says_so_rather_than_guessing(tmp_path):

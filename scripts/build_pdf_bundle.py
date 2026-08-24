@@ -265,6 +265,10 @@ def build_one(row, conv, ocr_conv, ocr_mode, out_root, run_id, cfg,
     except Exception as e:
         os.makedirs(doc_dir, exist_ok=True)
         err = "%s: %s" % (type(e).__name__, e)
+        # Same rule as the office lane: a conversion this run could not do must not
+        # leave the LAST one's bundle standing as if it were current, or the metadata
+        # pass republishes and `kb_lint` certifies a document that failed.
+        bb._announce_withdrawn(row, bb._withdraw_published(doc_dir))
         bb._write_json(os.path.join(doc_dir, "report.json"),
                        _failure_report(row, lane, err, warnings, run_id, run,
                                        decisions))
@@ -358,6 +362,7 @@ def build_one(row, conv, ocr_conv, ocr_mode, out_root, run_id, cfg,
 
     os.makedirs(doc_dir, exist_ok=True)
     if rep["status"] == "failed":
+        bb._announce_withdrawn(row, bb._withdraw_published(doc_dir))
         bb._write_json(os.path.join(doc_dir, "report.json"), rep)
         return {"doc_id": row["id"], "source_relpath": row["rel"], "lane": lane,
                 "status": "failed", "markdown_sha256": rep["markdown_sha256"],
@@ -413,6 +418,10 @@ def build_one(row, conv, ocr_conv, ocr_mode, out_root, run_id, cfg,
     bb._write_json(os.path.join(doc_dir, "report.json"), rep)
     bb._write_atomic(os.path.join(doc_dir, "document.md"), bundle["document_md"])
     bb._write_json(os.path.join(doc_dir, "structure.json"), bundle["structure"])
+    # Current again, so anything a previous failure withdrew is superseded rather
+    # than salvage — and a `document.md.stale` next to a fresh `document.md` invites
+    # somebody to read the wrong one.
+    bb._clear_withdrawn(doc_dir)
     return {"doc_id": row["id"], "source_relpath": row["rel"], "lane": lane,
             "status": rep["status"], "markdown_sha256": rep["markdown_sha256"],
             "error": ""}

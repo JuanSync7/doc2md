@@ -1,10 +1,15 @@
 # doc2md CI — three rings, cheapest first:
 #   1. tests-py36    unit+integration on bare Python 3.6 (the pipeline's real host
 #                    constraint: ingest/validate/bundle/sections must import + pass there)
-#   2. tests-modern  same suite on 3.12 (the PDF lane's interpreter generation)
+#   2. tests-modern  same suite on 3.12 (the PDF lane's interpreter generation),
+#                    plus the CommonMark differential, which needs a parser from PyPI
 #   3. eval-office   the synthetic-corpus eval (office/text/legacy lanes) with a real
-#                    LibreOffice — the regression gate over the fictional Kestrel docs
+#                    LibreOffice — the regression gate over the fictional Kestrel docs —
+#                    then the KB linter and the executable rubric over what it built
 # The PDF-lane eval (docling + torch, ~2 GB) runs nightly, not per-push: eval-pdf.
+# Every job carries timeout-minutes: this pipeline shells out to LibreOffice and to
+# docling, both of which can hang rather than fail, and a hung job is a job that
+# never reports.
 name: ci
 
 on:
@@ -26,36 +31,58 @@ jobs:
     # node20 runtime whose glibc floor old images may miss; this way no action ever
     # executes inside the 3.6 image, so the base image's age cannot break the job.
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       # pytest==6.2.5: last pytest generation supporting 3.6.
-      # test_coverage_flow's 2 broken tests reference scripts/coverage_report.py,
-      # which was never committed (pre-existing) — deselect until resolved.
+      # NOTHING else is installed here, deliberately: this ring is the offline
+      # bare-3.6 constraint, and a third-party import sneaking into src/backend
+      # must fail here. The md_structure CommonMark differential therefore SKIPS
+      # on this ring for the reason its skip message states (marko needs 3.8+);
+      # tests-modern is where that differential is mandatory, and asserts it ran.
       - name: Run suite on bare Python 3.6
         run: >
           docker run --rm -v "$PWD:/repo" -w /repo python:3.6-slim
           bash -ec "pip install -q 'pytest==6.2.5'
-          && python -m pytest tests/unit tests/integration -q
-          --deselect tests/integration/test_coverage_flow.py::test_coverage_report_summarize_and_dedup
-          --deselect tests/integration/test_coverage_flow.py::test_report_surfaces_figure_loss"
+          && python -m pytest tests/unit tests/integration -q"
 
   tests-modern:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install pytest
-      - run: >
-          python -m pytest tests/unit tests/integration -q
-          --deselect tests/integration/test_coverage_flow.py::test_coverage_report_summarize_and_dedup
-          --deselect tests/integration/test_coverage_flow.py::test_report_surfaces_figure_loss
+      # marko is the reference implementation the md_structure differential grades
+      # against — the same argument the losslessness gate makes with its
+      # converter-blind ground truth. PINNED: the 86 differential cases are graded
+      # against whatever the reference says, so an unpinned bump can turn CI red
+      # for reasons that have nothing to do with doc2md. Bump it deliberately.
+      - run: pip install pytest 'marko==2.2.3'
+      # A differential that skips reads exactly like a differential that passes.
+      # This ring is the one that installs the parser, so here a skip is a failure:
+      # assert the file reports none. Without this the parser could silently drop
+      # out of the install (or the import could break) and CI would stay green over
+      # 86 tests it never evaluated.
+      - name: The CommonMark differential must run here, not skip
+        shell: bash              # -o pipefail: tee must not mask a failed run
+        run: |
+          python -m pytest tests/unit/backend/test_validate_mdstructure.py -q -rs \
+            -p no:cacheprovider | tee md-oracle.txt
+          if grep -qi 'skipped' md-oracle.txt; then
+            echo "::error::the CommonMark differential SKIPPED on the ring that installs the parser"
+            exit 1
+          fi
+      - run: python -m pytest tests/unit tests/integration -q
 
   eval-office:
     # The regression gate: generate the Kestrel corpus, convert through the office +
     # text + legacy lanes, check every expectation. Nonzero exit fails the job.
+    # Also the home of the two corpus-level gates that need a real conversion and a
+    # real LibreOffice: scripts/kb_lint.py and scripts/grade_output.py.
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - name: Install LibreOffice (legacy/ODF lane)
@@ -64,6 +91,10 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends libreoffice
+      # The rubric answers its suite rows by running pytest files one at a time and
+      # reading the per-check outcomes, so this job needs pytest even though it is
+      # not a test ring.
+      - run: pip install pytest
       - name: Run eval (office + text lanes)
         shell: bash        # explicit bash => -o pipefail: tee must not mask a failed eval
         run: python3 evals/run_eval.py --skip-pdf | tee eval-office.txt
@@ -72,6 +103,39 @@ jobs:
         with:
           name: eval-office-report
           path: eval-office.txt
+      # The KB linter over the bundles the eval just wrote. Nonzero exit = a
+      # metadata container that lost its shape, a record nothing can check, a
+      # dangling ref, or a corpus-wide gate. It ran in no CI job at all before.
+      #
+      # The offline enrichment pass first, deliberately: the eval writes no
+      # knowledge sidecar, so linting its bundles straight away reports
+      # `graded=0 no-metadata=14` — exit 0 over nothing, which is the shape of
+      # gate this project exists to refuse. A no-model run fills the tier-0/1
+      # deterministic floor and exits 0 (pending fields are a fact, not a
+      # failure), which gives the linter 14 real documents to grade.
+      - name: Enrich the eval bundles offline, then lint them
+        shell: bash
+        run: |
+          python3 scripts/enrich_metadata.py --bundles data/eval_bundles --run-id ci
+          python3 scripts/kb_lint.py --bundles data/eval_bundles | tee kb-lint.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: kb-lint-report
+          path: kb-lint.txt
+      # The executable rubric (docs/quality-plan.md's A–E table). It exits 0 only on
+      # an overall A, so the grade cannot slide from A to D with every other check
+      # green — which is exactly what could happen while this ran nowhere. --json
+      # puts the whole row-by-row verdict on stdout (progress goes to stderr), so
+      # the log and the uploaded artifact are the same bytes.
+      - name: Grade the output against the rubric
+        shell: bash        # -o pipefail: tee must not mask a non-A grade
+        run: python3 scripts/grade_output.py --json | tee grade-output.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: grade-output
+          path: grade-output.json
 
   eval-pdf:
     # Heavy ring: docling + torch. Nightly + manual only — not per-push.

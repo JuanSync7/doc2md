@@ -401,3 +401,183 @@ def test_a_flat_extractor_that_starts_below_the_top_level_is_still_inferred():
     out = document_outline(text)
     assert out["levels_inferred"] is True
     assert [n["title"] for n in out["outline"]] == ["1.1", "1.2"]
+
+
+# ------------------------- an ascending measurement series (blocker 4f / idx 29)
+#
+# Prefix existence alone is not the property a section numbering has. It rejects the
+# rail list above only because `1` and `3` are never stated there — and an ASCENDING
+# series states its own integer parts on the way up, so each of these came out as a
+# two-level tree with fabricated `parent` pointers and rolled-up `subtree_tokens`,
+# an assertion the source never made. document.md is untouched by the reshape and
+# `structure_fidelity` grades document.md, so the second hard gate cannot see it.
+MEASUREMENT_SERIES = [
+    # capacity / price tiers: 1.5 is not a subsection of 1
+    "## 1 GB tier\nfor hobby projects\n## 1.5 GB tier\nfor small teams\n"
+    "## 2 GB tier\nfor growing teams\n## 2.5 GB tier\nfor large teams\n",
+    # fastener sizes, on the office one-heading-style shape
+    "# 2 mm screw\npan head\n# 2.5 mm screw\ncap head\n"
+    "# 3 mm screw\nhex head\n# 3.5 mm screw\ncountersunk\n",
+    # SLA response windows
+    "## 1 hour response\ngold\n## 2 hour response\nsilver\n"
+    "## 2.5 hour response\nbronze\n## 4 hour response\nbest effort\n",
+    # a 3 V coin cell beside a 3.3 V logic rail
+    "## 3 V rail\ncoin cell\n## 3.3 V rail\nlogic\n## 5 V rail\nfans\n",
+]
+
+
+@pytest.mark.parametrize("text", MEASUREMENT_SERIES)
+def test_an_ascending_measurement_series_is_not_a_hierarchy(text):
+    out = document_outline(text)
+    assert out["levels_inferred"] is False
+    assert all(not n["children"] for n in out["outline"])
+    # every heading is still its own top-level node — nothing adopted, nothing lost
+    assert len(out["outline"]) == text.count("\n#")+ 1
+
+
+def test_a_numbering_is_believed_only_when_its_children_start_at_one():
+    # The discriminator, directly. `1` then `1.1` is a numbering; `1` then only
+    # `1.5` is an interval. Gaps stay believable (a spec whose 2.3 was deleted),
+    # and `1.0 Introduction` is a real convention, so 0 counts as "starts at one".
+    from backend.sections._outline import _is_nested_outline
+    assert _is_nested_outline(["1", "1.1", "2", "2.1"]) is True
+    assert _is_nested_outline(["2", "2.1", "2.2", "2.4"]) is True    # a deleted 2.3
+    assert _is_nested_outline(["1", "1.0", "1.1"]) is True           # "1.0 Introduction"
+    assert _is_nested_outline(["1", "1.5", "2", "2.5"]) is False     # GB tiers
+    assert _is_nested_outline(["2", "2.5", "3", "3.5"]) is False     # mm fasteners
+    assert _is_nested_outline(["1", "2", "2.5", "4"]) is False       # SLA hours
+    assert _is_nested_outline(["3", "3.3", "5"]) is False            # V rails
+    # ...and what the tighter rule costs, stated rather than hidden: a document whose
+    # `1.1` heading the extractor missed leaves `1.2` as `1`'s only stated child and
+    # is no longer reshaped. Staying as flat as the extractor said is the safe error.
+    assert _is_nested_outline(["1", "1.2", "2"]) is False
+
+
+# ------------------------- the numbered branch is bounded (blocker 4g / idx 5)
+#
+# The third of `is_heading`'s heuristic branches, and the one left unbounded: any
+# short line opening with a digit run, a space and a letter became a heading that
+# REPARENTED every section after it, publishing an anchor for a fragment no heading
+# in document.md makes addressable — with recall, structure_fidelity and coverage all
+# green, because every word is still present and only the shape is wrong.
+NUMBERED_NOT_HEADINGS = [
+    "2024 replaced the manual failover script with the supervisor.",
+    "3.3 V is the nominal supply for the IO ring.",
+    "100 MHz.",
+    "10 GbE uplinks connect the top-of-rack switches to the spine.",
+    "2 engineers reviewed the change before it merged.",
+    "16 bytes are reserved at the head of every descriptor.",
+    "5 minutes after boot the watchdog is armed.",
+    "5 V tolerance is guaranteed.",
+    "8 GB DDR4 is fitted on the module.",
+    # ...and the same sentences with the full stop taken away, so the bound cannot
+    # be resting on terminal punctuation alone.
+    "2024 replaced the manual failover script with the supervisor",
+    "10 GbE uplinks connect the top-of-rack switches to the spine",
+    "5 V tolerance is guaranteed",
+    "3.3 V is the nominal supply for the IO ring",
+]
+
+# The reason the branch exists: a numbered section LABEL in un-marked-up native text.
+NUMBERED_HEADINGS = [
+    ("1 Introduction", 1),
+    ("1.2 Reference documents", 2),
+    ("2.1 The system context", 2),          # THE is deliberately not a verbal word
+    ("1.2.3 Something Here", 3),
+    ("2.1.1.1 Timing budget", 4),
+    ("4 Verification plan", 1),
+    ("1 SCOPE", 1),
+    ("3 Register map", 1),
+]
+
+
+@pytest.mark.parametrize("line", NUMBERED_NOT_HEADINGS)
+def test_a_numbered_body_sentence_is_not_a_heading(line):
+    assert is_heading(line) == 0
+
+
+@pytest.mark.parametrize("line,level", NUMBERED_HEADINGS)
+def test_a_numbered_label_is_still_a_heading(line, level):
+    assert is_heading(line) == level
+
+
+def test_the_numbered_sentence_does_not_reparent_the_document():
+    """The harm, end to end: the sentence became a LEVEL-1 root and `## Rollback`
+    was published as its child instead of a sibling of `## Failover`."""
+    text = ("# Kestrel Runbook\n"
+            "\n"
+            "## Failover\n"
+            "\n"
+            "2024 replaced the manual failover script with the supervisor.\n"
+            "Call the on-call lead before starting.\n"
+            "\n"
+            "## Rollback\n"
+            "\n"
+            "Restore the previous image and reboot.\n")
+    out = document_outline(text)
+    assert [n["title"] for n in out["outline"]] == ["Kestrel Runbook"]
+    assert [c["title"] for c in out["outline"][0]["children"]] == ["Failover",
+                                                                   "Rollback"]
+    # ...and no anchor is published for a fragment the rendered document has no
+    # heading for (quality-plan C3 grades exactly this).
+    anchors = [n["anchor"] for n in out["outline"][0]["children"]]
+    assert anchors == ["failover", "rollback"]
+
+
+def test_what_the_numbered_bound_still_lets_through():
+    # Honest about the residue in both directions, exactly as the keyword branch is.
+    # A bare capitalised measurement has no verb and no stop, and nothing in its
+    # SHAPE separates it from the real heading "5 V rail"...
+    assert is_heading("100 MHz") == 1
+    assert is_heading("8 GB DDR4") == 1
+    # ...and a genuine heading written in lower case after its number is now missed,
+    # as is one whose title runs past the keyword branch's eight-word title budget.
+    assert is_heading("4.2 reset sequence") == 0
+    assert is_heading("6.3 Requirements for the Detection of Open Faults") == 2
+    wordy = "6.3 Detection of Open Circuit Faults in the Redundant Power Path"
+    assert len(wordy) < 80                       # not the char bound: the word budget
+    assert is_heading(wordy) == 0
+    # That second loss is confined to UN-MARKED-UP text: once the converter marks the
+    # same heading up, the ATX branch answers first and carries no bound at all.
+    assert is_heading("## " + wordy) == 2
+
+
+# ------------------- an explicitly marked-up heading has no length bound (idx 6)
+
+LONG_TITLE = ("Reset and Initialisation Sequence for the Kestrel Fabric Bridge, "
+              "Including the Optional Retry Path and the Timeout Handling Rules")
+
+
+def test_an_atx_heading_is_recognised_at_any_length():
+    # `len(s) > 120: return 0` sat ABOVE the ATX branch, so a heading the document
+    # marked up ITSELF was silently deleted from structure.json. A `##` marker is
+    # unambiguous evidence at any length; the bound belongs on the heuristics only.
+    assert len("## " + LONG_TITLE) > 120
+    assert is_heading("## " + LONG_TITLE) == 2
+    assert is_heading("# " + LONG_TITLE) == 1
+    # the bound still guards the un-marked-up branches
+    assert is_heading(LONG_TITLE) == 0
+    assert is_heading("4.2 " + LONG_TITLE) == 0
+
+
+def test_a_long_heading_is_a_node_and_does_not_donate_its_body_to_its_sibling():
+    # Not merely "the node vanished": the dropped heading's whole section was
+    # re-attributed to the PRECEDING node, whose fingerprint, tables, images and
+    # links then described content that was not its own.
+    text = ("# Kestrel Databook\n"
+            "intro prose\n"
+            "## %s\n"
+            "The bridge asserts nreset for eight cycles.\n"
+            "## Clocking\n"
+            "The reference clock runs at one hundred megahertz.\n" % LONG_TITLE)
+    out = document_outline(text)
+    top = out["outline"][0]
+    assert [c["title"] for c in top["children"]] == [LONG_TITLE, "Clocking"]
+    # the parent owns its own two lines and nothing after them
+    assert top["line_span"][0] == 0
+    assert top["self_tokens"] == document_outline(
+        "# Kestrel Databook\nintro prose\n")["outline"][0]["self_tokens"]
+    # ...and the title is published VERBATIM, so its anchor is a fragment a renderer
+    # really emits (a `[:120]` clip would advertise the slug of a truncated title).
+    assert top["children"][0]["title"] == LONG_TITLE
+    assert top["children"][0]["anchor"].endswith("the-timeout-handling-rules")

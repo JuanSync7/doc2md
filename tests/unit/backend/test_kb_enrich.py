@@ -8,7 +8,8 @@ import copy
 from collections import OrderedDict
 
 import pytest
-from backend.kb import (FIELDS, PROVENANCE_KEY, SOURCE_AUTHORED, SOURCE_DERIVED,
+from backend.kb import (EVIDENCE_KEY, FIELDS, PROVENANCE_KEY, SOURCE_AUTHORED,
+                        SOURCE_DERIVED,
                         SOURCE_EXTRACTED, SOURCE_GENERATED, UNKNOWN,
                         abstract_floor, accept_model_meta, field_names,
                         harvested_links, is_authored, load_vocab, meta_coverage,
@@ -800,3 +801,182 @@ def test_the_spec_tells_the_model_the_shape_of_a_record_not_only_its_enums(vocab
     assert spec["relations"]["required_keys"] == ["s", "p", "o", "ref"]
     assert "#anchor" in spec["relations"]["ref"]
     assert spec["links"]["required_keys"] == ["url", "ref"]
+
+
+# ------------------------------------------- the anchor a harvested link cites
+
+def test_a_link_under_a_repeated_heading_cites_the_section_it_actually_sits_in():
+    """Two `## Overview` sections is the ordinary shape of a spec, not an edge case.
+
+    `harvested_links` used to re-derive the anchor from the node TITLE, so every
+    link under the second occurrence was filed against the FIRST one. Nothing
+    downstream could see it: the cited anchor exists, so `kb_lint`'s ref check
+    resolves it clean and rubric row D5 — "every knowledge record cites the section
+    that asserts it" — passed over a record citing a section that does not contain
+    it. The outline already publishes the disambiguated anchor; this reads it.
+    """
+    from backend.sections import document_outline
+    from backend.kb import body_anchors
+
+    body = ("Intro prose, above any heading, citing "
+            "[the vendor sheet](https://vendor.invalid/sheet).\n\n"
+            "# Clock Domain Crossing\n\n## Overview\n\n"
+            "See the [synchroniser note](https://a.invalid/sync).\n\n"
+            "# Reset Sequencing\n\n## Overview\n\n"
+            "See the [reset app note](https://b.invalid/reset).\n")
+    outline = document_outline(body)["outline"]
+    anchors = body_anchors(body)
+    assert "overview-1" in anchors            # the producer disambiguates
+
+    links = harvested_links(outline, anchors)
+    by_url = dict((r["url"], r) for recs in links.values() for r in recs)
+    assert by_url["https://a.invalid/sync"]["ref"] == "#overview"
+    assert by_url["https://b.invalid/reset"]["ref"] == "#overview-1"
+    # ...and the lede link keeps NO ref (quality-plan P7.10): the preamble node's
+    # anchor is not one the body publishes, so a fragment there would be dead.
+    assert "ref" not in by_url["https://vendor.invalid/sheet"]
+    assert by_url["https://vendor.invalid/sheet"]["line"] == 0
+
+
+def test_an_outline_that_publishes_no_anchor_still_gets_one_from_its_title():
+    # The fallback has to stay: a hand-written or older outline carries only
+    # title/level/line_span, and losing every ref for it would be a worse bug than
+    # the one being fixed.
+    assert harvested_links(OUTLINE, ANCHORS)["ecosystem"][0]["ref"] == "#1-scope"
+    node = [{"title": "1. Scope", "anchor": "  ", "line_span": [0, 8],
+             "links": [{"text": "wiki", "url": "https://x.example/w", "line": 3}]}]
+    assert harvested_links(node, ANCHORS)["ecosystem"][0]["ref"] == "#1-scope"
+
+
+# ------------------------------- revalidation must not delete a MEASURED record
+
+def test_a_vocabulary_bump_re_checks_a_guess_and_never_deletes_a_measurement(gvocab):
+    """`revalidate_generated` piped the whole `links` block through the rules
+    written for a MODEL's answer, `_GROUP_REQUIRED["links"] = ("url", "ref")`
+    included. A harvested URL in the lede legitimately has no `ref` — there is no
+    fragment above the first heading to point at (quality-plan P7.10) — so every
+    run deleted a recall-1.0 edge and logged `missing-required-ref` against the
+    schema's own intent, while `apply_floor` re-harvested it: a corpus that can
+    never converge, and permanent loss the moment `structure.json` is unreadable.
+    """
+    harvested = OrderedDict([
+        ("ecosystem", [OrderedDict([("title", "vendor timing note"),
+                                    ("url", "https://vendor.invalid/timing"),
+                                    ("line", 0),
+                                    (EVIDENCE_KEY, SOURCE_EXTRACTED)])])])
+    block = OrderedDict(harvested)
+    block["internal"] = [OrderedDict([("url", "runbook.md"), ("ref", "#rollback")])]
+    meta = OrderedDict([
+        ("links", block),
+        (PROVENANCE_KEY, OrderedDict([
+            ("links", {"source": SOURCE_GENERATED,
+                       "value_sha": value_sha(block)})])),
+    ])
+
+    out, moved = revalidate_generated(meta, gvocab)
+
+    urls = [r["url"] for recs in out["links"].values() for r in recs]
+    assert "https://vendor.invalid/timing" in urls      # the measurement survives
+    assert "runbook.md" in urls
+    assert moved == []                                  # and nothing was reported
+    # the fingerprint still describes what is stored, or the next run reads the
+    # block as hand-edited and freezes it forever
+    assert is_authored(out[PROVENANCE_KEY]["links"], out["links"]) is False
+
+
+def test_a_model_proposed_link_with_no_ref_is_still_dropped_on_revalidation(gvocab):
+    # The other direction, and the one that must not be loosened: a PROPOSAL gets
+    # no latitude. Only a record that says it is evidence is exempt.
+    block = OrderedDict([("internal", [OrderedDict([("url", "guess.md")])])])
+    meta = OrderedDict([
+        ("links", block),
+        (PROVENANCE_KEY, OrderedDict([
+            ("links", {"source": SOURCE_GENERATED,
+                       "value_sha": value_sha(block)})])),
+    ])
+    out, moved = revalidate_generated(meta, gvocab)
+    assert "links" not in out                            # nothing survived
+    assert [m[2] for m in moved] == ["missing-required-ref"]
+
+
+def test_a_model_may_not_label_its_own_guess_as_evidence(gvocab):
+    # `source: extracted` is what buys a record its exemptions. Only the harvester
+    # writes it; a model that emitted the word would launder a guess into a
+    # measurement — permanently, since evidence is never re-judged.
+    out = accept_model_meta({"links": {
+        "internal": [{"url": "guess.md", "ref": "#rollback",
+                      EVIDENCE_KEY: SOURCE_EXTRACTED}]}},
+        gvocab, anchors=ANCHORS)
+    kept = out["accepted"]["links"]["internal"][0]
+    assert kept["url"] == "guess.md"                     # the record survives
+    assert record_source(kept) == ""                     # the claim does not
+    assert out["provenance"]["links"]["source"] == SOURCE_GENERATED
+
+
+# ----------------------------- coverage sees the terms inside groups and records
+
+VOCAB_COVERAGE = VOCAB_GROUPS + """
+impact:
+  governance: closed
+  values: [high, low]
+"""
+
+
+@pytest.fixture
+def cvocab():
+    return load_vocab(text=VOCAB_COVERAGE)
+
+
+HEALTHY_KNOWLEDGE = {
+    "entities": {"hosts": [{"name": "db-1", "ref": "#a"}],
+                 "identifiers": {"gpg": "ABC123"}},
+    "relations": [{"s": "a", "p": "runs_on", "o": "b", "ref": "#a"}],
+    "decisions": [{"status": "accepted", "ref": "#a"}],
+    "risks": [{"impact": "high", "mode": "silent", "ref": "#a"}],
+    "open_questions": [{"ref": "#a"}],
+    "links": {"ecosystem": [{"url": "https://x.example/w", "ref": "#a"}]},
+}
+
+
+@pytest.mark.parametrize("field_name,broken", [
+    ("entities", {"hosts": [{"name": "h1", "type": "TotallyMadeUp", "ref": "#a"}]}),
+    ("relations", [{"s": "a", "p": "NOT_A_PREDICATE", "o": "b", "ref": "#a"}]),
+    ("decisions", [{"status": "NOT_A_STATUS", "ref": "#a"}]),
+    ("risks", [{"impact": "NOT_AN_IMPACT", "ref": "#a"}]),
+    ("risks", [{"impact": "high", "mode": "NOT_A_MODE", "ref": "#a"}]),
+    ("links", {"not_a_category": [{"url": "x", "ref": "#a"}]}),
+])
+def test_an_off_vocabulary_term_inside_a_group_or_a_record_counts_invalid(
+        cvocab, field_name, broken):
+    """The gate's own contract is that `invalid` prevents `complete` — "a value
+    outside the closed vocabulary is worse than an absent one".
+
+    For a `groups` or `records` field the declared vocabulary governs a MEMBER key,
+    not the field's own value, and the membership test only knew the scalar shape:
+    it ran over an empty list of values and passed vacuously, so `invalid` was
+    structurally pinned at 0 for the five fields where the closed vocabularies
+    actually live. `kb_lint` reported the same terms as ERRORs the whole time.
+    """
+    healthy = meta_coverage(dict(HEALTHY_KNOWLEDGE), cvocab)
+    assert healthy["invalid"] == 0                      # the ordinary payload passes
+
+    meta = dict(HEALTHY_KNOWLEDGE)
+    meta[field_name] = broken
+    counts = meta_coverage(meta, cvocab)
+    assert counts["invalid"] == 1, "%s is graded, not waved through" % field_name
+    assert counts["filled"] == healthy["filled"] - 1
+    assert counts["filled"] + counts["invalid"] + counts["pending"] == \
+        counts["expected"]
+
+
+def test_coverage_counts_a_member_that_declares_no_type_as_a_gap_not_an_error(cvocab):
+    # Absent is PENDING, never invalid — an untyped member of a known group takes
+    # the group's implied type, and one that has no type at all is a gap. Grading
+    # a gap as invalid would flip well-formed documents to a false failure, which
+    # is worse than the miss being fixed.
+    meta = dict(HEALTHY_KNOWLEDGE)
+    meta["entities"] = {"hosts": [{"name": "db-1", "ref": "#a"}],       # implied Host
+                        "gadgets": [{"name": "thing", "ref": "#a"}]}    # no type
+    assert meta_coverage(meta, cvocab)["invalid"] == 0
+    meta["relations"] = [{"s": "a", "p": "runs_on", "o": "b", "ref": "#a"}]  # no mode
+    assert meta_coverage(meta, cvocab)["invalid"] == 0

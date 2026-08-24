@@ -924,3 +924,176 @@ def test_a_hand_edited_value_survives_even_under_a_machine_stamp(tmp_path):
     assert '\n  id: "%s"' % picked in after, (
         "the hand-picked id was reverted; the documented remedy for a collision "
         "is only a remedy if it survives the next run")
+
+
+def test_the_second_change_to_a_derived_field_is_not_silently_discarded(tmp_path):
+    """Adopt a namespace, then correct it — and the correction has to land.
+
+    A deterministic field used to be provenance-stamped only when it had NO prior
+    entry, so the first legitimate change left `value_sha` describing the OLD
+    value. From the next run on, `is_authored` read that mismatch as a human edit
+    and inherited the machine's own stale value: the field froze forever while
+    still claiming `source: derived`, `report.json` recorded the NEW namespace in
+    its decisions, and the manifest row said `unchanged`. Exit 0 throughout.
+    """
+    from backend.kb import value_sha
+
+    em = _mod("enrich_metadata")
+    root, d = _bundles(tmp_path)
+
+    def enrich(run_id, ns, base):
+        argv = ["--bundles", root, "--run-id", run_id]
+        if ns:
+            argv += ["--namespace", ns]
+        if base:
+            argv += ["--source-base-url", base]
+        assert em.main(argv) == 0
+        front = split_front_matter(_read(d))[0][META_KEY]
+        # the fingerprint must describe what is STORED, on every run — that is the
+        # whole point of recording one
+        assert front[PROVENANCE_KEY]["id"]["value_sha"] == value_sha(front["id"])
+        assert front[PROVENANCE_KEY]["id"]["source"] == "derived"
+        return front
+
+    enrich("R1", "", "")
+    front = enrich("R2", "acme", "https://wiki.example.com/docs")
+    assert front["id"] == "acme/specs/aaa.docx"
+
+    front = enrich("R3", "beta", "https://intranet.example.com/d")
+    assert front["id"] == front["uid"] == "beta/specs/aaa.docx", (
+        "the corrected namespace was discarded and the machine's own earlier value "
+        "was inherited as if a person had written it")
+    assert front["source"]["url"] == \
+        "https://intranet.example.com/d/specs/aaa.docx"
+
+    # ...and a run that asks for the same thing again still converges: the
+    # fingerprint is a function of the value, so re-stamping costs nothing.
+    before = _read(d)
+    front = enrich("R4", "beta", "https://intranet.example.com/d")
+    assert front["id"] == "beta/specs/aaa.docx"
+    assert _read(d) == before
+    assert [r["action"] for r in _manifest(root) if r["stage"] == "enrich_metadata"] \
+        == ["enriched", "enriched", "enriched", "unchanged"]
+
+
+def test_a_hand_corrected_derived_field_survives_every_later_run(tmp_path):
+    """The opposite pull, and both have to hold at once.
+
+    The re-fingerprinting above must not become a licence to overwrite: a value a
+    person corrected under a machine stamp is still a person's value, and the run
+    after it must not read its own fresh fingerprint as permission to revert.
+    """
+    import re
+
+    em = _mod("enrich_metadata")
+    root, d = _bundles(tmp_path)
+    assert em.main(["--bundles", root, "--run-id", "R1"]) == 0
+
+    md_path = os.path.join(d, "document.md")
+    with open(md_path, encoding="utf-8") as fh:
+        before = fh.read()
+    picked = "kestrel-hand-picked-identity"
+    with open(md_path, "w", encoding="utf-8") as fh:
+        fh.write(re.sub(r'\n  id: "[^"]*"', '\n  id: "%s"' % picked, before, count=1))
+
+    # three more runs, one of them changing the very switch that derives `id`
+    for run_id, extra in (("R2", []), ("R3", ["--namespace", "acme"]),
+                          ("R4", ["--namespace", "acme"])):
+        assert em.main(["--bundles", root, "--run-id", run_id] + extra) == 0
+        front = split_front_matter(_read(d))[0][META_KEY]
+        assert front["id"] == picked, "run %s reverted a hand-corrected id" % run_id
+        # and the block now says what it is, rather than crediting a person's value
+        # to a rule that no longer produces it
+        assert front[PROVENANCE_KEY]["id"]["source"] == "authored"
+
+
+def test_a_bundle_whose_conversion_failed_is_refused_rather_than_published(tmp_path):
+    """Enrichment selected bundles on `document.md` existing and nothing else.
+
+    So a bundle a failed rebuild had left standing — stale body, `lossless: "true"`,
+    a report reading `status: failed` — was enriched: a fresh `knowledge.json`
+    minted for the stale body and a `doc_meta` gate stamped into the failed report,
+    exit 0. It read that very `status` out of the same file to fill a manifest
+    column, so the verdict was read, recorded, and not used as a gate.
+    """
+    em = _mod("enrich_metadata")
+    root, d = _bundles(tmp_path)
+    with open(os.path.join(d, "report.json"), encoding="utf-8") as fh:
+        rep = json.load(fh)
+    rep["status"] = "failed"
+    rep["losslessness"] = {"gate": "fail", "error": "unreadable-zip"}
+    with open(os.path.join(d, "report.json"), "w", encoding="utf-8") as fh:
+        json.dump(rep, fh)
+
+    before = _read(d)
+    assert em.main(["--bundles", root, "--run-id", "E1"]) == 0
+
+    assert _read(d) == before, "a failed bundle's document.md was rewritten"
+    assert _knowledge(d) is None, (
+        "a knowledge.json was minted for a body the pipeline could not convert")
+    after = _report(d)
+    assert "doc_meta" not in after, (
+        "a metadata gate was stamped into a report that says the conversion failed")
+    assert after["status"] == "failed"
+    assert not [r for r in _manifest(root) if r["stage"] == "enrich_metadata"]
+
+
+def test_a_degraded_or_unreported_bundle_is_still_enriched(tmp_path):
+    # The refusal has to be exactly as wide as the verdict. `degraded` is a
+    # published bundle, and a root with no report.json at all is not a failure —
+    # "I don't know" must not read as "it failed", or every hand-made bundle root
+    # stops being enrichable.
+    em = _mod("enrich_metadata")
+    root, d = _bundles(tmp_path)
+    with open(os.path.join(d, "report.json"), encoding="utf-8") as fh:
+        rep = json.load(fh)
+    rep["status"] = "degraded"
+    with open(os.path.join(d, "report.json"), "w", encoding="utf-8") as fh:
+        json.dump(rep, fh)
+    other = _bundle(root, doc_id="bbb")
+    os.remove(os.path.join(other, "report.json"))
+
+    assert em.main(["--bundles", root, "--run-id", "E1"]) == 0
+    assert split_front_matter(_read(d))[0][META_KEY]["id"] == "specs/aaa.docx"
+    assert split_front_matter(_read(other))[0][META_KEY]["id"] == "specs/bbb.docx"
+    assert sorted(r["doc_id"] for r in _manifest(root)
+                  if r["stage"] == "enrich_metadata") == ["aaa", "bbb"]
+
+
+def test_a_harvested_edge_survives_the_sidecar_going_away(tmp_path):
+    """The end-to-end shape of the revalidation asymmetry.
+
+    A URL in the prose above the first heading is harvested with no `ref` — there
+    is no fragment up there to point at — and once the model contributes one link
+    the field's provenance reads `generated`, so `revalidate_generated` re-judged
+    the WHOLE block by the model-answer rules and dropped the measured record every
+    run, logging `missing-required-ref` against the schema's own intent.
+    `apply_floor` re-harvested it from `structure.json`, so the corpus never
+    converged — and the moment the sidecar was unreadable the edge was gone for
+    good, with the run still exiting 0.
+    """
+    from backend.sections import document_outline
+
+    body = ("The vendor [timing note](https://vendor.invalid/timing) applies.\n\n"
+            "# Clock Spec\n\nThe clock tree is described here.\n\n"
+            "## Rollback\n\nRun the restore playbook.\n")
+    em = _mod("enrich_metadata")
+    root, d = _bundles(tmp_path, body=body)
+    with open(os.path.join(d, "structure.json"), "w", encoding="utf-8") as fh:
+        json.dump({"outline": document_outline(body)["outline"]}, fh)
+    client = _StubClient([("links", {"internal": [{"title": "Runbook",
+                                                   "url": "runbook.md",
+                                                   "ref": REF}]})])
+
+    def urls():
+        block = _knowledge(d)["links"]
+        return sorted(r["url"] for recs in block.values() for r in recs)
+
+    assert em.main(["--bundles", root, "--run-id", "E1"], client=client) == 0
+    assert urls() == ["https://vendor.invalid/timing", "runbook.md"]
+    assert "missing-required" not in json.dumps(_coverage(root)[-1]["revalidated"])
+
+    os.remove(os.path.join(d, "structure.json"))       # a pruned or partial copy
+    assert em.main(["--bundles", root, "--run-id", "E2"], client=client) == 0
+    assert urls() == ["https://vendor.invalid/timing", "runbook.md"], (
+        "a recall-1.0 edge was deleted by the rules written for a model's guess")

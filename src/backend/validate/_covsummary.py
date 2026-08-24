@@ -18,6 +18,17 @@ summary: Turns a pile of per-document coverage records into the short text an op
 #     two would let each hide the other.
 #
 # Pure: records in, text out. Reading the JSONL files is the runner's job.
+#
+# CONVENTIONS §1 makes ``__all__`` the machine-checkable public API of a source
+# file, private module or not — 32 of the 36 modules under src/backend carry one and
+# this was one of the four that did not. ``summarize`` is what the package re-exports
+# (as ``summarize_coverage``); ``worst_documents`` and ``figure_losses`` are the two
+# halves of it that are separately meaningful, and separately tested, but they stay
+# OUT of ``backend.validate.__all__`` deliberately: the package surface is kept tight
+# (src/backend/validate/CLAUDE.md), and widening it with helpers no runner calls
+# would freeze an internal shape as a contract.
+__all__ = ["summarize", "worst_documents", "figure_losses"]
+
 _BAR = "-" * 72
 
 

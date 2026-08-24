@@ -14,6 +14,10 @@ that describes what is on disk now.
 
 Exit code is 0 unless ``--fail-under`` is given and the lossless fraction falls
 below it, which makes this usable as a CI step rather than only as a report.
+``--fail-under`` also fails when there are NO records at all: a gate that was asked
+for a lossless corpus and measured nothing has not observed a pass, it has observed
+nothing, and reporting that as success is the vacuous pass this project's reports
+carry ``n_source`` denominators to prevent.
 """
 from __future__ import print_function
 
@@ -93,7 +97,22 @@ def main(argv=None):
         print(json.dumps(records, indent=2, sort_keys=True))
     else:
         print(summarize(records, worst_n=args.worst, min_tokens=args.min_tokens))
-    if args.fail_under and records:
+    if args.fail_under:
+        # Empty evidence is not a pass. A gate asked for a lossless corpus and handed
+        # ZERO measured documents used to exit 0 — which is the vacuous pass the
+        # rubric's own `_nothing_to_grade` refuses ("a grader that reports a cheerful
+        # A because it was handed no documents"). It is reachable by the plainest
+        # documented invocation: the default --dir is data/bundles, and data/* is
+        # gitignored, so a fresh clone has nothing there at all.
+        # NOTE the check lives INSIDE `if args.fail_under:` on purpose — --fail-under
+        # 0.0 is the documented default and means "never fail", so a plain report run
+        # over an empty directory must still exit 0 — and it returns BEFORE the
+        # division, which is what `and records` was really guarding.
+        if not records:
+            print("--fail-under %.4f was requested but NO coverage records were found "
+                  "under %s: nothing was measured, which is not a pass"
+                  % (args.fail_under, args.dir), file=sys.stderr)
+            return 1
         good = sum(1 for r in records if float(r.get("recall", 0.0) or 0.0) >= 1.0)
         frac = float(good) / len(records)
         if frac < args.fail_under:

@@ -30,7 +30,7 @@ from collections import Counter
 
 from ._chunk import (is_heading, is_toc_line, content_start, gfm_anchor,
                      fenced_lines, _fingerprint, _is_table_row, _is_separator_row,
-                     _TOC_HEADER, _WS)
+                     _ATX_HEADING, _TOC_HEADER, _WS)
 
 __all__ = ["document_outline", "outline_coverage"]
 
@@ -49,8 +49,19 @@ _LIST_ITEM = re.compile(r'^\s*(?:[-*+]|\d+[.)])\s+\S')
 
 def _title_at(lines, i):
     # type: (list, int) -> str
+    """The heading text at line ``i``, VERBATIM — never truncated.
+
+    It used to be clipped to ``s[:120]``, which was dead code while ``is_heading``
+    refused any line over 120 chars. Now that an explicitly marked-up ``##`` heading
+    is recognised at any length, the clip would be live and actively harmful: the
+    node's ``anchor`` is ``gfm_anchor(title)``, so a 129-char heading would publish
+    the slug of a TRUNCATED title — a fragment no renderer emits, which the rubric's
+    anchor cross-check (quality-plan C3) grades as an unaddressable anchor. The
+    anchor must be the fragment the RENDERED heading is reachable by, so the title
+    it is derived from has to be the whole heading.
+    """
     s = lines[i].strip().lstrip("#").strip()
-    return (s[:120] or "section")
+    return (s or "section")
 
 
 def _split_row(row):
@@ -211,6 +222,29 @@ def _links_in(lines, a, b, fenced):
 # a number the document has already stated. ``1.2`` under ``1`` is an outline; ``1.8``
 # under ``5`` is a voltage. Part numbers, version strings and rail names cannot pass
 # that test, and a genuinely flat extractor's ``1 / 1.1 / 1.1.1`` passes it trivially.
+#
+# PREFIX EXISTENCE ALONE WAS NOT ENOUGH, and the comment above used to overclaim it.
+# It rejects the documented rail list only because ``1`` and ``3`` are never stated
+# there; an ASCENDING MEASUREMENT SERIES states them as a matter of course, and every
+# one of these was reshaped into a two-level tree with fabricated ``parent`` pointers
+# and rolled-up ``subtree_tokens``:
+#     1 GB / 1.5 GB / 2 GB / 2.5 GB      capacity or price tiers
+#     2 mm / 2.5 mm / 3 mm / 3.5 mm      fastener and drill sizes
+#     1 h / 2 h / 2.5 h / 4 h            SLA response windows
+#     3 V / 3.3 V / 5 V                  a coin cell beside a logic rail
+# document.md is untouched by the reshape and ``structure_fidelity`` grades
+# document.md, so the second hard gate is structurally blind to it — the only
+# disclosure is ``levels_inferred: true``.
+#
+# The second half of the guard is therefore the property a real section numbering has
+# that a magnitude series does not: A PARENT'S CHILDREN START AT 1. ``1`` followed by
+# ``1.1`` is a numbering; ``1`` followed only by ``1.5`` is an interval. Deliberately
+# NOT "a contiguous run 1..k" — a spec whose 2.3 was deleted still numbers 2.1, 2.2,
+# 2.4 and must stay believable — and 0 is allowed, because "1.0 Introduction" is a
+# real convention. What it costs: a document whose ``1.1`` heading the extractor
+# missed, leaving ``1.2`` as ``1``'s only stated child, is no longer reshaped. That
+# is the safe direction — the outline stays as flat as the extractor stated it,
+# rather than being given a hierarchy on evidence this thin.
 _SECNO = re.compile(r'^(?:(\d+(?:\.\d+){1,5})\.?(?=[\sA-Za-z]|$)'   # 1.2 / 1.2Scope
                     r'|(\d+)\.?(?=\s|$))')                          # 1 / 1. / "1"
 _INFER_MIN_HEADS = 3          # two headings are not a pattern
@@ -246,16 +280,33 @@ def _is_nested_outline(numbers):
     shallowest depth are the roots and answer to nothing — a document may legitimately
     begin at ``1.1`` (the extractor skipped a TOC, or the source starts mid-chapter).
 
+    Prefix containment alone is not enough, because an ascending measurement series
+    states its own integer parts on the way up: ``1 GB / 1.5 GB / 2 GB / 2.5 GB``
+    passes it, and came out as a two-level tree. So a second property is required —
+    every stated parent's children must START AT 1 (or 0, for ``1.0 Introduction``).
+    A numbering's first subsection is ``x.1``; a magnitude's fractional neighbour is
+    whatever the quantity happens to be, and ``1.5`` as the sole child of ``1`` is an
+    interval, not a subsection. Gaps are fine (``2.1, 2.2, 2.4`` — a spec whose 2.3
+    was deleted is still a numbering), which is why this is a MINIMUM and not a
+    contiguity test.
+
     Rejects the failure this guard exists for: ``5``, ``1.8``, ``3.3`` are three
     unrelated magnitudes, and ``1.8`` names no subsection of ``5``.
     """
     top = min(len(n.split(".")) for n in numbers)
     stated = set()
+    leaves = {}                      # stated parent -> its children's leaf components
     for num in numbers:
         parts = num.split(".")
-        if len(parts) > top and ".".join(parts[:-1]) not in stated:
-            return False
+        if len(parts) > top:
+            parent = ".".join(parts[:-1])
+            if parent not in stated:
+                return False
+            leaves.setdefault(parent, set()).add(int(parts[-1]))
         stated.add(num)
+    for kids in leaves.values():
+        if min(kids) > 1:
+            return False
     return True
 
 
@@ -305,30 +356,58 @@ def outline_coverage(text, outline_nodes):
 
     The recall gate proves every source token reached ``document.md``; nothing proved
     those lines then reached ``structure.json``. This closes that hole, deliberately
-    measuring from the OUTPUT (the union of every node's ``line_span``) back against
-    the body, independent of how the outline was built — so any builder bug that drops
-    a region (a TOC misdetection, a span error) shows up here, not in a user report.
+    measuring from the OUTPUT (the union of every node's ``line_span``, plus the set
+    of lines a node actually OPENS on) back against the body, independent of how the
+    outline was built.
 
-    Every NON-BLANK line is classified: ``covered`` (inside some node's span),
-    ``toc`` (outside every span but table-of-contents furniture — dot-leader entries,
-    bare page numbers, a ``Contents`` header — the one thing the outline skips on
-    purpose), or ``uncovered`` (outside every span and NOT TOC-like: real content the
-    outline lost). Returns ``{"content_lines", "covered_lines", "toc_lines",
-    "uncovered_lines", "first_uncovered"}`` where ``first_uncovered`` holds up to the
-    first 5 offending 0-based line numbers for triage.
+    A line is ``covered`` when it is inside some node's span; ``toc`` when it is
+    outside every span but is table-of-contents furniture (dot-leader entries, bare
+    page numbers, a ``Contents`` header — the one thing the outline skips on purpose);
+    ``uncovered`` otherwise. Plus one rule that is not about spans at all:
+
+      A LINE THE BODY MARKS UP AS A HEADING (``## …``) THAT NO NODE OPENS ON IS
+      UNCOVERED, even though an ancestor's span contains it.
+
+    That rule is what makes this measurement falsifiable. LINE coverage on its own
+    cannot fail against the current builder and never could: a root's ``line_span``
+    runs to the next heading at its own level or shallower, so the roots exactly tile
+    ``[first_heading, n)``, the preamble node covers ``[content_start, first_heading)``,
+    and every line ``content_start`` skips is by construction one of the classes
+    classified ``toc`` above. ``uncovered_lines`` was therefore 0 for EVERY possible
+    input — arithmetic, not measurement — while the gate keyed off it advertised that
+    the outline had captured the document. It had not: when a heading is dropped, its
+    section's lines are silently re-attributed to the ANCESTOR, whose span already
+    covers them, so the loss the check exists to find is exactly the loss it is blind
+    to. Asking whether a node OPENS on the heading line is a question the ancestor
+    cannot backfill.
+
+    The ATX form is used because it is the only heading evidence that is independent
+    of ``is_heading``: the body wrote ``#`` itself. Lines inside a fence (a shell
+    comment in a transcript) and TOC-furniture lines are excluded, because the outline
+    is right not to open a node on those. The converse direction — a node the body
+    marks up NOWHERE, i.e. a heading the heuristics INVENTED — is not measurable here,
+    since the native-text lanes legitimately carry headings with no ``#`` at all; that
+    one is bounded at the source, in ``_chunk.is_heading``.
+
+    Returns ``{"content_lines", "covered_lines", "toc_lines", "uncovered_lines",
+    "first_uncovered"}`` where ``first_uncovered`` holds up to the first 5 offending
+    0-based line numbers for triage.
     """
     lines = text.split("\n")
     n = len(lines)
     covered = [False] * n
+    opened = set()
 
     def mark(nodes):
         for nd in nodes:
             a, b = nd["line_span"]
+            opened.add(a)
             for i in range(max(0, a), min(n, b)):
                 covered[i] = True
             mark(nd["children"])
     mark(outline_nodes or [])
 
+    fenced = fenced_lines(lines)
     content = covered_ct = toc = 0
     uncovered = []
     for i in range(n):
@@ -336,7 +415,10 @@ def outline_coverage(text, outline_nodes):
         if not s:
             continue
         content += 1
-        if covered[i]:
+        if (_ATX_HEADING.match(lines[i]) and not fenced[i] and not is_toc_line(s)
+                and i not in opened):
+            uncovered.append(i)          # a marked-up heading with no node of its own
+        elif covered[i]:
             covered_ct += 1
         elif is_toc_line(s) or _TOC_HEADER.match(s):
             toc += 1

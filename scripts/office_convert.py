@@ -40,6 +40,7 @@ import tempfile
 import time
 import xml.etree.ElementTree as _ET
 import zipfile
+import zlib
 from collections import OrderedDict
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -208,8 +209,9 @@ def plan(sources, out_dir):
     return rows
 
 
-def load_parts(row, soffice="", want_media=False, furniture_out=None):
-    # type: (dict, str, bool, dict) -> tuple
+def load_parts(row, soffice="", want_media=False, furniture_out=None,
+               members_out=None):
+    # type: (dict, str, bool, dict, list) -> tuple
     """``(parts, media, eff_ext, error)`` for one row — the single reader both the
     convert and validate paths use.
 
@@ -222,7 +224,10 @@ def load_parts(row, soffice="", want_media=False, furniture_out=None):
     extraction reads the exact bytes the converter's sentinels point at.
     ``furniture_out``, when given, is filled with the dropped page-furniture parts
     (read from that same effective source, so a soffice-produced header is measured
-    before the temp tree is removed)."""
+    before the temp tree is removed). ``members_out``, when given, is filled with the
+    EFFECTIVE package's full member list for the same reason — the drop checks must
+    read the package the converter actually walked, not the pre-conversion original,
+    whose ODF/CFB member names can never match an OOXML part pattern."""
     if row.get("lane") == ROUTE_LIBREOFFICE:
         target = _LO_TARGET.get(row["ext"])
         if not target:
@@ -234,11 +239,13 @@ def load_parts(row, soffice="", want_media=False, furniture_out=None):
             return {}, {}, "", "libreoffice-convert-failed"
         try:
             media = read_media(produced) if want_media else {}
-            return read_parts(produced, target, furniture_out), media, target, ""
+            return (read_parts(produced, target, furniture_out, members_out),
+                    media, target, "")
         finally:
             shutil.rmtree(os.path.dirname(produced), ignore_errors=True)
     media = read_media(row["src"]) if want_media else {}
-    return read_parts(row["src"], row["ext"], furniture_out), media, row["ext"], ""
+    return (read_parts(row["src"], row["ext"], furniture_out, members_out),
+            media, row["ext"], "")
 
 
 # Page-furniture parts the converter never walks. Read ONLY to measure what the
@@ -254,7 +261,12 @@ def zip_members(path):
 
     ``read_parts`` deliberately keeps only the parts the converter reads, which is
     why an embedded OLE object is invisible to it — and to ``--audit-parts``, which
-    inspects only members ending in ``.xml``. Reporting a drop needs the full list."""
+    inspects only members ending in ``.xml``. Reporting a drop needs the full list.
+
+    NOTE for callers that report a DROP: this reads the file it is handed. On the
+    LibreOffice lane the file that matters is the soffice-PRODUCED package, not the
+    original .odt/.doc — use ``load_parts(..., members_out=[])`` there instead, or a
+    drop check silently grades the wrong package (see ``bundle_inputs``)."""
     try:
         with zipfile.ZipFile(path) as zf:
             return zf.namelist()
@@ -262,25 +274,72 @@ def zip_members(path):
         return []
 
 
-def read_parts(path, ext, furniture_out=None):
-    # type: (str, str, dict) -> dict
+def _zip_read_errors():
+    # type: () -> tuple
+    """Everything ``ZipFile.read`` can raise on a package we cannot decompress.
+
+    ``BadZipFile``/``OSError``/``KeyError`` are the obvious ones, but a member is
+    handed to a DECOMPRESSOR and each of those has its own error type that inherits
+    from ``Exception``, not from ``OSError``:
+
+      * ``zlib.error``        — a corrupt deflate stream, the one an ordinary
+                                bit-rotted or text-mode-transferred file reaches;
+      * ``lzma.LZMAError`` / bz2's error — the same for methods 12/14;
+      * ``NotImplementedError`` — a compression method this interpreter has no
+                                decompressor for (AES/99, zstd/93, LZMA on a build
+                                without the module);
+      * ``RuntimeError``      — an encrypted member with no password;
+      * ``EOFError``          — a truncated stream.
+
+    Every one of them used to escape, so ONE damaged document aborted the whole
+    batch instead of being recorded as that document's failure. The list is
+    explicit rather than a blanket ``except Exception`` on purpose: an unreadable
+    package must become a NAMED failure (``unreadable-zip``), and a genuine bug in
+    this module must still crash loudly instead of being laundered into one."""
+    errors = [zipfile.BadZipFile, OSError, KeyError,
+              NotImplementedError, RuntimeError, EOFError, zlib.error]
+    for mod_name, err_name in (("lzma", "LZMAError"), ("bz2", "BZ2Error")):
+        try:
+            mod = __import__(mod_name)
+        except ImportError:                  # an interpreter built without it
+            continue
+        err = getattr(mod, err_name, None)
+        if isinstance(err, type) and issubclass(err, Exception):
+            errors.append(err)
+    return tuple(errors)
+
+
+_ZIP_READ_ERRORS = _zip_read_errors()
+
+
+def read_parts(path, ext, furniture_out=None, members_out=None):
+    # type: (str, str, dict, list) -> dict
     """The converter's input: {part_name: xml_text} for this format's main parts.
 
     A malformed/unreadable zip returns {} (the caller records the failure). When
     ``furniture_out`` is a dict it is filled in place with the dropped page-furniture
     parts, so a deliberate drop can be reported with a measured size instead of
-    silently looking like a document that never had a header."""
+    silently looking like a document that never had a header. When ``members_out``
+    is a list it is filled in place with EVERY member name of the package actually
+    read — which on the LibreOffice lane is the soffice-produced OOXML sibling, the
+    only package whose part names a drop check can meaningfully match. It is left
+    EMPTY on the unreadable path, so a package nobody could open can never fabricate
+    a drop warning."""
     pats = [re.compile(p) for p in OOXML_MAIN_PARTS.get(ext, ())]
     parts = {}
+    names = []                                           # type: list
     try:
         with zipfile.ZipFile(path) as zf:
-            for name in zf.namelist():
+            names = zf.namelist()
+            for name in names:
                 if any(p.match(name) for p in pats):
                     parts[name] = zf.read(name).decode("utf-8", "replace")
                 elif furniture_out is not None and _FURNITURE_READ.match(name):
                     furniture_out[name] = zf.read(name).decode("utf-8", "replace")
-    except (zipfile.BadZipFile, OSError, KeyError):
+    except _ZIP_READ_ERRORS:
         return {}
+    if members_out is not None:
+        members_out.extend(names)
     return parts
 
 
@@ -303,7 +362,7 @@ def read_media(path):
             for name in zf.namelist():
                 if _MEDIA_RE.match(name):
                     out[name] = zf.read(name)
-    except (zipfile.BadZipFile, OSError, KeyError):
+    except _ZIP_READ_ERRORS:
         return {}
     return out
 
@@ -388,8 +447,10 @@ def bundle_inputs(row, soffice="", emit_images=False):
     except OSError:
         pass
     furniture = {}                                       # type: dict
+    members = []                                         # type: list
     parts, media, eff_ext, err = load_parts(row, soffice, want_media=emit_images,
-                                            furniture_out=furniture)
+                                            furniture_out=furniture,
+                                            members_out=members)
     # Every deliberate drop is NAMED (end-goal.md §1): running headers/footers are
     # correctly excluded, but "excluded" must not read the same as "absent".
     warnings.extend(furniture_drops(furniture))
@@ -419,7 +480,13 @@ def bundle_inputs(row, soffice="", emit_images=False):
     repr_chars = sum(len(v) for v in parts.values())
     # Every deliberate flattening or drop, NAMED with its counts. A drop nobody
     # counted reads exactly like a bug (end-goal.md §1).
-    warnings.extend(policy_drops(parts, zip_members(row["src"])))
+    # ``members`` is the EFFECTIVE package's member list, not the source file's: on
+    # the LibreOffice lane (odt/odp/ods/doc/ppt/xls/rtf) the original carries ODF
+    # member names — or, for the legacy CFB binaries, is not a zip at all — so
+    # reading the drop off the SOURCE made ``dropped_embedded_objects`` a check that
+    # could never fire on that whole lane, while the embedded object was really
+    # dropped from the soffice-produced docx the converter walked.
+    warnings.extend(policy_drops(parts, members))
     body = ooxml_markdown(eff_ext, parts, emit_images)
     src_text = ooxml_source_text(eff_ext, parts)
     # Only docx has a structural ground truth so far. pptx (every paragraph is a

@@ -76,7 +76,7 @@ from backend.kb import (abstract_floor, accept_model_meta,        # noqa: E402
                         next_review_due, order_meta, reading_time_minutes,
                         request_spec, revalidate_generated, set_provenance,
                         slugify, source_url, split_meta, title_floor, unique_id,
-                        value_source, word_count,
+                        value_sha, value_source, word_count,
                         ALIAS_FIELDS, KNOWLEDGE_FILE, META_KEY, PROVENANCE_KEY,
                         SCHEMA_VERSION, SOURCE_AUTHORED, SOURCE_DERIVED,
                         SOURCE_EXTRACTED, SOURCE_GENERATED)
@@ -429,6 +429,34 @@ def apply_floor(meta, fm, body, outline, anchors):
     return filled
 
 
+def conversion_failed(doc_dir):
+    # type: (str) -> bool
+    """Does this bundle's own report say the conversion that produced it FAILED?
+
+    A bundle whose ``report.json`` reads ``status: failed`` beside a ``document.md``
+    is a contradiction: the documented invariant is that *a failed document
+    publishes ``report.json`` only*. Enrichment used to select bundles on
+    ``document.md`` existing and nothing else, so it enriched the stale body a
+    failed rebuild had left standing — writing a fresh ``knowledge.json`` for it and
+    stamping a ``doc_meta`` gate into the failed report — while reading that very
+    ``status`` out of the same file to fill a manifest column. The verdict was read,
+    recorded, and not used.
+
+    ``build_bundle`` now withdraws those artifacts, so this state should no longer
+    be reachable; it is still refused here, because a corpus on disk predates the
+    fix and because the cost of being wrong is a KB that ingested a document the
+    pipeline said it could not convert. Only an explicit ``failed`` counts: an
+    absent or unreadable report is NOT a verdict, and treating "I don't know" as a
+    failure would refuse every hand-made bundle root.
+    """
+    try:
+        with open(os.path.join(doc_dir, "report.json"), encoding="utf-8") as fh:
+            report = json.load(fh)
+    except (OSError, ValueError, UnicodeDecodeError):
+        return False
+    return isinstance(report, dict) and report.get("status") == "failed"
+
+
 def _prior_doc_meta(doc_dir):
     # type: (str) -> dict
     """The `doc_meta` block a previous run left in report.json, or {}."""
@@ -589,10 +617,11 @@ def enrich_one(doc_dir, vocab, client, run_id, args, cache, run_doc=None,
 
     meta = OrderedDict()
     meta.update(det)
-    # A prior value with NO provenance is treated as hand-written (that is the whole
-    # "authored always wins" rule). Which means it has to be RECORDED as authored —
-    # see below.
-    inherited_authored = set()
+    # Which deterministic fields kept a PRIOR value rather than this run's. A prior
+    # value with no provenance at all is treated as hand-written (that is the whole
+    # "authored always wins" rule), and so is one whose fingerprint no longer
+    # matches its stamp. Either way it has to be RECORDED as authored — see below.
+    inherited_det = set()
     for key, val in existing.items():          # authored/prior values win over derived
         if key == PROVENANCE_KEY:
             continue
@@ -612,22 +641,36 @@ def enrich_one(doc_dir, vocab, client, run_id, args, cache, run_doc=None,
         if key in det and (prior_src in (None, "authored")
                            or is_authored(prov_entry, val)):
             meta[key] = val
-            if prior_src is None:
-                inherited_authored.add(key)
+            inherited_det.add(key)
         elif key not in det:
             meta[key] = val
     meta[PROVENANCE_KEY] = OrderedDict(existing.get(PROVENANCE_KEY) or {})
     for name, source in det_prov.items():
-        if name not in (existing.get(PROVENANCE_KEY) or {}):
-            # AUTHORED WINS HAS TO SURVIVE THE NEXT RUN. Stamping an inherited
-            # hand-written value with the DERIVED source it would have had makes the
-            # following run see `source: derived`, which is not in (None, "authored"),
-            # so the derived value wins and the hand-written one is destroyed. That
-            # turns "authored always wins" into "authored wins once" — and silently:
-            # a hand-picked `id` reverts to a slug on run two, orphaning every
-            # `see_also` that pointed at it.
-            set_provenance(meta, name,
-                           SOURCE_AUTHORED if name in inherited_authored else source)
+        # WHERE THE STORED VALUE CAME FROM IS THE ONLY THING THAT DECIDES THIS, and
+        # it is decided above: a det key is either INHERITED (a person's value won)
+        # or written by this run.
+        #
+        # AUTHORED WINS HAS TO SURVIVE THE NEXT RUN. Stamping an inherited
+        # hand-written value with the DERIVED source it would have had makes the
+        # following run see `source: derived`, which is not in (None, "authored"),
+        # so the derived value wins and the hand-written one is destroyed. That
+        # turns "authored always wins" into "authored wins once" — and silently: a
+        # hand-picked `id` reverts to a slug on run two, orphaning every `see_also`
+        # that pointed at it. So an inherited value is stamped AUTHORED, which is
+        # what it is, whether the previous block said so, said nothing, or said
+        # `derived` over a value somebody has since corrected.
+        #
+        # A VALUE THIS RUN WROTE IS RE-FINGERPRINTED, EVERY RUN. Stamping only when
+        # no entry existed left `value_sha` describing the PREVIOUS value the
+        # moment a switch legitimately changed one (`--namespace`,
+        # `--source-base-url`, `$DOC2MD_SOURCE_BASE_URL`). The record was then
+        # false immediately, and on the NEXT run `is_authored` read the mismatch as
+        # a human edit and inherited the machine's own stale value — freezing the
+        # field forever while `report.json` recorded the new namespace and the
+        # manifest said `unchanged`. The fingerprint is a pure function of the
+        # value written, so re-stamping costs a converged run nothing.
+        set_provenance(meta, name,
+                       SOURCE_AUTHORED if name in inherited_det else source)
 
     meta, moved = revalidate_generated(meta, vocab)
     out["revalidated"] = moved
@@ -757,6 +800,16 @@ def enrich_one(doc_dir, vocab, client, run_id, args, cache, run_doc=None,
         """
         if isinstance(meta.get("extraction"), dict):
             meta["extraction"]["run_at"] = stamp
+            # ...and the fingerprint has to describe the bytes actually written.
+            # `run_at` is decided HERE (the idempotence check below renders with the
+            # PRIOR stamp first), so a `value_sha` taken when the block was built
+            # would fingerprint a run_at that may never be stored — and, once every
+            # det field is re-stamped, would differ on every run and churn
+            # document.md forever, which is exactly what the prior-stamp render
+            # exists to prevent.
+            entry = (meta.get(PROVENANCE_KEY) or {}).get("extraction")
+            if isinstance(entry, dict) and "value_sha" in entry:
+                entry["value_sha"] = value_sha(meta["extraction"])
         front_block, _know = split_meta(order_meta(meta))
         fm[META_KEY] = order_meta(front_block)
         return (render_front_matter(fm) + "\n" + body,
@@ -889,6 +942,14 @@ def main(argv=None, client=None):
 
     dirs = sorted(d for d in os.listdir(args.bundles)
                   if os.path.isfile(os.path.join(args.bundles, d, "document.md")))
+    # A bundle the writer FAILED is not a publishable bundle, whatever files are
+    # lying in it. Announced, never silent — an absence in the log and a refusal
+    # read the same otherwise, and they mean opposite things.
+    refused = [d for d in dirs if conversion_failed(os.path.join(args.bundles, d))]
+    for did in refused:
+        print("  REFUSED %s report.json says the conversion failed — nothing here "
+              "is safe to enrich or publish" % did, file=sys.stderr)
+    dirs = [d for d in dirs if d not in set(refused)]
     if args.only:
         want = set(args.only)
         dirs = [d for d in dirs if d in want]

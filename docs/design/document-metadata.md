@@ -47,8 +47,11 @@ small:
 | 2 | model | a model **proposes**, a human **corrects** |
 
 Orthogonal to the tier is **`authored_only`**. Some fields are an accountability or
-safety boundary — `owner`, `confidentiality`, `status`, `classification`, the review
-dates. Their entire purpose is that a person stood behind them. A model could
+safety boundary. The set is exactly eight, and it is the `authored_only=True`
+entries of the field inventory: `status`, `confidentiality`, `owner`,
+`accountable_roles`, `review_cadence`, `last_reviewed`, `next_review_due`,
+`validated_against_version`. Their entire purpose is that a person stood behind
+them. A model could
 certainly guess them; that is exactly why it may not. `confidentiality` exists so a
 restricted document is never surfaced to the wrong audience, and a field whose
 purpose is a safety boundary cannot have a model as its author.
@@ -142,7 +145,7 @@ every pointer resolved, `errors=0` — while the corpus is broken:
 | **synonymy** | `rhel-8` here and `RHEL_8` there | each spelling is locally fine |
 | **entities** | `Docker` and `docker` — one thing, two graph nodes | ditto, and this one is the expensive silent defect |
 | **graph** | dead `see_also`, orphans, edges naming undeclared entities | needs the full id set |
-| **schema skew** | which documents a version bump has to backfill | "current" is a corpus fact |
+| **schema skew** | which documents a version bump has to backfill | needs every document's stamp at once |
 | **coverage** | a field on 3% of documents: conditional, or a broken extractor? | needs the denominator |
 | **vocabulary** | terms nobody uses; synonyms *inside the term list itself* | needs no corpus at all — and runs on an empty one |
 
@@ -239,7 +242,7 @@ meta:
   reading_time_minutes: 60
   source: {...}              # tier 0 — dcterms:source
   extraction: {...}          # tier 0 — prov:Activity
-  vocab_version: 1
+  vocab_version: 2
   type: "runbook"            # tier 2 — closed vocabulary
   tags: []                   # tier 2 — registry
   tags_proposed: ["rhel8"]   #          not yet promoted
@@ -249,8 +252,7 @@ meta:
   _provenance:                 # ... and this block splits with its fields, so the
                                # sidecar carries the provenance of what IT holds.
     type:
-      tier: 2
-      source: "generated"
+      source: "generated"    # no `tier` — see below
       model: "..."
       prompt_sha: "..."
       value_sha: "..."       # what we wrote — a later edit is detectable
@@ -267,8 +269,16 @@ exactly what they meant; nesting is what lets the enrichment stage rewrite its o
 block wholesale without touching a key it does not own, and what stops a `title`
 from colliding with a `source_title`.
 
-`_provenance` carries `tier` and `source` (`extracted` | `derived` | `generated` |
-`authored`) per field, plus `model` and `prompt_sha` for generated values.
+`_provenance` carries `source` (`extracted` | `derived` | `generated` |
+`authored`) per field, plus `model` and `prompt_sha` for generated values and
+`value_sha` for every machine source. It carries **no `tier`**: the tier is a pure
+function of the field name, so storing it per value duplicated the inventory in
+every bundle and nothing ever read it back. It was dropped at schema v3 (P5.9), and
+`value_sha` — previously written only for `generated` — was widened to every machine
+source in the same change, which is what makes a hand-edited harvested link
+detectable. A `tier` key pasted in from an older example is not a term any gate
+knows: `lint_document` reports nothing about it and it is simply carried until the
+next run rewrites that field's entry wholesale.
 
 ## Backfill
 
@@ -373,6 +383,17 @@ were wrong" but "which term did it keep trying to invent".
   nothing carrying `schema_version` there is no current version to be behind, so
   naming every document would implicate each one for a property the corpus as a whole
   lacks.
+- **Skew is measured against the code, not against the corpus.**
+  `corpus_metrics.skew.<key>.current` is the version **the running checkout emits**,
+  and `behind` counts every *stamped* document not on it. Measuring the corpus
+  against its own newest member made the one question the gate exists to answer
+  unanswerable: a corpus uniformly one revision behind reported `behind: 0` and
+  exit 0, i.e. "nothing to backfill" at exactly the moment everything needed
+  backfilling. A corpus that is uniformly stale now reports `behind: N` plus a
+  `schema-corpus-behind` WARN. A corpus **ahead** of this checkout — a colleague's
+  newer build — is not called behind: `current` is the newest of (the code's
+  version, the stamps present), because calling those documents stale would invert
+  the work list.
 - **An enumerated family is never a synonym family.** `node-01`…`node-40`,
   `us-east-1`/`us-west-2`, `ISO-27001`/`ISO-27002` are each ~95% similar to their
   siblings. Measured on a synthetic 400-document corpus naming 1200 hosts, the naive

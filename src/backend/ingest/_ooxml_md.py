@@ -262,7 +262,22 @@ def _emit_image_blocks(rids, rels, blocks):
 # renderer character-perfect.
 _MD_SPECIAL = re.compile(r"([*`<\[\]~])|(_+)")
 _LEAD_LIST_NUM = re.compile(r"^(\d+)([.)])(\s)")
-_LEAD_MARK = re.compile(r"^([#+*-])(\s)")
+# LINE-LEADING constructs a body paragraph must never be mistaken for.
+#   * an ATX heading opens on ONE TO SIX hashes followed by whitespace or nothing
+#     at all; seven hashes is not a heading and neither is `#1 priority`, so
+#     escaping either would add a visible backslash to text never at risk.
+#   * `+ `/`- `/`* ` is a bullet marker (a lone `*` is already escaped by `_esc`).
+_LEAD_MARK = re.compile(r"^(?:#{1,6}(?:\s|$)|[+*-]\s)")
+# A line made ONLY of dashes or ONLY of equals signs (spaces allowed between) is a
+# thematic break or a setext heading underline: it renders as a rule, or as nothing,
+# and either way the paragraph's own characters are gone. `_` and `*` rules cannot
+# arise — `_esc` already escapes both.
+_LEAD_RULE = re.compile(r"^(?:-[- \t]*|=[= \t]*)$")
+# `[label]: destination` at the start of a line is a link reference DEFINITION.
+# CommonMark consumes it whole: the paragraph disappears from the render entirely,
+# and because `markdown_to_text` does not model definitions, both gates see a
+# document that is still intact.
+_LEAD_REFDEF = re.compile(r"^\[[^\]]*\]:")
 _WORD_CH = re.compile(r"[0-9A-Za-z]")
 
 
@@ -271,8 +286,8 @@ _WORD_CH = re.compile(r"[0-9A-Za-z]")
 _BRACKET_MEANS = ("](", "][")
 
 
-def _esc_special(m):
-    # type: (object) -> str
+def _esc_special(m, dangerous):
+    # type: (object, bool) -> str
     """Escape one markdown special — except one that cannot mean anything.
 
     Two exemptions, both the same argument. Escaping a character that could never
@@ -292,11 +307,18 @@ def _esc_special(m):
     resolve to and every renderer prints it literally. An ini section name, a bus
     slice ``[31:0]``, a ticket id: all of them were being stored as ``\\[…\\]`` for
     a danger that cannot arise. The test is on the whole run text rather than the
-    single character, because it takes two characters to make the danger."""
+    single character, because it takes two characters to make the danger.
+
+    ``dangerous`` is that two-character test, and it is the CALLER's to make: the
+    danger is a property of the assembled LINE, not of the ``w:t`` this call is
+    escaping. Word splits a run at every rsid, spell-check, bookmark, field and
+    internal-hyperlink boundary, so ``[3]`` and ``(page 12)`` routinely arrive as
+    two runs; deciding per run left both brackets bare and let the join fabricate
+    a link whose destination text a renderer then eats."""
     run = m.group(2)
     if run is None:
         ch = m.group(1)
-        if ch in "[]" and not any(seq in m.string for seq in _BRACKET_MEANS):
+        if ch in "[]" and not dangerous:
             return ch
         return "\\" + ch
     s, i, j = m.string, m.start(2), m.end(2)
@@ -306,12 +328,21 @@ def _esc_special(m):
     return "\\" + "\\".join(run)
 
 
-def _esc(text):
-    # type: (str) -> str
-    """Backslash-escape inline markdown specials in literal source text."""
+def _esc(text, line=None):
+    # type: (str, object) -> str
+    """Backslash-escape inline markdown specials in literal source text.
+
+    ``line`` is the whole literal text of the markdown line ``text`` will end up
+    in, when the caller assembles a line out of several pieces; it is used only to
+    decide whether a bracket in this piece could combine with a neighbouring piece
+    into link syntax. Callers that already hand over a whole line (a footnote, a
+    chart caption, a spreadsheet cell) pass nothing and the text speaks for itself."""
     if not text:
         return ""
-    return _MD_SPECIAL.sub(_esc_special, text.replace("\\", "\\\\"))
+    ctx = text if line is None else line
+    dangerous = any(seq in ctx for seq in _BRACKET_MEANS)
+    return _MD_SPECIAL.sub(lambda m: _esc_special(m, dangerous),
+                           text.replace("\\", "\\\\"))
 
 
 def _num_val(value, default):
@@ -412,9 +443,23 @@ def _close_list(lst):
 
 def _esc_lead(text):
     # type: (str) -> str
-    """Escape LINE-LEADING constructs too (list/heading/blockquote markers), for
-    text that opens a markdown line: ``15. foo`` would otherwise become an ordered
-    list whose marker (the ``15``) renderers and strippers both swallow."""
+    """Escape LINE-LEADING constructs too, for text that opens a markdown line.
+
+    Inline escaping (``_esc``) is not enough: a body paragraph must never come out
+    as a BLOCK the source never had. ``15. foo`` becomes an ordered list whose
+    marker renderers and strippers both swallow; ``## Build steps`` becomes a real
+    H2, which the structure-fidelity gate then (correctly) rejects as a fabricated
+    heading, so the whole document fails to publish; ``-----`` becomes a thematic
+    break and ``===`` a setext underline, and both of those are worse than a
+    failure — they carry no tokens and no heading fact, so BOTH gates report a
+    clean pass over a paragraph that has been deleted from the rendered document.
+    ``[label]: dest`` is the same shape again: CommonMark eats the whole line as a
+    link reference definition.
+
+    One backslash on the front is enough for every one of them: it makes the first
+    character literal, and no block construct can open on a literal character.
+    ``markdown_to_text`` strips it back off (``_ESCAPED_PUNCT``), so the text layer
+    and the recall gate see the paragraph exactly as the document wrote it."""
     if not text:
         return ""
     if text.startswith(">"):
@@ -422,7 +467,7 @@ def _esc_lead(text):
     m = _LEAD_LIST_NUM.match(text)
     if m:
         return text[:m.end(1)] + "\\" + text[m.end(1):]
-    if _LEAD_MARK.match(text):
+    if _LEAD_MARK.match(text) or _LEAD_RULE.match(text) or _LEAD_REFDEF.match(text):
         return "\\" + text
     return text
 
@@ -566,15 +611,86 @@ def _toggle_on(pr):
     return _attr(pr, "val") not in _OFF
 
 
-def _run_marks(run, char_styles=None):
-    # type: (object, object) -> tuple
-    """Formatting marks carried by one w:r, from its DIRECT w:rPr child.
+def _mark_of(loc):
+    # type: (str) -> str
+    """The mark one ``w:rPr`` child names, or ``""`` for a property that is not
+    one of the three this converter can render."""
+    if loc in _BOLD_LOCALS:
+        return "strong"
+    if loc in _ITALIC_LOCALS:
+        return "em"
+    if loc in _STRIKE_LOCALS:
+        return "strike"
+    return ""
 
-    Only direct formatting is read. Bold inherited from a paragraph style or from
-    docDefaults is invisible here — resolving the full style cascade (basedOn
-    chains, docDefaults, w:pPr/w:rPr) is a different feature, and claiming it
-    without implementing it would make the fidelity gate lie in both directions."""
-    marks = set()
+
+def _rpr_marks(el):
+    # type: (object) -> tuple
+    """``(on, off)`` — the marks the DIRECT ``w:rPr`` children of ``el`` turn on
+    and off. Tri-state, because ``<w:b w:val="0"/>`` is how a run (or a derived
+    style) takes back the bold it would otherwise inherit."""
+    on, off = set(), set()
+    for pr in el:
+        if _local(pr.tag) != "rPr":
+            continue
+        for prop in pr:
+            loc = _local(prop.tag)
+            if loc == "rPrChange":            # the PREVIOUS formatting of a tracked
+                continue                      # change — never the live one
+            mark = _mark_of(loc)
+            if mark:
+                (on if _toggle_on(prop) else off).add(mark)
+    return frozenset(on), frozenset(off)
+
+
+def _docx_style_marks(styles_xml):
+    # type: (str) -> dict
+    """styleId -> the emphasis marks that style CARRIES, resolved through basedOn.
+
+    Word puts bold on the STYLE at least as often as on the run: the built-in
+    ``Strong``/``Emphasis`` character styles, a ``Quote`` or ``Caption`` paragraph
+    style, and anything that came out of pandoc or an HTML->Word round trip. Reading
+    only a run's own ``w:rPr`` deleted every one of them — and deleted them
+    SILENTLY, because the structural ground truth used to read the document the same
+    wrong way and agree that there was nothing there.
+
+    Resolved by VALUE down the chain (``(inherited | own_on) - (own_off - own_on)``),
+    so a style based on a bold one that carries ``<w:b w:val="0"/>`` is not bold.
+    ``w:docDefaults`` and the ``w:default="1"`` style are deliberately NOT resolved:
+    a document that declares bold document-wide is not emphasising anything, and
+    marking every run in the file would be the mirror-image lie."""
+    root = _root(styles_xml)
+    if root is None:
+        return {}
+    records = _docx_style_records(styles_xml)
+    own = {}
+    for style in root:
+        if _local(style.tag) == "style" and _attr(style, "styleId"):
+            own[_attr(style, "styleId")] = _rpr_marks(style)
+    out = {}
+    for sid in records:
+        marks = frozenset()
+        for anc in reversed(_style_chain(sid, records)):   # farthest ancestor first
+            on, off = own.get(anc, (frozenset(), frozenset()))
+            marks = (marks | on) - (off - on)
+        if marks:
+            out[sid] = marks
+    return out
+
+
+def _run_marks(run, char_styles=None, style_marks=None, inherited=()):
+    # type: (object, object, object, tuple) -> tuple
+    """Formatting marks carried by one w:r: its own ``w:rPr``, the character style
+    its ``w:rStyle`` names, and whatever the owning PARAGRAPH's style supplies.
+
+    The order of resolution is load-bearing. An inherited mark is turned back off
+    by the run's OWN ``<w:b w:val="0"/>`` and by nothing else, which is how a run
+    inside a bold style un-bolds itself; an ``on`` in the same run wins over its own
+    ``off``, so a contradictory ``w:rPr`` still emphasises rather than dropping the
+    fact on the floor."""
+    style_on = set(inherited)
+    on, off = set(), set()
+    code = False
     for pr in run:
         if _local(pr.tag) != "rPr":
             continue
@@ -582,14 +698,19 @@ def _run_marks(run, char_styles=None):
             loc = _local(prop.tag)
             if loc == "rPrChange":            # the PREVIOUS formatting of a tracked
                 continue                      # change — never the live one
-            if loc in _BOLD_LOCALS and _toggle_on(prop):
-                marks.add("strong")
-            elif loc in _ITALIC_LOCALS and _toggle_on(prop):
-                marks.add("em")
-            elif loc in _STRIKE_LOCALS and _toggle_on(prop):
-                marks.add("strike")
-            elif loc == "rStyle" and char_styles and _attr(prop, "val") in char_styles:
-                marks.add("code")
+            if loc == "rStyle":
+                val = _attr(prop, "val")
+                if char_styles and val in char_styles:
+                    code = True
+                if style_marks:
+                    style_on |= style_marks.get(val, frozenset())
+                continue
+            mark = _mark_of(loc)
+            if mark:
+                (on if _toggle_on(prop) else off).add(mark)
+    marks = (style_on | on) - (off - on)
+    if code:
+        marks.add("code")
     return tuple(m for m in _MARK_ORDER if m in marks)
 
 
@@ -608,24 +729,127 @@ def _code_span(text):
     return fence + pad + text + pad + fence
 
 
-def _wrap_marks(text, marks):
-    # type: (str, tuple) -> str
+def _punct(ch):
+    # type: (str) -> bool
+    """CommonMark's "punctuation" for the flanking rule.
+
+    Anything that is neither whitespace nor alphanumeric. Deliberately WIDER than
+    the 0.30 spec (which leaves non-ASCII symbols out of the class): over-reporting
+    punctuation can only make the converter shift a delimiter it did not have to,
+    while under-reporting it emits one that cannot open."""
+    return bool(ch) and not ch.isspace() and not ch.isalnum()
+
+
+def _flank_blocked(inner, outer):
+    # type: (str, str) -> bool
+    """True when a delimiter run sitting between ``outer`` and ``inner`` can
+    neither open nor close.
+
+    A run is left-flanking when it is not followed by whitespace AND either it is
+    not followed by punctuation, or it is preceded by whitespace or punctuation
+    (start of line counts as whitespace); right-flanking is the mirror image. So
+    exactly ONE configuration kills a delimiter: punctuation on the inside and a
+    word character on the outside. ``Field MODE**(2:0)**`` is that configuration —
+    a renderer prints the four asterisks literally and the document's bold is gone
+    from the render, which the fidelity gate then reports as ``strong 1 vs 0``."""
+    return _punct(inner) and bool(outer) and not outer.isspace() and not _punct(outer)
+
+
+def _lead_unit(s):
+    # type: (str) -> int
+    """Length of the first RENDERING unit of an escaped string — a backslash escape
+    is two characters that render as one, and splitting it would leave the
+    backslash escaping a delimiter instead of the character it was written for."""
+    return 2 if (s[:1] == "\\" and len(s) > 1) else 1
+
+
+def _trail_unit(s):
+    # type: (str) -> int
+    """Length of the last rendering unit, found by scanning from the LEFT: ``\\\\.``
+    is an escaped backslash followed by a period, not an escaped period."""
+    i, last = 0, 0
+    while i < len(s):
+        last = i
+        i += 2 if (s[i] == "\\" and i + 1 < len(s)) else 1
+    return len(s) - last
+
+
+def _wrap_marks(text, marks, prev="", nxt=""):
+    # type: (str, tuple, str, str) -> str
     """Apply formatting marks to one already-escaped segment.
 
     Leading and trailing whitespace is moved OUTSIDE the markers: CommonMark's
     right-flanking rule refuses to close ``**bold **``, which would leave the
-    asterisks as literal text in the stored bytes."""
+    asterisks as literal text in the stored bytes.
+
+    ``prev``/``nxt`` are the characters that will sit either side of the emitted
+    markers, and they are what makes the rest of that rule checkable. When the
+    delimiter would be blocked — punctuation just inside it, a word character just
+    outside — one rendering unit of the segment's own text is moved out of the
+    span. That unit is punctuation by construction, so it becomes the delimiter's
+    new outer neighbour and the run flanks. The cost is that the emphasis covers
+    ``2:0`` instead of ``(2:0)``; the alternative is asterisks the reader sees and
+    an emphasis the render does not have. See DEVIATIONS in docs/quality-plan.md.
+
+    The shift is only available when the delimiter's inner neighbour is a character
+    of the TEXT. ``**`` and ``*`` together are ONE contiguous asterisk run, so bold
+    italic is still shiftable; a ``~~`` or a backtick between the asterisks and the
+    text (``**~~x~~**``, ``**`x`**``) is a delimiter that cannot move, and those stay
+    as they are with the fidelity gate reporting the loss."""
     if not marks or not text.strip():
         return text
     lead = text[:len(text) - len(text.lstrip())]
     trail = text[len(text.rstrip()):]
     core = text.strip()
+    if lead:
+        prev = lead[-1]
+    if trail:
+        nxt = trail[0]
+    pre = post = ""
+    emph = [m for m in ("strong", "em", "strike") if m in marks]
+    if "code" not in marks and emph and ("strike" not in emph or emph == ["strike"]):
+        n = _lead_unit(core)
+        if len(core) > n and _flank_blocked(core[n - 1], prev):
+            pre, core = core[:n], core[n:]
+        n = _trail_unit(core)
+        if len(core) > n and _flank_blocked(core[-1], nxt):
+            core, post = core[:-n], core[-n:]
     if "code" in marks:
         core = _code_span(core)
     for mark in ("strike", "em", "strong"):       # innermost first
         if mark in marks:
             core = _MARKERS[mark] + core + _MARKERS[mark]
-    return lead + core + trail
+    return lead + pre + core + post + trail
+
+
+def _stars(marks):
+    # type: (tuple) -> bool
+    """True when this segment's OUTERMOST marker is an asterisk run."""
+    return "strong" in marks or "em" in marks
+
+
+def _edge_char(group, first, merges):
+    # type: (tuple, bool, bool) -> str
+    """The character that will actually sit against this segment's delimiter run.
+
+    Usually the neighbour's own marker, and every marker this converter emits
+    (``*``, ``~``, `````) is punctuation, so which one it is does not matter.
+
+    The exception is what made ``**MODE***(2:0)*`` unreadable: two asterisk markers
+    written against each other are ONE delimiter run to CommonMark, so the
+    neighbour's marker does not shield us — what abuts the run is whatever is inside
+    the neighbour's asterisks, its own inner ``~~``/backtick or its text. ``merges``
+    is whether THIS segment emits asterisks too; a ``~~`` against a ``*`` is two
+    runs, and each is punctuation to the other."""
+    marks, text = group
+    if not text:
+        return ""
+    edge = text[0] if first else text[-1]
+    if not marks or not text.strip() or edge.isspace():
+        return edge
+    if merges and _stars(marks):
+        return "*" if ("code" in marks or "strike" in marks) else edge
+    return "*"
 
 
 def _render_runs(segments):
@@ -635,8 +859,11 @@ def _render_runs(segments):
     Coalescing is mandatory, not tidiness. Word splits one word across several
     runs at every property boundary — a spell-check mark is enough — so wrapping
     each run on its own emits ``**Dma****Arbiter**``, which ``markdown_to_text``'s
-    non-greedy _BOLD mis-pairs into a stray literal ``**`` in the text layer."""
-    out = []
+    non-greedy _BOLD mis-pairs into a stray literal ``**`` in the text layer.
+
+    Coalescing FIRST is also what makes the flanking check meaningful: a segment's
+    neighbours are only known once the groups are final."""
+    groups = []  # type: list
     i = 0
     while i < len(segments):
         marks, text = segments[i]
@@ -644,8 +871,14 @@ def _render_runs(segments):
         while j < len(segments) and segments[j][0] == marks:
             text += segments[j][1]
             j += 1
-        out.append(_wrap_marks(text, marks))
+        groups.append((marks, text))
         i = j
+    out = []
+    for k, group in enumerate(groups):
+        star = _stars(group[0])
+        prev = _edge_char(groups[k - 1], False, star) if k else ""
+        nxt = _edge_char(groups[k + 1], True, star) if k + 1 < len(groups) else ""
+        out.append(_wrap_marks(group[1], group[0], prev, nxt))
     return "".join(out)
 
 
@@ -709,21 +942,33 @@ def _join_blocks(blocks):
     lets a list interrupt a paragraph only when an ordered marker reads ``1``, so a
     sub-list that starts at 5 written directly under its parent's text is swallowed
     as that parent's prose. One blank line closes the parent's paragraph and the
-    sub-list survives; the items after it stack normally again."""
+    sub-list survives; the items after it stack normally again.
+
+    An EMPTY code block is a blank line inside a listing (in Word, pressing Enter
+    inside a shell transcript), and it is kept when it falls between two code lines:
+    a blank line is part of the program. Leading and trailing ones are dropped —
+    they emit no block, so they neither open a fence nor close one, which is exactly
+    what the structural ground truth counts."""
     parts = []  # type: list
     prev_kind = None
     i = 0
     while i < len(blocks):
         kind, text = blocks[i]
-        if not text:
-            i += 1
-            continue
         if kind == "code":
             run = []  # type: list
-            while i < len(blocks) and blocks[i][0] == "code" and blocks[i][1]:
+            while i < len(blocks) and blocks[i][0] == "code":
                 run.append(blocks[i][1])
                 i += 1
+            while run and not run[0]:
+                del run[0]
+            while run and not run[-1]:
+                del run[-1]
+            if not run:
+                continue
             text = _fenced(run)
+        elif not text:
+            i += 1
+            continue
         else:
             i += 1
         if parts:
@@ -819,6 +1064,23 @@ def _docx_styles(styles_xml):
                 continue
             break
     return levels
+
+
+# Everything the paragraph and run renderers need to know about word/styles.xml,
+# in one bundle so the four walkers that thread it cannot drift apart on which
+# question they answer from which map.
+_EMPTY_STYLE_CTX = {"para": (), "char": (), "levels": {}, "marks": {}}
+
+
+def _docx_style_ctx(styles_xml):
+    # type: (str) -> dict
+    """``{"para", "char", "levels", "marks"}`` — the four style questions the docx
+    renderers ask: is this paragraph code, is this run code, is this paragraph a
+    heading, and what emphasis does this style carry."""
+    code = _docx_code_styles(styles_xml)
+    return {"para": code["para"], "char": code["char"],
+            "levels": _docx_styles(styles_xml),
+            "marks": _docx_style_marks(styles_xml)}
 
 
 def _docx_numbering(numbering_xml):
@@ -933,8 +1195,104 @@ def _p_style_info(p):
     return sid, num_id, ilvl, outline
 
 
-def _docx_p_text(p, links, boxes, images=None, char_styles=None, raw=False):
-    # type: (object, dict, list, object, object, bool) -> str
+def _heading_level(sid, outline, levels):
+    # type: (str, str, dict) -> object
+    """The markdown heading level a paragraph renders at, or ``None``: its style's
+    level, else an explicit ``w:outlineLvl`` on the paragraph itself."""
+    level = levels.get(sid)
+    if level is None and outline:
+        try:
+            level = int(outline) + 1
+        except ValueError:
+            level = None
+    return level
+
+
+def _p_marks(p, sty):
+    # type: (object, object) -> tuple
+    """The emphasis a paragraph's OWN style hands to every run inside it.
+
+    Two exclusions, and both are statements about MARKDOWN rather than about Word.
+    A CODE paragraph carries none: inside a fence ``**`` is two asterisks, so there
+    is no span there either to emit or to lose. A HEADING carries none either —
+    every stock ``Heading1..9`` carries ``<w:b/>``, and ``# Title`` already renders
+    bold, so honouring it would demand ``# **Title**`` of every heading in every
+    document. A run's OWN ``w:rStyle`` marks inside either still count."""
+    if not sty:
+        return ()
+    sid, _num, _ilvl, outline = _p_style_info(p)
+    if not sid and not outline:
+        return ()
+    if sid in (sty.get("para") or ()):
+        return ()
+    if _heading_level(sid, outline, sty.get("levels") or {}):
+        return ()
+    return tuple((sty.get("marks") or {}).get(sid, ()))
+
+
+def _p_literal(p):
+    # type: (object) -> str
+    """The paragraph's literal source text, joined the way the markdown line will
+    join it — the string a LINE-SCOPED escaping decision has to be made against.
+
+    Only the characters the document itself supplies: a hyperlink's display text is
+    in, the ``](url)`` the converter synthesises around it is not. That asymmetry is
+    the point. A genuine link must not freeze every unrelated ``[31:0]`` in the same
+    paragraph into ``\\[31:0\\]``, and a fabricated one must not be allowed to form."""
+    out = []  # type: list
+
+    def walk(el):
+        for ch in el:
+            loc = _local(ch.tag)
+            if loc in _SKIP_LOCALS or loc in ("pPr", "txbxContent"):
+                continue
+            if loc == "t":
+                if ch.text:
+                    out.append(ch.text)
+            elif loc in _BREAK_LOCALS:
+                out.append(" ")
+            else:
+                walk(ch)
+    walk(p)
+    return "".join(out)
+
+
+def _collapse_prose(segments):
+    # type: (list) -> list
+    """Collapse runs of whitespace in PROSE segments, leaving code spans verbatim.
+
+    Whitespace is not content in prose — Word's own renderer collapses it — but
+    inside a code span it IS content: ``cmd   --flag`` and a column-aligned
+    ``NAME      OFFSET`` mean what their columns say, and one shared normalisation
+    over the finished line silently retyped both.
+
+    The collapse spans segment boundaries, because Word splits one word and the
+    space after it across runs, so collapsing each segment on its own would leave
+    ``foo `` + `` bar`` doubled where the old whole-line pass did not."""
+    out = []  # type: list
+    prev_space = True                 # the start of the line behaves like a space
+    for marks, text in segments:
+        if "code" in marks:
+            core = text.strip()
+            if core:
+                # Only the OUTER whitespace of a code segment is prose spacing;
+                # _wrap_marks moves it outside the backticks anyway.
+                chunk = ((" " if (text[:1].isspace() and not prev_space) else "")
+                         + core + (" " if text[-1:].isspace() else ""))
+            else:
+                chunk = "" if prev_space else " "
+        else:
+            chunk = _WS.sub(" ", text)
+            if prev_space and chunk[:1] == " ":
+                chunk = chunk[1:]
+        if chunk:
+            prev_space = chunk[-1:] == " "
+        out.append((marks, chunk))
+    return out
+
+
+def _docx_p_text(p, links, boxes, images=None, sty=None, raw=False, pmarks=()):
+    # type: (object, dict, list, object, object, bool, tuple) -> str
     """Markdown text of one paragraph: verbatim run joins, hyperlinks rendered
     ``[text](url)`` when the rel target is external. Text boxes anchored inside
     the paragraph are collected into ``boxes`` for rendering as their own blocks.
@@ -943,13 +1301,21 @@ def _docx_p_text(p, links, boxes, images=None, char_styles=None, raw=False):
     ``<v:imagedata>``) are appended to it in reading order; the caller emits the
     sentinels. ``None`` (the default) means the legacy text-only walk -- byte-identical.
 
-    ``char_styles`` is the set of character styleIds that mean monospace; runs
-    carrying one become inline code spans. ``raw`` is for a paragraph that is
-    ITSELF code: its text is emitted unescaped and unmarked, because the caller
-    will put it inside a fence where backslashes would survive as literal
-    characters and destroy recall (``markdown_to_text`` keeps fenced lines verbatim
-    and never unescapes them)."""
+    ``sty`` is the style context from ``_docx_style_ctx``: ``char`` (the character
+    styleIds that mean monospace, whose runs become inline code spans) and ``marks``
+    (the emphasis each style carries). ``pmarks`` is what the paragraph's OWN style
+    hands to every run in it — see ``_p_marks``.
+
+    ``raw`` is for a paragraph that is ITSELF code. Its text is emitted unescaped,
+    unmarked and — this is the part that was missing — UNTOUCHED: no whitespace
+    normalisation, ``w:tab`` as a tab and ``w:br`` as a newline, because the caller
+    puts it inside a fence where indentation and column alignment are the content.
+    Escaping is skipped for the same reason (``markdown_to_text`` keeps fenced lines
+    verbatim and never unescapes them, so a backslash there would destroy recall)."""
     segments = []  # type: list
+    char_styles = sty.get("char") if sty else None
+    style_marks = sty.get("marks") if sty else None
+    line = None if raw else _p_literal(p)
 
     def walk(el, marks):
         for ch in el:
@@ -970,12 +1336,15 @@ def _docx_p_text(p, links, boxes, images=None, char_styles=None, raw=False):
                     images.append(rid)
                 continue
             if loc == "r" and not raw:
-                walk(ch, _run_marks(ch, char_styles) or marks)
+                walk(ch, _run_marks(ch, char_styles, style_marks, pmarks) or marks)
                 continue
             if loc == "hyperlink":
                 mark = len(segments)
                 walk(ch, marks)
-                inner = _WS.sub(" ", _render_runs(segments[mark:])).strip()
+                if raw:
+                    inner = "".join(t for _m, t in segments[mark:])
+                else:
+                    inner = _render_runs(_collapse_prose(segments[mark:])).strip()
                 del segments[mark:]
                 url = _attr(ch, "id") and links.get(_attr(ch, "id"), "") or ""
                 if raw:
@@ -989,18 +1358,26 @@ def _docx_p_text(p, links, boxes, images=None, char_styles=None, raw=False):
             if loc == "t":
                 if ch.text:
                     segments.append((marks, ch.text if (raw or "code" in marks)
-                                     else _esc(ch.text)))
+                                     else _esc(ch.text, line)))
                 continue
             if loc in _BREAK_LOCALS:
-                segments.append((marks, " "))
+                # Inside a fence these are the program's own layout: a tab is an
+                # indent and a soft break is the next LINE, not a space that welds
+                # two statements into one.
+                segments.append((marks, ("\t" if loc == "tab" else "\n") if raw
+                                 else " "))
                 continue
             walk(ch, marks)
     walk(p, ())
-    text = "".join(t for _m, t in segments) if raw else _render_runs(segments)
-    return _WS.sub(" ", text).strip()
+    if raw:
+        # rstrip only: leading indentation is the content, trailing blanks are not
+        # (and markdown_to_text rstrips fenced lines anyway, so keeping them would
+        # only move the stored bytes away from the text layer).
+        return "".join(t for _m, t in segments).rstrip()
+    return _render_runs(_collapse_prose(segments)).strip()
 
 
-def _docx_cell_text(tc, links, boxes, images=None, char_styles=None):
+def _docx_cell_text(tc, links, boxes, images=None, sty=None):
     # type: (object, dict, list, object, object) -> str
     """One table cell as a single GFM-safe cell text; inner paragraphs join with
     ``<br>``; NESTED table rows flatten into the cell (escaped pipes) so their
@@ -1012,11 +1389,11 @@ def _docx_cell_text(tc, links, boxes, images=None, char_styles=None):
     _find_locals(tc, ("p", "tbl"), content, stop=("tcPr",))
     for el in content:
         if _local(el.tag) == "p":
-            t = _docx_p_text(el, links, boxes, images, char_styles)
+            t = _docx_p_text(el, links, boxes, images, sty, pmarks=_p_marks(el, sty))
             if t:
                 chunks.append(_md_cell(t))
         else:
-            for row in _docx_table_rows_md(el, links, boxes, images, char_styles):
+            for row in _docx_table_rows_md(el, links, boxes, images, sty):
                 flat = " ".join(c for c in row if c)
                 if flat:
                     chunks.append(flat)
@@ -1050,7 +1427,7 @@ def _row_grid_pad(tr):
     return before, after
 
 
-def _docx_table_rows_md(tbl, links, boxes, images=None, char_styles=None):
+def _docx_table_rows_md(tbl, links, boxes, images=None, sty=None):
     # type: (object, dict, list, object, object) -> list
     """Rows of cell texts for one w:tbl, honoring gridSpan column geometry,
     gridBefore/gridAfter row offsets AND vMerge forward-fill. Rows/cells wrapped in
@@ -1084,7 +1461,7 @@ def _docx_table_rows_md(tbl, links, boxes, images=None, char_styles=None):
                     span = 1
             vmerges = []  # type: list
             _find_locals(tc, ("vMerge",), vmerges, stop=("p", "tbl"))
-            text = _docx_cell_text(tc, links, boxes, images, char_styles)
+            text = _docx_cell_text(tc, links, boxes, images, sty)
             if vmerges and _attr(vmerges[0], "val") != "restart":
                 if not text:                       # continuation: repeat the value above
                     text = fill.get(col, "")
@@ -1101,7 +1478,7 @@ def _docx_table_rows_md(tbl, links, boxes, images=None, char_styles=None):
     return rows
 
 
-def _lift_box(box, styles, numbering, links, blocks, img, lst, code, snum, pad):
+def _lift_box(box, styles, numbering, links, blocks, img, lst, sty, snum, pad):
     # type: (object, dict, dict, dict, list, object, dict, object, dict, str) -> None
     """Render one text box's content as its own blocks, indented into the list item
     that anchors it whenever that is expressible.
@@ -1124,7 +1501,7 @@ def _lift_box(box, styles, numbering, links, blocks, img, lst, code, snum, pad):
     # its own. The COUNTERS are shared, because Word does not restart a procedure
     # because a callout was anchored inside it.
     inner = {"cols": [], "counts": lst["counts"], "open": {}}
-    _docx_blocks(box, styles, numbering, links, sub, img, inner, code, snum)
+    _docx_blocks(box, styles, numbering, links, sub, img, inner, sty, snum)
     if pad and not any(k in ("li", "lib", "code") for k, _t in sub):
         for kind, text in sub:
             blocks.append((kind, "\n".join(pad + ln for ln in text.split("\n"))))
@@ -1133,7 +1510,7 @@ def _lift_box(box, styles, numbering, links, blocks, img, lst, code, snum, pad):
     blocks.extend(sub)
 
 
-def _docx_blocks(el, styles, numbering, links, blocks, img=None, lst=None, code=None,
+def _docx_blocks(el, styles, numbering, links, blocks, img=None, lst=None, sty=None,
                  snum=None):
     # type: (object, dict, dict, dict, list, object, dict, object, dict) -> None
     """Walk any element emitting (kind, markdown) blocks for each w:p / w:tbl.
@@ -1154,9 +1531,11 @@ def _docx_blocks(el, styles, numbering, links, blocks, img=None, lst=None, code=
     clamped by ``_list_indent``, which is the real defence against a list that starts
     at ilvl 2 with no parent.
 
-    ``code`` is ``{"para": {styleId}, "char": {styleId}}`` from ``_docx_code_styles``:
-    a paragraph in a code style becomes a ``("code", ...)`` block, which
-    ``_join_blocks`` fuses with its neighbours into one fenced block.
+    ``sty`` is the style context from ``_docx_style_ctx``. Its ``para``/``char``
+    code-style sets make a paragraph in a code style a ``("code", ...)`` block —
+    which ``_join_blocks`` fuses with its neighbours into one fenced block — and a
+    run in one an inline code span; ``marks`` and ``levels`` resolve the emphasis a
+    style carries (see ``_p_marks``).
 
     ``snum`` is ``{styleId: (numId, ilvl)}`` from ``_docx_style_numbering`` — the
     numbering a paragraph inherits from its STYLE when its own w:pPr carries none.
@@ -1164,8 +1543,8 @@ def _docx_blocks(el, styles, numbering, links, blocks, img=None, lst=None, code=
     rels = img["rels"] if img is not None else None
     if lst is None:
         lst = {"cols": [], "counts": {}, "open": {}}
-    if code is None:
-        code = {"para": (), "char": ()}
+    if sty is None:
+        sty = _EMPTY_STYLE_CTX
     if snum is None:
         snum = {}
     cols = lst["cols"]
@@ -1183,20 +1562,20 @@ def _docx_blocks(el, styles, numbering, links, blocks, img=None, lst=None, code=
                     num_id = inherited[0]
                     if not ilvl:
                         ilvl = inherited[1]
-            is_code = sid in code["para"]
-            text = _docx_p_text(ch, links, boxes, images, code["char"], raw=is_code)
+            is_code = sid in sty["para"]
+            level = None if is_code else _heading_level(sid, outline, styles)
+            text = _docx_p_text(ch, links, boxes, images, sty, raw=is_code,
+                                pmarks=_p_marks(ch, sty))
             item_pad = ""            # the content column an anchored figure continues
-            if text:
-                level = None if is_code else styles.get(sid)
-                if level is None and outline and not is_code:
-                    try:
-                        level = int(outline) + 1
-                    except ValueError:
-                        level = None
-                if is_code:
-                    _close_list(lst)
-                    blocks.append(("code", text))
-                elif level:
+            if is_code:
+                # Emitted even when EMPTY: a blank line inside a shell transcript is
+                # part of the transcript, and _join_blocks keeps the ones that fall
+                # between two code lines (and drops the ones that do not, which is
+                # what the structural ground truth counts).
+                _close_list(lst)
+                blocks.append(("code", text))
+            elif text:
+                if level:
                     _close_list(lst)
                     blocks.append(("h", "#" * min(level, 6) + " " + _esc_lead(text)))
                 elif num_id and num_id != "0":
@@ -1236,7 +1615,7 @@ def _docx_blocks(el, styles, numbering, links, blocks, img=None, lst=None, code=
                     blocks.extend(img_blocks)
                     _close_list(lst)          # a column-0 sentinel closes the list
             for box in boxes:
-                _lift_box(box, styles, numbering, links, blocks, img, lst, code,
+                _lift_box(box, styles, numbering, links, blocks, img, lst, sty,
                           snum, item_pad)
         elif loc == "tbl":
             # A 1x1 table is Word LAYOUT scaffolding (a framed section), not data:
@@ -1251,12 +1630,12 @@ def _docx_blocks(el, styles, numbering, links, blocks, img=None, lst=None, code=
                 if len(tcs) == 1:
                     single = tcs[0]
             if single is not None:
-                _docx_blocks(single, styles, numbering, links, blocks, img, lst, code,
+                _docx_blocks(single, styles, numbering, links, blocks, img, lst, sty,
                              snum)
                 continue
             boxes = []
             images = [] if rels is not None else None
-            rows_md = _docx_table_rows_md(ch, links, boxes, images, code["char"])
+            rows_md = _docx_table_rows_md(ch, links, boxes, images, sty)
             # The row lists are already span-padded, so their length IS the
             # declared grid width; passing it stops a lone spanning cell from
             # trimming the table back to one column.
@@ -1269,10 +1648,10 @@ def _docx_blocks(el, styles, numbering, links, blocks, img=None, lst=None, code=
                 _emit_image_blocks(images, rels, blocks)
                 _close_list(lst)
             for box in boxes:
-                _lift_box(box, styles, numbering, links, blocks, img, lst, code,
+                _lift_box(box, styles, numbering, links, blocks, img, lst, sty,
                           snum, "")
         else:
-            _docx_blocks(ch, styles, numbering, links, blocks, img, lst, code, snum)
+            _docx_blocks(ch, styles, numbering, links, blocks, img, lst, sty, snum)
 
 
 def _docx_notes_section(xml, title):
@@ -1325,17 +1704,17 @@ def docx_markdown(parts, emit_images=False):
     root = _root(parts.get("word/document.xml", ""))
     if root is None:
         return ""
-    styles = _docx_styles(parts.get("word/styles.xml", ""))
+    sty = _docx_style_ctx(parts.get("word/styles.xml", ""))
+    styles = sty["levels"]
     numbering = _docx_numbering(parts.get("word/numbering.xml", ""))
     links = _rels_targets(parts.get("word/_rels/document.xml.rels", ""))
     img = None
     if emit_images:
         img = {"rels": _image_rels(parts.get("word/_rels/document.xml.rels", ""),
                                    "word/document.xml")}
-    code = _docx_code_styles(parts.get("word/styles.xml", ""))
     snum = _docx_style_numbering(parts.get("word/styles.xml", ""))
     blocks = []  # type: list
-    _docx_blocks(root, styles, numbering, links, blocks, img, None, code, snum)
+    _docx_blocks(root, styles, numbering, links, blocks, img, None, sty, snum)
     for part, title in (("word/footnotes.xml", "Footnotes"),
                         ("word/endnotes.xml", "Endnotes"),
                         ("word/comments.xml", "Comments")):

@@ -15,7 +15,8 @@ from collections import OrderedDict
 import pytest
 
 from backend.ingest import parse_block, render_front_matter
-from backend.kb import KNOWLEDGE_FILE, in_knowledge, load_vocab, split_meta
+from backend.kb import (KNOWLEDGE_FILE, SCHEMA_VERSION, in_knowledge, load_vocab,
+                        split_meta)
 
 pytestmark = pytest.mark.integration
 
@@ -26,6 +27,12 @@ REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 VOCAB = os.path.join(REPO, "config", "vocab.yaml")
 
 BODY = "# Overview\n\nThe collector runs on the build host.\n"
+
+# What the ENRICHER stamps. The skew gate compares a document's versions against the
+# versions the running code emits, not against the newest one the corpus happens to
+# hold, so a fixture that stamped neither was a uniformly-stale corpus and drew a
+# backfill finding naming every document in it.
+VOCAB_VERSION = load_vocab(VOCAB).version
 
 
 def _mod(name):
@@ -44,15 +51,21 @@ def _meta(doc_id, extra=None):
     # A realistically populated, clean metadata block: every value a governed term.
     m = OrderedDict([
         ("id", doc_id),
+        ("schema_version", SCHEMA_VERSION),
+        ("vocab_version", VOCAB_VERSION),
         ("title", "Collector runbook"),
         ("type", "runbook"),
         ("lang", "en-GB"),
         ("status", "approved"),
         ("confidentiality", "internal"),
         ("owner", "platform-team"),
+        # Every knowledge record cites the section that asserts it. That became a
+        # schema requirement at SCHEMA_VERSION 3 and the linter can finally see it,
+        # so a fixture that called itself "clean" without one was pinning the hole.
         ("relations", [OrderedDict([("s", "collector"),
                                     ("p", "runs_on"),
-                                    ("o", "build-host")])]),
+                                    ("o", "build-host"),
+                                    ("ref", "#overview")])]),
     ])
     for key, val in (extra or []):
         m[key] = val
@@ -272,10 +285,12 @@ def test_two_individually_perfect_documents_still_fail_the_corpus_gates(
     bundles = tmp_path / "bundles"
     _write_doc(bundles, "b01", _meta("fleet-runbook", [
         ("entities", {"software": [OrderedDict([("name", "Docker"),
-                                                ("type", "Software")])]})]))
+                                                ("type", "Software"),
+                                                ("ref", "#overview")])]})]))
     _write_doc(bundles, "b02", _meta("fleet-runbook", [
         ("entities", {"software": [OrderedDict([("name", "docker"),
-                                                ("type", "Software")])]})]))
+                                                ("type", "Software"),
+                                                ("ref", "#overview")])]})]))
 
     assert kb.main(_argv(bundles)) == 1
     out = capsys.readouterr().out
@@ -401,12 +416,13 @@ def test_strict_promotes_a_corpus_warning_to_a_failure_too(tmp_path, capsys):
     # accumulate, or half the gates are exempt from the CI knob.
     kb = _mod("kb_lint")
     bundles = tmp_path / "bundles"
-    # Both versions stamped everywhere, so exactly ONE corpus warning is in play:
-    # b01 is behind on schema_version. Anything else would make the count ambiguous.
-    _write_doc(bundles, "b01", _meta("alpha-runbook", [("schema_version", 1),
-                                                       ("vocab_version", 1)]))
-    _write_doc(bundles, "b02", _meta("beta-runbook", [("schema_version", 2),
-                                                      ("vocab_version", 1)]))
+    # Both versions stamped everywhere and b02 on the CURRENT pair, so exactly ONE
+    # corpus warning is in play: b01 is behind on schema_version. Anything else would
+    # make the count ambiguous — in particular b01 must not be behind on
+    # `vocab_version` as well, and neither may be behind the version the running code
+    # emits, which is what `schema-corpus-behind` reports separately.
+    _write_doc(bundles, "b01", _meta("alpha-runbook", [("schema_version", 1)]))
+    _write_doc(bundles, "b02", _meta("beta-runbook"))
 
     assert kb.main(_argv(bundles)) == 0
     out = capsys.readouterr().out
@@ -537,6 +553,50 @@ def test_linting_twice_leaves_the_corpus_byte_identical(tmp_path, capsys):
     assert first == second                           # and a deterministic report
 
 
+def test_the_json_report_is_byte_identical_across_SEPARATE_PROCESSES(tmp_path):
+    # `test_linting_twice_leaves_the_corpus_byte_identical` above calls main() twice
+    # in ONE process, so both runs share a hash seed and set iteration is identical
+    # by construction — it is structurally incapable of catching this. CPython
+    # randomises str hashing PER PROCESS, and `synonym_report` built its alias table
+    # by iterating a per-document set, so `alias_suggestions` came out in a different
+    # key order on every ordinary invocation over the same bytes.
+    #
+    # TWO collision groups minimum: within one group the members were already sorted,
+    # so a single-group fixture is byte-stable before the fix and the test could not
+    # fail. That is the check-that-cannot-fail shape this project treats as worst.
+    import subprocess
+    import sys
+
+    bundles = tmp_path / "bundles"
+    variants = [("fleet-upgrade", "fleet_upgrade"), ("rhel-8", "rhel_8"),
+                ("cost-model", "cost_model"), ("edge-cache", "edge_cache"),
+                ("blue-green", "blue_green"), ("k8s-node", "k8s_node")]
+    for i in range(6):
+        _write_doc(bundles, "b%02d" % i,
+                   _meta("doc-%d" % i,
+                         [("tags_proposed", [v[i % 2] for v in variants])]))
+
+    digests = set()
+    for seed in ("0", "1", "2", "3"):
+        out = os.path.join(str(tmp_path), "rep-%s.json" % seed)
+        env = dict(os.environ, PYTHONHASHSEED=seed)
+        # Exit 1 is EXPECTED and is the point: six spelling collisions are corpus
+        # ERRORs. What is under test is that the artifact it writes on the way out
+        # is the same bytes every time.
+        rc = subprocess.call(
+            [sys.executable, os.path.join(REPO, "scripts", "kb_lint.py"),
+             "--bundles", str(bundles), "--vocab", VOCAB, "--json", out, "--quiet"],
+            cwd=REPO, env=env, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL)
+        assert rc == 1
+        with open(out, encoding="utf-8") as fh:
+            report = json.load(fh)
+        block = report["alias_suggestions"]
+        assert block and sum(len(t) for t in block.values()) >= 5
+        digests.add(json.dumps(block, sort_keys=False))
+    assert len(digests) == 1
+
+
 def test_the_linter_grades_both_files_and_says_which_one_to_open(tmp_path, capsys):
     # The linter works on ONE merged mapping, which is what keeps every rule in
     # backend.kb unaware of the storage split — but a person still has to be told
@@ -547,7 +607,8 @@ def test_the_linter_grades_both_files_and_says_which_one_to_open(tmp_path, capsy
     _write_doc(bundles, "b01", _meta("alpha-runbook", [
         ("type", "cookbook"),                                    # document.md
         ("relations", [OrderedDict([("s", "a"), ("p", "NOT_A_PREDICATE"),
-                                    ("o", "b")])]),              # knowledge.json
+                                    ("o", "b"),
+                                    ("ref", "#overview")])]),    # knowledge.json
     ]))
 
     assert kb.main(_argv(bundles)) == 1
@@ -565,7 +626,8 @@ def test_the_json_report_names_the_file_each_finding_belongs_to(tmp_path, capsys
     bundles = tmp_path / "bundles"
     _write_doc(bundles, "b01", _meta("alpha-runbook", [
         ("type", "cookbook"),
-        ("relations", [OrderedDict([("s", "a"), ("p", "NOPE"), ("o", "b")])]),
+        ("relations", [OrderedDict([("s", "a"), ("p", "NOPE"), ("o", "b"),
+                                    ("ref", "#overview")])]),
     ]))
     target = os.path.join(str(tmp_path), "kb_lint.json")
     assert kb.main(_argv(bundles, "--json", target)) == 1
@@ -593,7 +655,8 @@ def test_a_document_whose_knowledge_lives_only_in_the_sidecar_is_still_graded(
         fh.write(render_front_matter(OrderedDict([("doc_id", "b01")])) + "\n" + BODY)
     with open(os.path.join(d, KNOWLEDGE_FILE), "w", encoding="utf-8") as fh:
         json.dump({"doc_id": "b01",
-                   "relations": [{"s": "a", "p": "NOT_A_PREDICATE", "o": "b"}]}, fh)
+                   "relations": [{"s": "a", "p": "NOT_A_PREDICATE", "o": "b",
+                                  "ref": "#overview"}]}, fh)
 
     assert kb.main(_argv(bundles)) == 1
     out = capsys.readouterr().out
@@ -654,7 +717,8 @@ def test_a_field_in_both_files_is_reported_rather_than_silently_resolved(
         text = fh.read()
     text = text.replace('  id: "alpha-runbook"',
                         '  id: "alpha-runbook"\n  relations:\n'
-                        '    - s: "x"\n      p: "runs_on"\n      o: "y"')
+                        '    - s: "x"\n      p: "runs_on"\n      o: "y"'
+                        '\n      ref: "#overview"')
     with open(path, "w", encoding="utf-8") as fh:
         fh.write(text)
 
@@ -809,7 +873,7 @@ def _scale_corpus(bundles, n_docs=1000, shared=("kubernetes", "ubernetes")):
         # still a node — so these five thousand names go through the blocked sweep
         # in full. That is the half of the run the shingle index has to carry.
         ents = [{"name": "".join(rng.choice(letters) for _ in range(14)),
-                 "type": "Software"} for _ in range(5)]
+                 "type": "Software", "ref": "#overview"} for _ in range(5)]
         # The planted near-duplicate pair differs in its FIRST characters, which is
         # exactly what the old first-two-character bucketing could never compare.
         # Both spellings sit on enough documents to stay inside a scoped sweep.

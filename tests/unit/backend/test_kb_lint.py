@@ -192,7 +192,184 @@ def test_an_entity_group_that_is_a_mapping_of_scalars_is_reported_not_dropped():
     assert malformed[0].where == "entities.broken"
 
 
+def test_every_required_sub_key_is_enforced_whether_or_not_it_has_a_vocabulary():
+    # THE REQUIRED-KEY CHECK USED TO BE A FILTER. It lived inside the loop over
+    # vocabulary-bound sub-keys, so `record_required` could only ever narrow THAT
+    # loop: of the thirteen required slots the schema declares, only the three that
+    # also carry a vocabulary (relations.p, decisions.status, risks.impact) could
+    # produce a finding. `open_questions` binds no vocabulary at all, so its loop
+    # body never ran, and the members of a `groups` field were never walked for
+    # required keys at all. A bundle where NOT ONE record cited a section anchor —
+    # the exact state SCHEMA_VERSION 3 was bumped for — linted errors=0 warnings=0.
+    meta = {"schema_version": 3,
+            "relations": [{"p": "runs_on"}],
+            "decisions": [{"id": "d1", "status": "accepted"}],
+            "risks": [{"id": "r1", "impact": "high"}],
+            "open_questions": [{"q": "?"}],
+            "entities": {"hosts": [{"name": "build01"}]},
+            "links": {"internal": [{"title": "x"}]}}
+    result = lint_document(meta, _vocab(), anchors=set(["setup"]), known_ids=set())
+
+    where = set(f.where for f in result["findings"]
+                if f.code in ("record-missing-required", "record-uncited"))
+    assert where == set([
+        "relations[0].s", "relations[0].o", "relations[0].ref",
+        "decisions[0].ref", "risks[0].ref", "open_questions[0].ref",
+        "entities.hosts[0].ref", "links.internal[0].url",
+        "links.internal[0].ref"])
+    assert all(f.severity == ERROR for f in result["findings"]
+               if f.code in ("record-missing-required", "record-uncited"))
+    assert result["errors"] == 9
+
+    # ... and a complete record produces none of them.
+    clean = lint_document(
+        {"schema_version": 3,
+         "relations": [{"s": "a", "p": "runs_on", "o": "b", "ref": "#setup"}],
+         "decisions": [{"id": "d1", "status": "accepted", "ref": "#setup"}],
+         "risks": [{"id": "r1", "impact": "high", "ref": "#setup"}],
+         "open_questions": [{"q": "?", "ref": "#setup"}],
+         "entities": {"hosts": [{"name": "build01", "ref": "#setup"}]},
+         "links": {"internal": [{"url": "https://x/", "ref": "#setup"}]}},
+        _vocab(), anchors=set(["setup"]), known_ids=set())
+    assert clean["errors"] == 0 and clean["warnings"] == 0
+
+
+def test_a_harvested_record_that_names_its_line_has_cited_its_source():
+    # A URL in the LEDE sits above the first heading, in a region a renderer emits
+    # no fragment for, so a `ref` there would be a dead link. What it does have is
+    # the body line it was lifted from. `harvested_links` writes exactly that, and
+    # the fidelity rubric's D5 row grants exactly this latitude — two gates
+    # disagreeing about what counts as a citation would make one of them wrong
+    # about every harvested link in the corpus.
+    meta = {"schema_version": 3,
+            "links": {"internal": [{"url": "https://x/", "line": 3,
+                                    "source": "extracted"}]}}
+    result = lint_document(meta, _vocab(), anchors=set(["setup"]))
+    assert _of(result, "record-uncited") == []
+
+    # The latitude is HARVESTED-only. A model-proposed record gets none of it, and
+    # neither does a harvested one that cannot say where it came from.
+    for bad in ({"url": "https://x/", "line": 3},
+                {"url": "https://x/", "source": "extracted"},
+                {"url": "https://x/", "line": 3, "source": "generated"}):
+        r = lint_document({"schema_version": 3, "links": {"internal": [bad]}},
+                          _vocab(), anchors=set(["setup"]))
+        assert [f.where for f in _of(r, "record-uncited")] == \
+            ["links.internal[0].ref"]
+
+
+def test_a_block_declaring_an_older_schema_gets_a_backfill_warning_not_an_error():
+    # `ref` became required at SCHEMA_VERSION 3. Every knowledge.json written under
+    # v2 has s/p/o and no ref, so grading those as ERRORs would turn every legacy
+    # bundle red on the first run after the bump — the same run the skew gate hands
+    # the operator as a work list. The finding is still MADE; only its severity
+    # follows the revision the block itself declares.
+    v2 = lint_document({"schema_version": 2,
+                        "relations": [{"s": "a", "p": "runs_on", "o": "b"}]},
+                       _vocab(), anchors=set(["setup"]))
+    uncited = _of(v2, "record-uncited")
+    assert len(uncited) == 1 and uncited[0].severity == WARN
+    assert v2["errors"] == 0 and v2["warnings"] == 1
+
+    # An UNSTAMPED block is being written now, against the current schema.
+    now = lint_document({"relations": [{"s": "a", "p": "runs_on", "o": "b"}]},
+                        _vocab(), anchors=set(["setup"]))
+    assert _of(now, "record-uncited")[0].severity == ERROR
+
+
+def test_a_link_group_that_is_not_a_list_of_records_is_reported_not_skipped():
+    # The `links` group was only ever graded on its group NAMES, so a group holding
+    # junk — or holding junk MEMBERS — read exactly like a group holding nothing.
+    # "Not looked at" and "looked at and clean" must never render the same.
+    result = lint_document({"links": {"internal": "https://x/",
+                                      "product_docs": [42]}}, _vocab())
+    codes = dict((f.code, f) for f in result["findings"])
+    assert codes["group-malformed"].where == "links.internal"
+    assert codes["record-malformed"].where == "links.product_docs[0]"
+    assert all(f.severity == ERROR for f in
+               (codes["group-malformed"], codes["record-malformed"]))
+
+
+def test_one_mistyped_list_field_is_one_error_not_two():
+    # The container shape gate already reports every mis-typed list field. The
+    # governed-list loop repeated the same report, so `tags: urgent` cost two ERROR
+    # rows in the JSON report and two in the corpus error total, while the identical
+    # slip on `see_also` (a list field with no vocabulary) cost one — the count for
+    # one mistake depended on whether the field happened to have a vocabulary.
+    for name in ("tags", "keywords", "topics", "audience", "subtype", "see_also"):
+        result = lint_document({name: "not a list"}, _vocab())
+        malformed = _of(result, "field-malformed")
+        assert [f.where for f in malformed] == ["meta.%s" % name]
+        assert result["errors"] == 1
+        # The `continue` has to stay: without it the per-item loop walks the string
+        # one character at a time and invents a finding per character.
+        assert _of(result, "vocab-unknown") == []
+
+
 # --------------------------------------------------------------- membership
+
+def test_a_container_that_lost_its_shape_is_an_error_for_every_kind_of_field():
+    # The container-shape gate is the ONLY thing that notices a whole metadata
+    # container arriving as the wrong type: normalize_document passes such a value
+    # through verbatim (changed=[]), and every collector below the gate returns
+    # empty for a shape it does not recognise — so a document that has lost every
+    # relation, entity and link reads exactly like one that had none.
+    #
+    # Deleting the gate used to leave the whole suite green: the one test that
+    # named `field-malformed` was answered by the governed-list emitter, and every
+    # other kind (`records`, `groups`, `map`, `scalar`) was pinned nowhere. This
+    # asserts the `where` of each finding for that reason — a bare
+    # `"field-malformed" in codes` is satisfiable by any one of the five and would
+    # leave the other four silently deletable.
+    meta = {"relations": "see the architecture diagram",   # records -> str
+            "entities": ["DmaArbiterUnit", "ClockTree"],   # groups  -> list
+            "links": ["https://x/"],                       # groups  -> list
+            "source": "kestrel.docx",                      # map     -> str
+            "title": {"a": 1},                             # scalar  -> dict
+            "tags": "urgent"}                              # list    -> str
+    result = lint_document(meta, _vocab())
+
+    malformed = _of(result, "field-malformed")
+    assert sorted(f.where for f in malformed) == [
+        "meta.entities", "meta.links", "meta.relations", "meta.source",
+        "meta.tags", "meta.title"]
+    assert all(f.severity == ERROR for f in malformed)
+    # The message has to say what was expected AND what arrived, or the report
+    # names a field and leaves the author to guess which half is wrong.
+    by_where = dict((f.where, f.message) for f in malformed)
+    assert "list" in by_where["meta.relations"] and "str" in by_where["meta.relations"]
+    assert "dict" in by_where["meta.source"] and "str" in by_where["meta.source"]
+    assert result["errors"] == 6
+
+
+def test_a_record_nothing_can_check_is_an_error_because_the_exit_code_reads_it():
+    # `record-untyped` fires when a record omits the ONE sub-key a vocabulary
+    # governs — `relations.p`, `decisions.status`, `risks.impact` — i.e. when a
+    # record is present and nothing about it is checkable. It is the sole finding
+    # for that shape: no other rule notices a relation with no predicate.
+    #
+    # Its SEVERITY is what scripts/kb_lint.py's exit code keys off (`failed =
+    # bool(n_err) or ...`; warnings only bind under --strict), so ERROR->WARN
+    # silently turns a corpus gate from exit 1 into exit 0. Assert the (code,
+    # severity) PAIR, not the aggregate count: an unrelated error would keep a
+    # count assertion true after exactly that downgrade.
+    meta = {"relations": [{"s": "hostA", "o": "hostB", "ref": "#intro"}],
+            "decisions": [{"what": "use nfs", "ref": "#intro"}],
+            "risks": [{"what": "disk", "ref": "#intro"}]}
+    # No anchors and no known_ids: ref integrity is skipped, so nothing else can
+    # keep the error count up on this document.
+    result = lint_document(meta, _vocab())
+
+    untyped = _of(result, "record-untyped")
+    assert sorted(f.where for f in untyped) == [
+        "decisions[0].status", "relations[0].p", "risks[0].impact"]
+    assert [f.severity for f in untyped] == [ERROR, ERROR, ERROR]
+    assert result["errors"] == 3 and result["warnings"] == 0
+    # And the message says WHY it cannot be checked, naming the vocabulary that
+    # would have graded it.
+    assert "relation_predicates" in dict(
+        (f.where, f.message) for f in untyped)["relations[0].p"]
+
 
 def test_a_closed_vocabulary_rejects_an_unknown_value_and_names_the_allowed_set():
     result = lint_document({"type": "runbookk"}, _vocab())
@@ -208,8 +385,10 @@ def test_a_closed_vocabulary_rejects_an_unknown_value_and_names_the_allowed_set(
 
 
 def test_an_alias_is_a_warning_naming_the_canonical_term_not_a_rejection():
-    meta = {"relations": [{"s": "a", "p": "threatens", "o": "b"}],
-            "decisions": [{"id": "d1", "status": "assumed"}]}
+    # Every record carries the citation the schema requires, so the only findings
+    # this document can produce are the two alias warnings under test.
+    meta = {"relations": [{"s": "a", "p": "threatens", "o": "b", "ref": "#setup"}],
+            "decisions": [{"id": "d1", "status": "assumed", "ref": "#setup"}]}
     result = lint_document(meta, _vocab())
 
     aliases = _of(result, "vocab-alias")
@@ -272,6 +451,12 @@ def test_facet_verdicts_grade_a_field_by_distinct_over_used():
     assert isinstance(rows[0], FacetRow)
 
 
+def _rel(p, i=0):
+    """A COMPLETE relation — every required sub-key — so a cardinality assertion is
+    not quietly reading a required-key finding instead."""
+    return {"s": "s%d" % i, "p": p, "o": "o%d" % i, "ref": "#setup"}
+
+
 def test_a_field_with_too_few_values_is_sparse_and_never_an_error():
     # One relation is 1.00 distinct/used and says nothing whatever about the
     # field. Without this guard every short document fails the cardinality gate,
@@ -280,7 +465,7 @@ def test_a_field_with_too_few_values_is_sparse_and_never_an_error():
     assert row.ratio == 1.0 and row.verdict == "sparse"
 
     result = lint_document(
-        {"relations": [{"p": "runs_on"}, {"p": "requires"}]}, _vocab())
+        {"relations": [_rel("runs_on", 0), _rel("requires", 1)]}, _vocab())
     assert _facet(result, "relations.p").verdict == "sparse"
     assert _of(result, "facet-not-a-facet") == []
     assert _of(result, "facet-thin") == []
@@ -288,20 +473,42 @@ def test_a_field_with_too_few_values_is_sparse_and_never_an_error():
 
 
 def test_a_field_that_is_not_a_facet_is_an_error_once_the_sample_can_carry_it():
+    # The ERROR path, on the regime the ratio is a heuristic FOR: a field nobody
+    # governs, where "one more invented value per document" is the failure being
+    # detected. `terms=0` is how a pair says "ungoverned, or unbounded".
+    rows = facet_report([("notes.tag", ["v%d" % i for i in range(4)], 0)],
+                        warn=0.45, fail=0.75, min_uses=3)
+    assert rows[0].verdict == "note-not-facet" and rows[0].ratio == 1.0
+
+    thin = facet_report([("notes.tag", ["a", "b", "b", "c"], 0)],
+                        warn=0.45, fail=0.75, min_uses=3)
+    assert thin[0].verdict == "thin"
+
+
+def test_a_closed_vocabulary_is_never_condemned_for_using_the_terms_it_was_given():
+    # THE POINT OF THE SAMPLE FLOOR. `distinct` can never exceed the number of legal
+    # spellings, so with five governed predicates and four relations the ratio is
+    # pinned at 1.00 by arithmetic, not by evidence: the document used four different
+    # CURATED terms and invented nothing. Grading that as "documentation, not a
+    # facet" condemned a maximally-correct document, and the remedy the message
+    # prescribes ("move it to an unindexed note") is impossible — `p` is a required
+    # discriminator, so the only edit that clears the gate is deleting relations.
     vocab = _vocab(min_uses=3)
-    rels = [{"p": p} for p in ("runs_on", "requires", "mitigates", "targets")]
-    result = lint_document({"relations": rels}, vocab)
+    rels = [_rel(p, i) for i, p in
+            enumerate(("runs_on", "requires", "mitigates", "targets"))]
+    result = lint_document(rels and {"relations": rels}, vocab, anchors=set(["setup"]))
 
-    not_a_facet = _of(result, "facet-not-a-facet")
-    assert len(not_a_facet) == 1
-    assert not_a_facet[0].severity == ERROR
-    assert not_a_facet[0].where == "relations.p"
+    assert _facet(result, "relations.p").ratio == 1.0      # still REPORTED ...
+    assert _facet(result, "relations.p").verdict == "sparse"   # ... never graded
+    assert _of(result, "facet-not-a-facet") == []
+    assert _of(result, "facet-thin") == []
+    assert result["errors"] == 0 and result["warnings"] == 0
 
-    thin = lint_document({"relations": [{"p": "runs_on"}, {"p": "requires"},
-                                        {"p": "requires"}, {"p": "mitigates"}]},
-                         vocab)
-    assert [f.code for f in thin["findings"]] == ["facet-thin"]
-    assert thin["errors"] == 0
+    # The floor is the vocabulary's size, not a constant: an ungoverned facet of the
+    # same shape and the same min_uses is still condemned (see the test above), so
+    # this is a correction to the RULE and not the gate being switched off.
+    assert facet_report([("relations.p", [r["p"] for r in rels], 5)],
+                        warn=0.45, fail=0.75, min_uses=3)[0].verdict == "sparse"
 
 
 # ------------------------------------------------------------ integrity

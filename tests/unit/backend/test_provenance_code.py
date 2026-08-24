@@ -73,10 +73,40 @@ def test_dirty_is_omitted_when_unknown_never_reported_clean(tmp_path):
 
 
 def test_version_comes_from_the_project_table_not_a_dependency_pin(tmp_path):
+    """The decoy goes BEFORE `[project]`, which is the only placement that tests it.
+
+    With the decoy after, the first match in the file is the right one anyway and
+    this test passed with the guard deleted — a check that cannot fail. A real
+    pyproject opens with a comment or `[build-system]` (this repo's does both), so
+    the old `text.startswith("[project]")` guard never fired and the first
+    `version =` anywhere in the file won.
+    """
     (tmp_path / "pyproject.toml").write_text(
+        '# doc2md\n[build-system]\nrequires = ["setuptools"]\n\n'
+        '[tool.commitizen]\nversion = "9.9.9"\n\n'
         '[project]\nname = "doc2md"\nversion = "0.1.0"\n\n'
-        '[tool.poetry.dependencies]\nversion = "9.9.9"\n')
+        '[tool.poetry.dependencies]\nversion = "8.8.8"\n')
     assert package_version(str(tmp_path)) == "0.1.0"
+
+
+def test_a_project_table_that_states_no_version_yields_none_not_someone_elses(tmp_path):
+    # PEP 621 `dynamic = ["version"]`: the distribution's version is not in this
+    # file. Reporting a tool table's number instead would stamp every bundle's
+    # `run.code.version` — and the graded `converter` string — with a version of the
+    # converter that does not exist.
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "doc2md"\ndynamic = ["version"]\n\n'
+        '[tool.bumpversion]\nversion = "9.9.9"\n')
+    assert package_version(str(tmp_path)) == ""
+
+
+def test_a_project_with_no_project_table_still_reports_its_version(tmp_path):
+    # A poetry layout keeps the version in `[tool.poetry]`, and there is no other
+    # candidate to confuse it with. Losing it would trade a wrong version for a
+    # missing one, which degrades the converter stamp to `doc2md-ooxml/0+<sha>`.
+    (tmp_path / "pyproject.toml").write_text(
+        '[tool.poetry]\nname = "doc2md"\nversion = "2.3.4"\n')
+    assert package_version(str(tmp_path)) == "2.3.4"
 
 
 def test_version_absent_is_empty_not_an_exception(tmp_path):

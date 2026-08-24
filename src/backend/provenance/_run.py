@@ -46,10 +46,10 @@ DECISION_CODES = (
     "permalink_base",         # whether meta.source.url came out absolute or relative
 )
 
-_REDACT = ("--src", "--out", "--bundles", "--assets", "--assets-dir", "--md-dir",
-           "--dest", "--rpms", "--corpus", "--text-out", "--json", "--vocab",
-           "--prompt-file", "--domain-file", "--expectations", "--status-file",
-           "--worker-cmd")
+# A scheme, then `://`. Used to tell a network URL (a switch that decided the
+# output, and safe to publish) from `file://`, which is an absolute host path
+# wearing a scheme.
+_URL = re.compile(r"^([A-Za-z][A-Za-z0-9+.\-]*)://")
 
 
 def path_id(path):
@@ -83,16 +83,38 @@ def _redact_piece(piece):
     keyed on ``--src`` never fired for ``--sr /tmp/x``; and switches nobody thought
     to list take paths routinely (``--only /abs/spec.docx``,
     ``--tokenizer char:/home/me/models/tok``). Anything shaped like an absolute
-    path is redacted whatever switch carried it."""
-    if piece.startswith("//"):                  # a scheme-relative URL, not a path
-        return piece
+    path is redacted whatever switch carried it.
+
+    A leading ``//`` used to be waved through as "a scheme-relative URL". It is
+    not: ``//vols/private/spec.docx`` is a working POSIX path that resolves exactly
+    like ``/vols/private/spec.docx``, and ``file:///vols/...`` went through the same
+    door. Only a piece that really opens with ``<scheme>://`` is a URL, and even
+    then the ``file`` scheme is a host path, not a network location."""
+    m = _URL.match(piece)
+    if m:
+        # `--source-base-url https://wiki/docs` decided every permalink in the
+        # bundle and discloses no host path, so it survives verbatim.
+        if m.group(1).lower() != "file":
+            return piece
+        rest = piece[m.end():]
+        return ("file://<path:%s>" % path_id(rest)) if rest.startswith("/") else piece
     if piece.startswith("/") and len(piece) > 1:
         return "<path:%s>" % path_id(piece)
+    if piece.startswith("~") and "/" in piece:
+        # `~/models/tok`, `~someone/models/tok`. Not absolute by shape, still a home
+        # directory — and the second form names the user, which this layer must
+        # never record.
+        return "<path:%s>" % path_id(piece)
+    head, sep, tail = piece.partition("=")
+    # A `k=/abs/path` pair riding inside a compound value:
+    # `--worker-cmd "python3 w.py --out=/vols/private/x"`. The TOP-level `=` form is
+    # split by `redact_argv` before it ever reaches here; this is the buried one.
+    if sep and "/" in tail:
+        return "%s=%s" % (head, _redact_piece(tail))
     head, sep, tail = piece.partition(":")
-    # A path riding inside a compound value: `char:/home/me/models/tok`. A URL is
-    # excluded by the `//` test above, so `--source-base-url https://wiki/docs`
-    # survives verbatim — it is a switch that decided the output, not a host path.
-    if sep and tail.startswith("/") and not tail.startswith("//"):
+    # A path riding inside a compound value: `char:/home/me/models/tok`. A URL was
+    # returned above, so this test cannot swallow one.
+    if sep and tail.startswith("/"):
         return "%s:<path:%s>" % (head, path_id(tail))
     return piece
 
@@ -108,7 +130,7 @@ def _redact_value(value):
     a path buried at word three leaks exactly as much as one at word one."""
     if not isinstance(value, str) or "/" not in value:
         return value
-    if value.startswith("/"):
+    if value.startswith("/") or value.startswith("~"):
         return _redact_piece(value)
     parts = re.split(r"(\s+)", value)
     return "".join(p if i % 2 else _redact_piece(p) for i, p in enumerate(parts))
@@ -116,20 +138,25 @@ def _redact_value(value):
 
 def _placeholder_for(flag, paths):
     # type: (str, dict) -> str
-    """The placeholder a named path flag asks for, honouring argparse's PREFIXES.
+    """The placeholder a REPLAYABLE root flag asks for, honouring argparse PREFIXES.
 
-    ``--sr`` IS ``--src`` to argparse. A prefix that is ambiguous within the known
-    set gets no placeholder and falls through to the value test above, which is the
-    safe direction: it redacts rather than reconstructs."""
+    ``--sr`` IS ``--src`` to argparse. A prefix that is ambiguous within ``paths``
+    gets no placeholder and falls through to the value test above, which is the safe
+    direction: it redacts rather than reconstructs.
+
+    ``paths`` is the ONLY list consulted, and it holds roots a replay must be handed
+    back (``--src``, ``--out``, ``--bundles``). There used to be a second, larger
+    list of "path-ish" flags whose values were blanked to ``<path>``; it bought no
+    safety — ``_redact_value`` already redacts every absolute path whatever switch
+    carried it — and it broke the docstring above twice over. Prefix-expanded, it
+    rewrote ordinary NON-path switches: ``--ex 4000`` (argparse's own abbreviation of
+    ``--excerpt-chars``) recorded ``--ex <path>``, destroying the value in ``argv``
+    and making ``replay_run`` refuse a run it could have reconstructed."""
     if flag in paths:
         return paths[flag]
-    if flag in _REDACT:
-        return "<path>"
     if not flag.startswith("--") or len(flag) < 4:
         return ""
-    known = dict((name, "<path>") for name in _REDACT)
-    known.update(paths)
-    hits = sorted(set(v for name, v in known.items() if name.startswith(flag)))
+    hits = sorted(set(v for name, v in paths.items() if name.startswith(flag)))
     return hits[0] if len(hits) == 1 else ""
 
 
@@ -141,9 +168,9 @@ def redact_argv(argv, paths=None):
     more than it needs the operator's home directory, and the one thing that must
     never land in a published artifact is an absolute host path. ``paths`` maps a
     flag to the placeholder a REPLAY can fill back in, e.g. ``{"--src": "<src>"}``;
-    the flags in the default set become ``<path>``; and every remaining value is
-    scrubbed by shape, so a path can never reach an artifact through a switch
-    nobody listed."""
+    every other value is scrubbed BY SHAPE, so a path can never reach an artifact
+    through a switch nobody listed — and a switch nobody listed can never lose its
+    value to a placeholder it did not need."""
     paths = paths or {}
     out = []
     expect = None
@@ -179,9 +206,16 @@ def safe_value(value):
     published output. Hashing keeps the value COMPARABLE — two runs that used the
     same directory still agree — without disclosing whose directory it was. Same
     shape test as ``argv``, so the two cannot drift into disagreeing about what a
-    path looks like."""
+    path looks like.
+
+    Every container is walked, not only the flat ones: a caller handing this a
+    mapping (``decision(..., evidence={"paths": {...}})``) is exactly the caller most
+    likely to be handing it a path, and returning the dict untouched would have made
+    the public helper the one place a path could get out."""
     if isinstance(value, (list, tuple)):
         return [safe_value(v) for v in value]
+    if isinstance(value, dict):
+        return OrderedDict((key, safe_value(val)) for key, val in value.items())
     return _redact_value(value)
 
 

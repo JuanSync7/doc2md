@@ -10,9 +10,32 @@ summary: The summary leads with the worst documents, never hides a small-documen
 import pytest
 
 from backend.validate import summarize_coverage
+from backend.validate import _covsummary
 from backend.validate._covsummary import figure_losses, worst_documents
 
 pytestmark = pytest.mark.unit
+
+
+def test_the_module_declares_its_public_surface_and_it_does_not_drift():
+    """CONVENTIONS §1 makes ``__all__`` the machine-checkable public API of a source
+    file. This module shipped without one, so "which of these names is a caller
+    allowed to reach for" was answerable only by reading the code — and a new helper
+    added tomorrow would join the surface by accident.
+
+    The second assertion is the one with teeth: every public name DEFINED here must
+    be listed, so the declaration cannot silently fall behind the module."""
+    assert _covsummary.__all__, "the module must declare its public API"
+    for name in _covsummary.__all__:
+        assert hasattr(_covsummary, name), name
+    defined = sorted(
+        name for name, value in vars(_covsummary).items()
+        if not name.startswith("_")
+        and getattr(value, "__module__", None) == _covsummary.__name__)
+    assert defined == sorted(_covsummary.__all__)
+    # ``summarize`` is the one the PACKAGE re-exports (as ``summarize_coverage``);
+    # the other two stay module-level on purpose, so backend.validate's surface
+    # stays tight rather than freezing two internal helpers as a contract.
+    assert summarize_coverage is _covsummary.summarize
 
 
 def _rec(doc_id, recall, n_source=200, missing_top=None, figures=None, rel=None):

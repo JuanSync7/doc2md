@@ -14,8 +14,12 @@ summary: Deterministic, lossless document -> Markdown conversion with measured f
 Deterministic **document → Markdown** conversion for RAG ingestion, with an
 independent second-pass validator: every conversion is *measured*, never
 assumed. Office documents are converted from their OOXML XML directly and hard-gated
-at **token recall = 1.0**; PDF/HTML go through a best-effort lane whose loss is
-quantified and surfaced, never hidden.
+**twice** — at **token recall = 1.0**, and against a converter-blind OOXML
+structural ground truth (`structure_fidelity`, fifteen facts: headings and their
+titles, list nesting, printed ordered numbers, emphasis, fences, links, every table
+cell, every list item in order). Structure *is* content, so a document whose
+headings flattened or whose table rows scrambled fails even at recall 1.0. PDF/HTML
+go through a best-effort lane whose loss is quantified and surfaced, never hidden.
 
 ## What it produces
 
@@ -27,9 +31,11 @@ binding contract):
 <out>/<doc_id>/
   document.md      # the converted body, frontmatter-stamped (hashes, lane, run)
   structure.json   # heading outline + figure nodes with line spans
-  report.json      # measured gates: losslessness, outline coverage, image integrity
+  report.json      # measured gates: losslessness, structure fidelity, coverage, images
+  knowledge.json   # the extracted graph payload — only once enrichment has run
   images/          # content-addressed (<sha16>.<ext>), byte-verified figures
 <out>/manifest.jsonl
+<out>/runs.jsonl
 ```
 
 `report.json` carries an honest `status`: `ok`, `degraded` (converted, with a

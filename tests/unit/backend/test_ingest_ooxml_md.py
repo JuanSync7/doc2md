@@ -1235,3 +1235,495 @@ def test_ooxml_dispatcher_threads_emit_images_flag():
     assert ooxml_image_parts(ooxml_markdown("docx", parts, emit_images=True)) == \
         ["word/media/i.png"]
     assert "ooxml-image" not in ooxml_markdown("docx", parts)      # default off
+
+
+# ============================================================================
+# Whitespace, flanking, brackets and line-leading markers
+# ----------------------------------------------------------------------------
+# Four families of defect that all come from the same mistake: deciding something
+# about markdown from LESS text than the renderer will see. Whitespace was
+# normalised for prose and applied to code too; a delimiter run was written
+# without looking at its neighbours; the bracket exemption was decided per w:t
+# instead of per LINE; and only a SINGLE leading marker character was neutralised,
+# so every other block construct walked straight out of a body paragraph.
+
+def _wpre(text, style=None):
+    """A paragraph whose run PRESERVES whitespace — the shape Word writes for code."""
+    ppr = ("<w:pPr><w:pStyle w:val=\"%s\"/></w:pPr>" % style) if style else ""
+    return ('<w:p>%s<w:r><w:t xml:space="preserve">%s</w:t></w:r></w:p>'
+            % (ppr, text))
+
+
+def _wrun(text, rpr=""):
+    return ('<w:r>%s<w:t xml:space="preserve">%s</w:t></w:r>'
+            % ("<w:rPr>%s</w:rPr>" % rpr if rpr else "", text))
+
+
+CODE_STYLES = ('<w:styles %s>'
+               '<w:style w:type="paragraph" w:styleId="Pre">'
+               '<w:name w:val="HTML Preformatted"/></w:style>'
+               '<w:style w:type="character" w:styleId="Mono">'
+               '<w:name w:val="HTML Code"/></w:style>'
+               '</w:styles>' % W)
+
+
+def _fidelity(parts):
+    from backend.ingest import docx_source_structure
+    from backend.validate import md_structure, structure_fidelity_report
+    return structure_fidelity_report(md_structure(ooxml_markdown("docx", parts)),
+                                     docx_source_structure(parts))
+
+
+def _graded(parts):
+    """(markdown, conversion_report) — every test here is graded, never asserted alone."""
+    md = ooxml_markdown("docx", parts)
+    return md, conversion_report(ooxml_source_text("docx", parts), md)
+
+
+# ------------------------------------------------- raw means raw (code paragraphs)
+
+def test_indentation_inside_a_code_style_paragraph_survives():
+    # `if dev.ready:` with no body and an unconditional `return dev` is the OPPOSITE
+    # program, and it is not even valid Python — yet both gates certified it, because
+    # whitespace is not a token and the ground truth counts fences, not their content.
+    lines = ["def configure(dev):", "    if dev.ready:",
+             "        dev.write(0x04, 1)", "    return dev"]
+    parts = {"word/document.xml":
+             _wdoc("".join(_wpre(l, style="Pre") for l in lines)),
+             "word/styles.xml": CODE_STYLES}
+    md, rep = _graded(parts)
+    assert md == "```\n" + "\n".join(lines) + "\n```\n"
+    assert rep["valid"] is True and rep["recall"] == 1.0
+    assert _fidelity(parts)["gate"] == "pass"
+
+
+def test_a_tab_inside_a_code_paragraph_is_a_tab_not_a_space():
+    body = (_wpre("top", style="Pre")
+            + '<w:p><w:pPr><w:pStyle w:val="Pre"/></w:pPr><w:r><w:tab/>'
+              '<w:t xml:space="preserve">one</w:t></w:r></w:p>')
+    parts = {"word/document.xml": _wdoc(body), "word/styles.xml": CODE_STYLES}
+    md, rep = _graded(parts)
+    assert md == "```\ntop\n\tone\n```\n"
+    assert rep["valid"] is True and rep["recall"] == 1.0
+
+
+def test_a_soft_break_inside_a_code_paragraph_is_a_new_line():
+    # One w:br used to weld two program lines into one statement.
+    body = ('<w:p><w:pPr><w:pStyle w:val="Pre"/></w:pPr>'
+            '<w:r><w:t xml:space="preserve">for i in range(3):</w:t></w:r>'
+            '<w:r><w:br/><w:t xml:space="preserve">    print(i)</w:t></w:r></w:p>')
+    parts = {"word/document.xml": _wdoc(body), "word/styles.xml": CODE_STYLES}
+    md, rep = _graded(parts)
+    assert md == "```\nfor i in range(3):\n    print(i)\n```\n"
+    assert rep["valid"] is True and rep["recall"] == 1.0
+    assert _fidelity(parts)["gate"] == "pass"
+
+
+def test_column_alignment_inside_a_listing_survives():
+    parts = {"word/document.xml": _wdoc(_wpre("NAME      OFFSET   ACCESS", "Pre")),
+             "word/styles.xml": CODE_STYLES}
+    md, rep = _graded(parts)
+    assert "NAME      OFFSET   ACCESS" in md
+    assert rep["valid"] is True and rep["recall"] == 1.0
+
+
+def test_a_blank_line_between_two_code_lines_is_kept():
+    # Pressing Enter inside a shell transcript. The blank paragraph emits no block,
+    # so it neither opens a fence nor closes one — which is what the structural
+    # ground truth counts — but it IS a line of the program.
+    body = (_wpre("first", "Pre")
+            + '<w:p><w:pPr><w:pStyle w:val="Pre"/></w:pPr></w:p>'
+            + _wpre("second", "Pre"))
+    parts = {"word/document.xml": _wdoc(body), "word/styles.xml": CODE_STYLES}
+    md, rep = _graded(parts)
+    assert md == "```\nfirst\n\nsecond\n```\n"
+    assert rep["valid"] is True and rep["recall"] == 1.0
+    assert _fidelity(parts)["gate"] == "pass"
+
+
+def test_a_code_paragraph_alone_never_opens_a_fence_on_a_blank_line():
+    # The converse: leading and trailing blank code paragraphs emit nothing at all,
+    # so a listing that is only blank lines is not a fenced block.
+    body = ('<w:p><w:pPr><w:pStyle w:val="Pre"/></w:pPr></w:p>'
+            + _wpre("only line", "Pre")
+            + '<w:p><w:pPr><w:pStyle w:val="Pre"/></w:pPr></w:p>')
+    parts = {"word/document.xml": _wdoc(body), "word/styles.xml": CODE_STYLES}
+    md, rep = _graded(parts)
+    assert md == "```\nonly line\n```\n"
+    assert rep["valid"] is True
+    assert _fidelity(parts)["gate"] == "pass"
+
+
+def test_internal_spacing_of_an_inline_code_span_survives():
+    body = ('<w:p>' + _wrun("Run ")
+            + _wrun("cmd   --flag", '<w:rStyle w:val="Mono"/>')
+            + _wrun(" now.") + '</w:p>')
+    parts = {"word/document.xml": _wdoc(body), "word/styles.xml": CODE_STYLES}
+    md, rep = _graded(parts)
+    assert md == "Run `cmd   --flag` now.\n"
+    assert rep["valid"] is True and rep["recall"] == 1.0
+
+
+def test_prose_whitespace_is_still_collapsed_across_a_run_boundary():
+    # The guard on the fix: prose normalisation is unchanged, INCLUDING across the
+    # run boundary Word puts in the middle of "foo " + " bar".
+    body = ('<w:p>' + _wrun("Reset  the ") + _wrun("  core\tnow.\n") + '</w:p>')
+    parts = {"word/document.xml": _wdoc(body)}
+    md, rep = _graded(parts)
+    assert md == "Reset the core now.\n"
+    assert rep["valid"] is True and rep["recall"] == 1.0
+
+
+# ------------------------------------------------- emphasis that can actually open
+
+def test_bold_abutting_a_word_on_one_side_and_punctuation_on_the_other_renders():
+    # `Field MODE**(2:0)**`: the opening run has a word character outside and
+    # punctuation inside, so CommonMark cannot open it and the bold is GONE from the
+    # render. One character of the span moves out so the delimiter flanks.
+    body = ('<w:p>' + _wrun("Field MODE") + _wrun("(2:0)", "<w:b/>")
+            + _wrun(" is read-only.") + '</w:p>')
+    parts = {"word/document.xml": _wdoc(body)}
+    md, rep = _graded(parts)
+    assert md == "Field MODE(**2:0)** is read-only.\n"
+    assert rep["valid"] is True and rep["recall"] == 1.0
+    assert _fidelity(parts)["gate"] == "pass"
+
+
+def test_bold_ending_in_punctuation_against_a_following_word_renders():
+    body = ('<w:p>' + _wrun("See ") + _wrun("Fig.", "<w:b/>") + _wrun("1 above.")
+            + '</w:p>')
+    parts = {"word/document.xml": _wdoc(body)}
+    md, rep = _graded(parts)
+    assert md == "See **Fig**.1 above.\n"
+    assert _fidelity(parts)["gate"] == "pass"
+
+
+def test_an_escaped_character_moves_out_of_a_span_whole():
+    # `VDD` + bold `_core`: the escape `\_` is the punctuation that blocks the
+    # delimiter, and splitting it would leave the backslash escaping the asterisk.
+    body = ('<w:p>' + _wrun("VDD") + _wrun("_core", "<w:b/>")
+            + _wrun(" must stay high.") + '</w:p>')
+    parts = {"word/document.xml": _wdoc(body)}
+    md, rep = _graded(parts)
+    assert md == "VDD\\_**core** must stay high.\n"
+    assert rep["valid"] is True and rep["recall"] == 1.0
+    assert _fidelity(parts)["gate"] == "pass"
+
+
+def test_italic_gets_the_same_treatment_as_bold():
+    body = ('<w:p>' + _wrun("Field MODE") + _wrun("(2:0)", "<w:i/>")
+            + _wrun(" is read-only.") + '</w:p>')
+    parts = {"word/document.xml": _wdoc(body)}
+    md, rep = _graded(parts)
+    assert md == "Field MODE(*2:0)* is read-only.\n"
+    assert _fidelity(parts)["gate"] == "pass"
+
+
+def test_a_delimiter_that_already_flanks_is_left_exactly_where_it_was():
+    # Direction (b) for the flanking fix, three ways. A space-flanked span, a span
+    # whose own edges are punctuation but whose NEIGHBOUR is whitespace, and the
+    # recorded mid-word deviation `Dma**ArbiterUnit**` — which renders correctly and
+    # must not start being rewritten.
+    for runs, want in (
+            ([("The ", ""), ("MODE", "<w:b/>"), (" field.", "")],
+             "The **MODE** field.\n"),
+            ([("the ", ""), ('"safe"', "<w:b/>"), (" mode.", "")],
+             'the **"safe"** mode.\n'),
+            ([("Dma", ""), ("ArbiterUnit", "<w:b/>"), (" here.", "")],
+             "Dma**ArbiterUnit** here.\n")):
+        parts = {"word/document.xml":
+                 _wdoc('<w:p>%s</w:p>' % "".join(_wrun(t, pr) for t, pr in runs))}
+        md, rep = _graded(parts)
+        assert md == want
+        assert rep["valid"] is True and rep["recall"] == 1.0
+        assert _fidelity(parts)["gate"] == "pass"
+
+
+def test_a_span_of_one_punctuation_character_keeps_its_markers():
+    # The residual, pinned so it is a decision and not a surprise: nothing can move
+    # out of a one-character span without emptying it, so the markers stay and the
+    # fidelity gate reports the loss honestly rather than the converter hiding it.
+    body = ('<w:p>' + _wrun("Note") + _wrun(".", "<w:b/>") + _wrun(" end.") + '</w:p>')
+    parts = {"word/document.xml": _wdoc(body)}
+    md, _rep = _graded(parts)
+    assert md == "Note**.** end.\n"
+    assert _fidelity(parts)["gate"] == "fail"
+
+
+# ------------------------------------------ the bracket rule is about the LINE
+
+def test_a_run_boundary_between_a_bracket_and_a_paren_cannot_fabricate_a_link():
+    # Word splits a run at every rsid, proofErr, bookmark and field boundary, so
+    # `[3]` and `(page 12)` routinely arrive separately. Deciding the exemption per
+    # w:t left both bare and the join invented a link.
+    body = ('<w:p>' + _wrun("See ") + _wrun("[3]") + _wrun("(page 12)")
+            + _wrun(" for the timing.") + '</w:p>')
+    parts = {"word/document.xml": _wdoc(body)}
+    md, rep = _graded(parts)
+    assert md == "See \\[3\\](page 12) for the timing.\n"
+    assert rep["valid"] is True and rep["recall"] == 1.0
+    assert markdown_to_text(md) == "See [3](page 12) for the timing."
+
+
+def test_a_run_boundary_between_two_brackets_cannot_fabricate_a_reference_link():
+    body = ('<w:p>' + _wrun("See ") + _wrun("[3]") + _wrun("[4]") + _wrun(" more.")
+            + '</w:p>')
+    parts = {"word/document.xml": _wdoc(body)}
+    md, rep = _graded(parts)
+    assert md == "See \\[3\\]\\[4\\] more.\n"
+    assert rep["valid"] is True and rep["recall"] == 1.0
+
+
+def test_a_bookmark_between_the_brackets_is_still_one_line():
+    # A Word cross-reference TARGET is exactly a bookmarkStart/End pair.
+    body = ('<w:p>' + _wrun("See ")
+            + '<w:bookmarkStart w:id="1" w:name="_Ref1"/>' + _wrun("[3]")
+            + '<w:bookmarkEnd w:id="1"/>' + _wrun("(p12)") + _wrun(" now.")
+            + '</w:p>')
+    parts = {"word/document.xml": _wdoc(body)}
+    md, rep = _graded(parts)
+    assert md == "See \\[3\\](p12) now.\n"
+    assert rep["valid"] is True and rep["recall"] == 1.0
+
+
+def test_the_bracket_exemption_still_holds_for_a_line_that_cannot_form_a_link():
+    # Direction (b): the whole point of the exemption is that `[31:0]` stays
+    # greppable. It is decided per LINE, so a genuine link in the SAME PARAGRAPH
+    # does not freeze it either — the `](` the converter synthesises around a
+    # hyperlink is not text the document wrote.
+    body = ('<w:p>' + _wrun("Signal ") + _wrun("[31:0]") + _wrun(" is wide, see ")
+            + '<w:hyperlink r:id="rId9">%s</w:hyperlink>' % _wrun("the map")
+            + _wrun(" for pins [7:0].") + '</w:p>')
+    rels = ('<Relationships %s><Relationship Id="rId9" Target="https://x.example/m"'
+            ' TargetMode="External" Type="t"/></Relationships>' % RELS)
+    parts = {"word/document.xml": '<w:document %s %s %s><w:body>%s</w:body></w:document>'
+             % (W, MC, R, body),
+             "word/_rels/document.xml.rels": rels}
+    md, rep = _graded(parts)
+    assert "Signal [31:0] is wide" in md
+    assert "pins [7:0]." in md
+    assert "[the map](https://x.example/m)" in md
+    assert "\\[" not in md
+    assert rep["valid"] is True and rep["recall"] == 1.0
+
+
+def test_the_bracket_decision_is_per_paragraph_not_per_document():
+    body = (_wp("The tier owns the [payments] section.")
+            + '<w:p>%s%s%s</w:p>' % (_wrun("See "), _wrun("[3]"), _wrun("(p12).")))
+    parts = {"word/document.xml": _wdoc(body)}
+    md, rep = _graded(parts)
+    assert "[payments] section" in md          # its own line holds no `](`
+    assert "See \\[3\\](p12)." in md           # this one does
+    assert rep["valid"] is True and rep["recall"] == 1.0
+
+
+# ------------------------------- a body paragraph is never a block it was not
+
+def test_a_multi_hash_body_paragraph_does_not_become_a_heading():
+    body = _wp("Kestrel build notes", style="Heading1") + _wp("## Build steps")
+    parts = {"word/document.xml": _wdoc(body), "word/styles.xml": STYLES}
+    md, rep = _graded(parts)
+    assert "\\## Build steps" in md
+    assert rep["valid"] is True and rep["recall"] == 1.0
+    assert _fidelity(parts)["gate"] == "pass"
+    assert markdown_to_text(md).endswith("## Build steps")
+
+
+def test_every_atx_heading_shape_is_neutralised_and_nothing_else_is():
+    # 1..6 hashes with or without a following space open a heading; SEVEN do not,
+    # and neither does a hash glued to a word — escaping those would put a visible
+    # backslash into text that was never at risk.
+    for text, want in (("# one", "\\# one"), ("## two", "\\## two"),
+                       ("###### six", "\\###### six"), ("#", "\\#"), ("##", "\\##"),
+                       ("####### seven", "####### seven"), ("#1 priority",
+                                                            "#1 priority")):
+        parts = {"word/document.xml": _wdoc(_wp("Body.") + _wp(text))}
+        md, rep = _graded(parts)
+        assert md.split("\n\n")[-1].strip() == want, text
+        assert rep["valid"] is True and rep["recall"] == 1.0, text
+        assert _fidelity(parts)["gate"] == "pass", text
+
+
+def test_a_paragraph_of_dashes_is_not_deleted_as_a_thematic_break():
+    # The gate-blind half: `-----` carries no tokens and no heading fact, so BOTH
+    # gates passed while the paragraph was rendered away to a horizontal rule and
+    # deleted outright from the text layer the knowledge base consumes.
+    body = _wp("Kestrel build notes", style="Heading1") + _wp("-----")
+    parts = {"word/document.xml": _wdoc(body), "word/styles.xml": STYLES}
+    md, rep = _graded(parts)
+    assert md.endswith("\\-----\n")
+    assert rep["valid"] is True
+    assert markdown_to_text(md) == "Kestrel build notes\n\n-----"
+
+
+def test_a_marker_run_paragraph_survives_whatever_the_marker_is():
+    for text in ("---", "-----", "===", "=", "-", "- - -"):
+        parts = {"word/document.xml": _wdoc(_wp("Body.") + _wp(text))}
+        md, _rep = _graded(parts)
+        assert markdown_to_text(md).split("\n")[-1] == text, text
+        assert _fidelity(parts)["gate"] == "pass", text
+
+
+def test_a_link_reference_definition_cannot_be_written_by_a_body_paragraph():
+    # `[REG]: 0x04` is consumed WHOLE by CommonMark — the paragraph disappears from
+    # the render — and markdown_to_text does not model definitions, so recall and
+    # the fidelity gate both saw an intact document.
+    parts = {"word/document.xml": _wdoc(_wp("Body.") + _wp("[REG]: 0x04"))}
+    md, rep = _graded(parts)
+    assert md.endswith("\\[REG]: 0x04\n")
+    assert rep["valid"] is True and rep["recall"] == 1.0
+
+
+def test_lead_escaping_leaves_ordinary_prose_alone():
+    # Direction (b): nothing that was not a block construct grows a backslash.
+    for text in ("Then run make all.", "5 GHz is the ceiling", "-40 C minimum",
+                 "#1 priority", "= sign in the middle = here", "a - b - c"):
+        parts = {"word/document.xml": _wdoc(_wp(text))}
+        md, rep = _graded(parts)
+        assert md == text + "\n", text
+        assert rep["valid"] is True and rep["recall"] == 1.0, text
+
+
+# ---------------------------------------------------- emphasis carried by a STYLE
+
+STYLE_MARKS = ('<w:styles %s>'
+               '<w:style w:type="paragraph" w:styleId="Heading1">'
+               '<w:name w:val="heading 1"/><w:rPr><w:b/></w:rPr></w:style>'
+               '<w:style w:type="character" w:styleId="Strong">'
+               '<w:name w:val="Strong"/><w:rPr><w:b/></w:rPr></w:style>'
+               '<w:style w:type="paragraph" w:styleId="Quote">'
+               '<w:name w:val="Quote"/><w:rPr><w:i/></w:rPr></w:style>'
+               '<w:style w:type="character" w:styleId="SubStrong">'
+               '<w:name w:val="SubStrong"/><w:basedOn w:val="Strong"/></w:style>'
+               '<w:style w:type="character" w:styleId="NotStrong">'
+               '<w:name w:val="NotStrong"/><w:basedOn w:val="Strong"/>'
+               '<w:rPr><w:b w:val="0"/></w:rPr></w:style>'
+               '</w:styles>' % W)
+
+
+def test_emphasis_carried_by_a_character_style_is_emitted():
+    body = '<w:p>%s</w:p>' % _wrun("Save", '<w:rStyle w:val="Strong"/>')
+    parts = {"word/document.xml": _wdoc(body), "word/styles.xml": STYLE_MARKS}
+    md, rep = _graded(parts)
+    assert md == "**Save**\n"
+    assert rep["valid"] is True and rep["recall"] == 1.0
+    assert _fidelity(parts)["gate"] == "pass"
+
+
+def test_emphasis_carried_by_a_paragraph_style_is_emitted():
+    parts = {"word/document.xml": _wdoc(_wp("Quoted line.", style="Quote")),
+             "word/styles.xml": STYLE_MARKS}
+    md, _rep = _graded(parts)
+    assert md == "*Quoted line.*\n"
+    assert _fidelity(parts)["gate"] == "pass"
+
+
+def test_a_character_style_inherits_emphasis_through_basedOn():
+    body = '<w:p>%s</w:p>' % _wrun("Save", '<w:rStyle w:val="SubStrong"/>')
+    parts = {"word/document.xml": _wdoc(body), "word/styles.xml": STYLE_MARKS}
+    md, _rep = _graded(parts)
+    assert md == "**Save**\n"
+    assert _fidelity(parts)["gate"] == "pass"
+
+
+def test_a_run_can_turn_its_styles_emphasis_back_off():
+    body = ('<w:p>%s</w:p>'
+            % _wrun("Save", '<w:rStyle w:val="Strong"/><w:b w:val="0"/>'))
+    parts = {"word/document.xml": _wdoc(body), "word/styles.xml": STYLE_MARKS}
+    md, _rep = _graded(parts)
+    assert md == "Save\n"
+    assert _fidelity(parts)["gate"] == "pass"
+
+
+def test_a_style_can_turn_off_what_it_is_based_on():
+    body = '<w:p>%s</w:p>' % _wrun("Save", '<w:rStyle w:val="NotStrong"/>')
+    parts = {"word/document.xml": _wdoc(body), "word/styles.xml": STYLE_MARKS}
+    md, _rep = _graded(parts)
+    assert md == "Save\n"
+    assert _fidelity(parts)["gate"] == "pass"
+
+
+def test_a_heading_styles_own_bold_is_the_heading_not_a_span():
+    # Stock Heading1..9 all carry <w:b/>. Honouring that would demand `# **Title**`
+    # of every heading in every document; the ground truth suppresses it for the same
+    # reason, so the two agree because they read the same rule out of markdown.
+    parts = {"word/document.xml": _wdoc(_wp("Title here", style="Heading1")),
+             "word/styles.xml": STYLE_MARKS}
+    md, _rep = _graded(parts)
+    assert md == "# Title here\n"
+    assert _fidelity(parts)["gate"] == "pass"
+
+
+def test_a_run_style_inside_a_heading_still_counts():
+    body = ('<w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr>%s%s</w:p>'
+            % (_wrun("Bring up the "), _wrun("clock", '<w:rStyle w:val="Strong"/>')))
+    parts = {"word/document.xml": _wdoc(body), "word/styles.xml": STYLE_MARKS}
+    md, _rep = _graded(parts)
+    assert md == "# Bring up the **clock**\n"
+    assert _fidelity(parts)["gate"] == "pass"
+
+
+def test_a_code_paragraph_carries_no_style_emphasis():
+    styles = CODE_STYLES.replace('<w:name w:val="HTML Preformatted"/>',
+                                 '<w:name w:val="HTML Preformatted"/>'
+                                 '<w:rPr><w:b/></w:rPr>')
+    parts = {"word/document.xml": _wdoc(_wpre("x = 1", "Pre")),
+             "word/styles.xml": styles}
+    md, _rep = _graded(parts)
+    assert md == "```\nx = 1\n```\n"
+    assert _fidelity(parts)["gate"] == "pass"
+
+
+def test_style_emphasis_reaches_a_table_cell():
+    cell = ('<w:tc><w:p><w:pPr><w:pStyle w:val="Quote"/></w:pPr>%s</w:p></w:tc>'
+            % _wrun("Free-running"))
+    body = "<w:tbl><w:tr>%s%s</w:tr></w:tbl>" % (_wcell("CLK"), cell)
+    parts = {"word/document.xml": _wdoc(body), "word/styles.xml": STYLE_MARKS}
+    md, _rep = _graded(parts)
+    assert "| CLK | *Free-running* |" in md
+    assert _fidelity(parts)["gate"] == "pass"
+
+
+def test_two_emphasised_runs_written_against_each_other_still_open():
+    # `**MODE**` written straight against `*(2:0)*` is ONE run of three asterisks to
+    # CommonMark, so the neighbour's marker does not shield the second span: the
+    # merged run has `E` outside and `(` inside and neither emphasis opens.
+    body = ('<w:p>' + _wrun("The ") + _wrun("MODE", "<w:b/>")
+            + _wrun("(2:0)", "<w:i/>") + _wrun(" end.") + '</w:p>')
+    parts = {"word/document.xml": _wdoc(body)}
+    md, rep = _graded(parts)
+    assert md == "The **MODE**(*2:0)* end.\n"
+    assert rep["valid"] is True and rep["recall"] == 1.0
+    assert _fidelity(parts)["gate"] == "pass"
+
+
+def test_the_merged_run_is_fixed_from_whichever_side_can_move():
+    # Mirror image: here it is the FIRST span whose closing delimiter cannot close,
+    # so the character that moves comes off its end.
+    body = ('<w:p>' + _wrun("The ") + _wrun("(2:0)", "<w:b/>")
+            + _wrun("MODE", "<w:i/>") + _wrun(" end.") + '</w:p>')
+    parts = {"word/document.xml": _wdoc(body)}
+    md, rep = _graded(parts)
+    assert md == "The **(2:0**)*MODE* end.\n"
+    assert rep["valid"] is True and rep["recall"] == 1.0
+    assert _fidelity(parts)["gate"] == "pass"
+
+
+def test_a_tilde_neighbour_does_not_merge_and_needs_no_shift():
+    # Direction (b) for the merge rule: `~~` and `*` are two runs, each punctuation
+    # to the other, so nothing moves.
+    body = ('<w:p>' + _wrun("The ") + _wrun("MODE", "<w:b/>")
+            + _wrun("safe", "<w:strike/>") + _wrun(" end.") + '</w:p>')
+    parts = {"word/document.xml": _wdoc(body)}
+    md, _rep = _graded(parts)
+    assert md == "The **MODE**~~safe~~ end.\n"
+    assert _fidelity(parts)["gate"] == "pass"
+
+
+def test_bold_italic_on_one_run_is_shiftable_because_the_asterisks_are_one_run():
+    body = ('<w:p>' + _wrun("The ") + _wrun("MODE") + _wrun("(2:0)", "<w:b/><w:i/>")
+            + _wrun(" end.") + '</w:p>')
+    parts = {"word/document.xml": _wdoc(body)}
+    md, _rep = _graded(parts)
+    assert md == "The MODE(***2:0)*** end.\n"
+    assert _fidelity(parts)["gate"] == "pass"

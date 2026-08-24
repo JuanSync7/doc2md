@@ -71,6 +71,26 @@ SIBLING_AT_COL_2 = ("1. Stop the service\n"
                     "  1. Check the depth first\n"
                     "3. Restart\n")
 
+# A fenced block inside a list item whose closing fence lost its indent, and the two
+# indent bounds a closing fence has to respect. Shared by the hand-written cases at
+# the bottom of this file and by the differential corpus, so the same documents are
+# graded by the pinned contract AND by a real parser.
+FENCE_OUTLIVES_ITS_ITEM = ("1. Stop the service\n"
+                           "\n"
+                           "   ```bash\n"
+                           "   systemctl stop kestrel\n"
+                           "```\n"
+                           "\n"
+                           "2. Drain the queue\n"
+                           "3. Restart the service\n"
+                           "\n"
+                           "## Verification\n"
+                           "\n"
+                           "Check the **status** page.\n")
+FENCE_CLOSE_INDENTED_FOUR = "```\ncode\n    ```\nstill code\n```\n\n# After\n"
+FENCE_CLOSE_INDENTED_THREE = "```\ncode\n   ```\n\n# After\n"
+FENCE_OPENED_INDENTED = "   ```\ncode\n```\n\n# After\n"
+
 
 def test_child_indented_to_content_column_three_nests():
     got = md_structure(NESTED_AT_COL_3)
@@ -338,6 +358,18 @@ def test_bullets_contribute_no_numbers():
 # importable. We never shell out and never look at a virtualenv path: on the modern
 # ring one of these is installed and the test runs, on the bare 3.6 office ring none
 # is and the test skips with a reason that says so.
+#
+# That sentence was an ASSUMPTION for as long as it stood here — no CI job installed
+# a parser, so BOTH rings skipped every case below, including the anti-vacuity guard
+# written to prove the differential is wired up, and a green CI carried zero evidence
+# from any of them. It is now enforced from the outside, where the constraint lives:
+# `.github/workflows/ci.yml` pins `marko==2.2.3` into tests-modern and runs THIS FILE
+# alone, failing the job if it reports a single skip. A skip here is free on a bare
+# checkout and on the 3.6 ring, and is a build failure on the ring that installs the
+# parser. Enforcing it from ci.yml rather than from an env var read here is
+# deliberate: a `DOC2MD_*` switch is part of the pipeline's configuration surface and
+# would have to be documented as such, and this is not configuration — it is one
+# ring's obligation.
 
 def _start(value):
     """A list's declared start. `or 1` would be wrong: `0.` is a legal ordered
@@ -511,7 +543,8 @@ REFERENCE_NAME, _reference_adapter = _load_reference()
 
 _NO_PARSER = ("no CommonMark reference parser importable (tried marko, "
               "markdown_it, commonmark) — expected on the bare 3.6 ring, which "
-              "has no PyPI access; the hand-written cases above still run")
+              "has no PyPI access; the hand-written cases above still run. On "
+              "the modern CI ring, which installs marko, this skip fails the job")
 
 # The corpus. The hand-written cases above, plus samples chosen to hurt: the
 # indent rules a converter gets wrong, lazy continuations, list-vs-paragraph
@@ -547,6 +580,15 @@ CORPUS = [
     ("two_fences", "```\na\n```\n\n~~~\nb\n~~~\n"),
     ("fence_inside_fence", "````\n```\ninner\n```\n````\n"),
     ("fence_in_list", "- item\n\n  ```\n  code\n  ```\n"),
+    # A closing fence is judged by POSITION as well as by run length: dedenting out
+    # of the container ends the block without closing it, and four columns past the
+    # container's content column is code content, not a close.
+    ("fence_outlives_its_item", FENCE_OUTLIVES_ITS_ITEM),
+    ("fence_close_indented_four", FENCE_CLOSE_INDENTED_FOUR),
+    ("fence_close_indented_three", FENCE_CLOSE_INDENTED_THREE),
+    ("fence_opened_indented", FENCE_OPENED_INDENTED),
+    ("fence_dedent_out_of_a_nested_item",
+     "- outer\n  - inner\n\n    ```\n    code\n  ```\n\n# After\n"),
     ("links_and_images", "[a](http://x) and ![b](y.png) and ![c](c.png)\n"),
     ("autolink", "see <https://example.test/a?b=1> for more\n"),
     ("autolink_mail", "mail <a@b.test> or read <xml:id>\n"),
@@ -647,3 +689,112 @@ def test_the_reference_actually_disagrees_when_md_structure_is_wrong():
     module = __import__(REFERENCE_NAME)
     assert _reference_adapter(module, SIBLING_AT_COL_2)["list_items"] == {0: 4}
     assert _reference_adapter(module, NESTED_AT_COL_3)["list_items"] == {0: 3, 1: 1}
+
+
+# --------------------------------------------------------------------------
+# (3) Where this reader used to disagree with a renderer
+# --------------------------------------------------------------------------
+#
+# Every expectation below was rendered through marko 2.2.3 (the GFM ones through
+# marko.ext.gfm) before it was written down. The CommonMark ones are ALSO in the
+# differential corpus above, so the modern ring keeps re-deriving them; the GFM
+# ones can only live here, because a stock CommonMark parser reads a pipe table as
+# a paragraph and cannot corroborate a table at all.
+
+
+def test_a_fence_that_outlives_its_list_item_is_not_a_clean_close():
+    # The closing fence lost its three-column indent. To a renderer the col-0 fence
+    # ENDS THE LIST ITEM — which ends the code block inside it — and then OPENS a
+    # new fence that never closes, so the remaining steps, the heading and the bold
+    # sentence are all literal code. Read as a tidy close, this document produced
+    # facts byte-identical to the correctly indented one and the gate saw nothing.
+    got = md_structure(FENCE_OUTLIVES_ITS_ITEM)
+    assert got["list_items"] == {0: 1}
+    assert got["code_blocks"] == 2
+    assert got["headings"] == {}
+    assert got["strong"] == 0
+    # ... and the correctly indented twin really is a different document.
+    good = md_structure(FENCE_OUTLIVES_ITS_ITEM.replace("\n```\n\n2.", "\n   ```\n\n2."))
+    assert (good["list_items"], good["code_blocks"], good["headings"],
+            good["strong"]) == ({0: 3}, 1, {2: 1}, 1)
+
+
+def test_a_run_indented_four_columns_inside_a_fence_is_content_not_a_close():
+    # CommonMark lets a closing fence sit up to three columns past its container's
+    # content column. At four it is code content — closing there ended the block
+    # early and LOST the heading that followed the real close.
+    got = md_structure(FENCE_CLOSE_INDENTED_FOUR)
+    assert got["code_blocks"] == 1
+    assert got["headings"] == {1: 1}
+
+
+def test_a_closing_fence_may_still_be_indented_up_to_three_columns():
+    # The converse direction, so the bound cannot be tightened into never closing.
+    for src in (FENCE_OPENED_INDENTED, FENCE_CLOSE_INDENTED_THREE):
+        got = md_structure(src)
+        assert (got["code_blocks"], got["headings"]) == (1, {1: 1}), src
+
+
+_TABLE = "| Signal | Width |\n| --- | --- |\n| clk | 1 |\n"
+
+
+def test_a_rule_or_a_marker_run_after_a_table_keeps_the_table():
+    # The setext rule used to be applied before the open paragraph was resolved as
+    # a table, so a `---` under the last row DELETED the whole table and invented
+    # an h2 no renderer shows. marko-gfm keeps the table and adds an <hr />.
+    for trailer in ("---\n", "-----\n", "* * *\n", "===\n"):
+        got = md_structure(_TABLE + trailer)
+        assert [(t["rows"], t["cols"]) for t in got["tables"]] == [(2, 2)], trailer
+        assert got["headings"] == {}, trailer
+
+
+def test_a_delimiter_row_that_does_not_match_the_header_is_not_a_table():
+    # GFM refuses a table whose delimiter row has a different number of cells, so
+    # this is a paragraph with a setext h2 underneath. Without that parity check,
+    # resolving the table candidate earlier would have invented a 2-column table.
+    got = md_structure("a | b | c\n---|---\n---\n")
+    assert got["tables"] == []
+    assert got["headings"] == {2: 1}
+
+
+def test_a_thematic_break_is_counted():
+    # The one construct that DELETES ITS OWN CHARACTERS: `-----` typed as a body
+    # paragraph renders as <hr /> and carries no ASCII token, so recall reads a
+    # vacuous 1.0 over text that has left the document. A count is the only handle.
+    assert md_structure("intro\n\n-----\n\ntail\n")["thematic_breaks"] == 1
+    assert md_structure("a\n\n---\n\n***\n\n___\n")["thematic_breaks"] == 3
+    # A setext underline is a heading, not a break; an escaped run is prose.
+    assert md_structure("Title\n---\n")["thematic_breaks"] == 0
+    assert md_structure("\\-----\n")["thematic_breaks"] == 0
+
+
+def test_heading_path_records_the_titles_in_document_order():
+    # `headings` is a HISTOGRAM: exchange two section titles and it does not move,
+    # the token multiset does not move, and both hard gates reported a document
+    # that no longer said what the source said.
+    got = md_structure("# 1 Introduction\n\n## 1.1 Scope\n\n# 2 Clock architecture\n")
+    assert got["heading_path"] == [(1, ("1", "introduction")),
+                                   (2, ("1", "1", "scope")),
+                                   (1, ("2", "clock", "architecture"))]
+    swapped = md_structure("# 2 Clock architecture\n\n## 1.1 Scope\n\n# 1 Introduction\n")
+    assert swapped["headings"] == got["headings"]
+    assert swapped["heading_path"] != got["heading_path"]
+
+
+def test_a_setext_heading_contributes_its_text_to_the_path():
+    got = md_structure("Clock architecture\n===\n\nScope\n---\n")
+    assert got["heading_path"] == [(1, ("clock", "architecture")), (2, ("scope",))]
+
+
+def test_a_cell_line_break_is_a_word_boundary_and_not_a_word():
+    # `<br>` is how a GFM cell holds a second paragraph; a renderer draws a line
+    # break there, never the letters "br". Tokenising the raw tag invented a word
+    # no source document can contain, so every multi-paragraph docx cell — and
+    # every list item holding a soft line break — failed the gate on a perfect
+    # conversion.
+    cells = md_structure("| a | b |\n| --- | --- |\n"
+                         "| Free-running.<br>Do not gate. | x |\n")["tables"][0]["cells"]
+    assert cells[1][0] == ("free", "running", "do", "not", "gate")
+    # An ESCAPED tag is the document talking ABOUT the tag: that `br` IS content.
+    escaped = md_structure("| a | b |\n| --- | --- |\n| use \\<br> here | x |\n")
+    assert escaped["tables"][0]["cells"][1][0] == ("use", "br", "here")

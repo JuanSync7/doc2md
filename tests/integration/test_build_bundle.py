@@ -442,3 +442,75 @@ def test_image_filenames_are_deterministic_across_force_rebuild(tmp_path):
     assert bb.main(["--src", str(src), "--out", str(out), "--run-id", "R", "--force"]) == 0
     files2 = sorted(os.listdir(os.path.join(d, "images")))
     assert files1 == files2 and len(files1) == 1             # content-addressed = stable
+
+
+def test_a_failed_rebuild_withdraws_the_bundle_the_last_run_published(tmp_path):
+    """The invariant is written down — *a failed document publishes `report.json`
+    only* — and the failure branches only honoured it on a FIRST build, where there
+    is nothing to leave behind.
+
+    On a rebuild they rewrote `report.json` to `status: failed` and returned, so the
+    previous run's `document.md`, `structure.json` and `images/` stayed on disk: a
+    bundle asserting `lossless: "true"` over the OLD source, under the OLD
+    `source_sha256`, beside a report saying the conversion failed. Everything
+    downstream keys off "does document.md exist", so enrichment then published a
+    fresh `knowledge.json` describing the stale body and `kb_lint` graded it clean.
+    """
+    bb = _mod("build_bundle")
+    src = tmp_path / "s"
+    out = tmp_path / "o"
+    src.mkdir()
+    _docx(str(src / "spec.docx"))
+    assert bb.main(["--src", str(src), "--out", str(out), "--run-id", "R1"]) == 0
+    d = os.path.join(str(out), _bundle_dirs(str(out))[0])
+    good = open(os.path.join(d, "document.md"), encoding="utf-8").read()
+    assert 'lossless: "true"' in good
+
+    # the source is replaced by something the reader rejects, and the doc rebuilt
+    (src / "spec.docx").write_bytes(b"not a zip at all")
+    assert bb.main(["--src", str(src), "--out", str(out), "--run-id", "R2",
+                    "--force"]) == 1
+
+    rep = json.load(open(os.path.join(d, "report.json"), encoding="utf-8"))
+    assert rep["status"] == "failed"
+    for name in ("document.md", "structure.json"):
+        assert not os.path.exists(os.path.join(d, name)), (
+            "%s from the last successful run is still published beside a failed "
+            "report" % name)
+    assert not os.path.isdir(os.path.join(d, "images"))
+    # withdrawn, not destroyed: an environmental failure must not cost the only
+    # good copy of a bundle
+    assert open(os.path.join(d, "document.md.stale"), encoding="utf-8").read() == good
+    assert os.path.isfile(os.path.join(d, "structure.json.stale"))
+    assert os.path.isdir(os.path.join(d, "images.stale"))
+
+    # a second failing rebuild is not an error either (the withdrawal is atomic)
+    assert bb.main(["--src", str(src), "--out", str(out), "--run-id", "R3",
+                    "--force"]) == 1
+    assert not os.path.exists(os.path.join(d, "document.md"))
+
+    # ...and once the document converts again the withdrawn copies are superseded
+    _docx(str(src / "spec.docx"))
+    assert bb.main(["--src", str(src), "--out", str(out), "--run-id", "R4",
+                    "--force"]) == 0
+    assert os.path.isfile(os.path.join(d, "document.md"))
+    assert not os.path.exists(os.path.join(d, "document.md.stale"))
+    assert not os.path.exists(os.path.join(d, "structure.json.stale"))
+    assert not os.path.isdir(os.path.join(d, "images.stale"))
+
+
+def test_an_empty_source_still_publishes_its_vacuous_bundle_on_a_rebuild(tmp_path):
+    # The other direction. `empty-source-file` is deliberately NOT a failure — it is
+    # a vacuous pass that legitimately publishes — so a withdrawal keyed on anything
+    # broader than the failure branches would delete a bundle that is doing its job.
+    bb = _mod("build_bundle")
+    src = tmp_path / "s"
+    out = tmp_path / "o"
+    src.mkdir()
+    (src / "empty.docx").write_bytes(b"")
+    assert bb.main(["--src", str(src), "--out", str(out), "--run-id", "R1"]) == 0
+    d = os.path.join(str(out), _bundle_dirs(str(out))[0])
+    assert bb.main(["--src", str(src), "--out", str(out), "--run-id", "R2",
+                    "--force"]) == 0
+    assert os.path.isfile(os.path.join(d, "document.md"))
+    assert not os.path.exists(os.path.join(d, "document.md.stale"))

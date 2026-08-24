@@ -362,6 +362,17 @@ def _accept_groups(name, groups, vocab, rejected, anchors=None):
             if bad:
                 rejected.append(("%s.%s.ref" % (name, gname), member.get("ref"), bad))
                 continue
+            if record_source(member) == SOURCE_EXTRACTED:
+                # A PROPOSAL MAY NOT LABEL ITSELF EVIDENCE. Only the harvester
+                # writes `source: extracted` (harvested_links), and that label is
+                # what buys a record its exemptions — `merge_group_evidence` keeps
+                # it, `is_protected` defends it, and `revalidate_generated` no
+                # longer re-judges it by the model-answer rules. A model that
+                # emitted the word would launder its own guess into a measurement,
+                # permanently. The record itself is kept; only the unearned claim
+                # is dropped, so the value survives as what it is: a proposal.
+                member = OrderedDict(member)
+                member.pop(EVIDENCE_KEY, None)
             if gv.get("member_type"):
                 etype = member.get("type") or implied
                 if not etype:
@@ -768,11 +779,26 @@ def harvested_links(outline, anchors=None):
 
     First occurrence wins: a URL cited in three sections is one edge with one home,
     not three. Deterministic, so a re-run reproduces it byte for byte.
+
+    THE ANCHOR IS READ, NOT RE-DERIVED. ``document_outline`` already publishes the
+    node's ``anchor``, disambiguated by the same suffix rule ``body_anchors``
+    renders (``overview``, then ``overview-1``). Recomputing the BASE anchor from
+    the node TITLE instead filed every link under the second ``## Overview`` — an
+    entirely ordinary shape for a spec — against the FIRST one, and because the
+    cited anchor does exist, the linter resolved it clean and rubric row D5
+    reported "cites the section that asserts it" over a record that cited a
+    section which does not contain it. ``heading_anchor`` stays as the fallback
+    for an outline that carries no ``anchor`` key at all; the three anchor
+    implementations stay separate (see ``_derive``), because reading a value the
+    producer published is not the same as grading a module against itself.
     """
     out = OrderedDict()
     seen = set()
     for node in _outline_nodes(outline):
-        anchor = heading_anchor(node.get("title") or "")
+        published = node.get("anchor")
+        anchor = published.strip() if isinstance(published, str) else ""
+        if not anchor:
+            anchor = heading_anchor(node.get("title") or "")
         if anchors is not None and anchor not in anchors:
             anchor = ""
         for link in node.get("links") or []:
@@ -854,6 +880,30 @@ def merge_group_evidence(existing, incoming):
             if isinstance(out[gname], list):
                 out[gname].append(member)
     return out
+
+
+def _split_evidence(groups):
+    # type: (dict) -> tuple
+    """``(evidence, proposals)`` — a grouped block split by each record's OWN source.
+
+    The unit of a `groups` field is the record, and the records in one block do not
+    share an origin: a harvested URL is a measurement and a model's URL is a guess.
+    Anything that has to re-judge such a block has to take it apart first, or it
+    applies one set of rules to both.
+    """
+    evidence = OrderedDict()
+    proposals = OrderedDict()
+    for gname, members in (groups or {}).items():
+        if not isinstance(members, list):
+            proposals[gname] = members          # a mapping group: not evidence
+            continue
+        keep = [m for m in members if record_source(m) == SOURCE_EXTRACTED]
+        rest = [m for m in members if record_source(m) != SOURCE_EXTRACTED]
+        if keep:
+            evidence[gname] = keep
+        if rest:
+            proposals[gname] = rest
+    return (evidence, proposals)
 
 
 def value_source(value, default=SOURCE_GENERATED):
@@ -1048,7 +1098,21 @@ def revalidate_generated(meta, vocab):
             continue
         if f.kind == "groups" and isinstance(value, dict):
             dropped = []  # type: list
-            kept_groups = _accept_groups(name, value, vocab, dropped)
+            # A VOCABULARY BUMP RE-CHECKS A GUESS; IT NEVER DELETES A MEASUREMENT.
+            # `_accept_groups` enforces the rules written for a MODEL's answer,
+            # `_GROUP_REQUIRED["links"] = ("url", "ref")` among them — and a
+            # harvested link legitimately carries no `ref` when the URL sits above
+            # the first heading, where a renderer emits no fragment to point at
+            # (quality-plan P7.10). Running the whole block through those rules
+            # therefore deleted recall-1.0 evidence as if a model had proposed it,
+            # and reported `missing-required-ref` over the schema's own intent. So
+            # the block is split by each record's own source first: evidence is
+            # carried through untouched, only proposals are re-judged, and
+            # `merge_group_evidence` puts them back together the same way the
+            # accept path does.
+            evidence, proposals = _split_evidence(value)
+            kept_groups = merge_group_evidence(
+                evidence, _accept_groups(name, proposals, vocab, dropped))
             for where, bad_value, reason in dropped:
                 moved.append((where, bad_value, reason))
             if kept_groups:
@@ -1135,6 +1199,72 @@ def set_provenance(meta, name, source, model="", prompt_sha="", value=None):
                        meta.get(name) if value is None else value)
 
 
+def _groups_off_vocabulary(name, value, vocab):
+    # type: (str, dict, object) -> bool
+    """Does a ``groups`` value carry a term outside a closed vocabulary?
+
+    For a grouped field the declared ``vocab`` does NOT govern the field's own
+    value — it governs a member key: ``entities`` governs each member's ``type``
+    (with the group's implied type standing in for a member that omits one) and
+    ``links`` governs the GROUP NAME. The scalar membership test can see neither,
+    which is why ``invalid`` was structurally pinned at 0 for these fields and a
+    payload full of invented terms reported ``complete``.
+
+    ABSENT IS NOT INVALID: a member that declares no type at all is a gap, and a
+    gap is pending. Only a term that is actually there and actually outside the
+    list counts. ``is_allowed`` passes anything under a registry regime, so only
+    closed vocabularies bind — the same rule the scalar path applies.
+    """
+    gv = group_vocab(name)
+    gname_vocab = gv.get("group_name") or ""
+    member_vocab = gv.get("member_type") or ""
+    for gname, members in (value or {}).items():
+        if gname_vocab and vocab.has(gname_vocab) \
+                and not vocab.is_allowed(gname_vocab, gname):
+            return True
+        if not member_vocab or not vocab.has(member_vocab):
+            continue
+        implied = vocab.group_type(gname)
+        if isinstance(members, dict):
+            candidates = list(members.values())   # the declared scalar-group shape
+        elif isinstance(members, list):
+            candidates = members
+        else:
+            continue
+        for member in candidates:
+            if not isinstance(member, dict):
+                continue
+            etype = member.get("type") or implied
+            if _empty(etype):
+                continue
+            if not vocab.is_allowed(member_vocab, etype):
+                return True
+    return False
+
+
+def _records_off_vocabulary(name, value, vocab):
+    # type: (str, list, object) -> bool
+    """Does a record list carry a sub-key term outside a closed vocabulary?
+
+    ``record_vocab`` is the same table the write path validates against, so the
+    gate grades exactly what acceptance graded: ``relations[].p`` and its ``mode``
+    qualifier, ``decisions[].status``, ``risks[].impact`` and ``mode``. A record
+    that omits a governed key is pending, not invalid.
+    """
+    for rec in value or []:
+        if not isinstance(rec, dict):
+            continue
+        for sub, vname in record_vocab(name).items():
+            if not vocab.has(vname):
+                continue
+            term = rec.get(sub)
+            if _empty(term):
+                continue
+            if not vocab.is_allowed(vname, term):
+                return True
+    return False
+
+
 def meta_coverage(meta, vocab):
     # type: (dict, object) -> dict
     """Counts for the ``doc_meta`` report gate.
@@ -1142,6 +1272,14 @@ def meta_coverage(meta, vocab):
     ``expected`` is every model-writable field — the denominator stays the SCHEMA,
     not whatever this run happened to attempt, so a run that skipped fields reports
     them as pending instead of quietly shrinking the target.
+
+    ``invalid`` is what the gate's own contract turns on ("a value outside the
+    closed vocabulary is worse than an absent one"), and it is measured for EVERY
+    kind. The membership test used to be the scalar one only, so for the five
+    vocabulary-governed knowledge fields — entities, links, relations, decisions,
+    risks — the check ran over an empty list of values and passed vacuously: the
+    gate reported ``complete`` over closed vocabularies full of unknown terms,
+    while ``kb_lint`` reported the same block as six ERRORs.
     """
     meta = meta or {}
     prov = meta.get(PROVENANCE_KEY) or {}
@@ -1154,7 +1292,12 @@ def meta_coverage(meta, vocab):
         if _empty(value):
             continue
         ok = True
-        if f.vocab and vocab.has(f.vocab) and vocab.governance(f.vocab) == "closed":
+        if f.kind == "groups" and isinstance(value, dict):
+            ok = not _groups_off_vocabulary(f.name, value, vocab)
+        elif f.kind == "records" and isinstance(value, list):
+            ok = not _records_off_vocabulary(f.name, value, vocab)
+        elif f.vocab and vocab.has(f.vocab) \
+                and vocab.governance(f.vocab) == "closed":
             vals = value if isinstance(value, list) else [value]
             ok = all(vocab.is_allowed(f.vocab, v) for v in vals
                      if not isinstance(v, (list, dict)))

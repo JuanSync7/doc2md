@@ -404,7 +404,14 @@
    "## Continuation steps (5 onwards)",
    "5. Verify the backup before cutting over.\n6. Cut over the primary region.",
    "   Rollback stays available until the checksum is confirmed.",
-   "|  | storage | storage rota | Only after hours; daytime lag is expected |"
+   "|  | storage | storage rota | Only after hours; daytime lag is expected |",
+   "The **payments rota** owns",
+   "Field MODE(**2:0)** is read-only",
+   "see \\[3\\](page 12) for the drain timing.",
+   "\\## Restart the drain from a clean slate",
+   "\\-----",
+   "TIER        REPLICAS   QUEUE   STATE",
+   "draining\n\ndef kestrel_drain(tier):\n    if tier.ready:\n        tier.write(0x04, 1)\n    return tier\n```"
   ],
   "md_not_contains": [
    "\\\\[payments\\\\]",
@@ -412,7 +419,11 @@
    "Confidential",
    "\n1. Run the migration",
    "\n1. Confirm the checksum",
-   "\n1. Verify the backup"
+   "\n1. Verify the backup",
+   "\n## Restart the drain",
+   "\nMODE**(2:0)**",
+   "\nTIER REPLICAS QUEUE STATE",
+   "\nif tier.ready:"
   ],
   "md_min_count": {
    "| --- |": 1,

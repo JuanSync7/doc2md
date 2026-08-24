@@ -25,15 +25,41 @@ summary: Reads the same structural facts as backend.validate.md_structure, but o
 # w:sdt content control — the flat scan still finds the paragraph, the counts
 # diverge, and the gate fires.
 #
-# POLICY MIRRORED FROM THE CONVERTER (deliberate, and the only coupling):
+# POLICY MIRRORED FROM THE CONVERTER (deliberate, and the only coupling). Every
+# item here is a statement about what MARKDOWN can hold, re-derived from the source:
 #   * a 1x1 table is Word layout scaffolding, so its content is body, not a table
-#   * a paragraph with no text of its own emits no block
-#   * consecutive code-styled paragraphs are ONE fenced block
+#   * a nested table has no cell to live in, so it flattens into its owning cell
+#   * a paragraph with no text and no picture of its own emits no block
+#   * consecutive code-styled paragraphs are ONE fenced block, and only a block
+#     actually emitted between them ends it
 #   * an all-blank table row is dropped, and trailing all-blank columns are trimmed
+#   * embedded diagrams, charts and SVG figures each get at most ONE trailing
+#     section, and only when some part of that kind carries text
+#   * a docx has no horizontal-rule construct, so a faithful conversion of one
+#     contains no thematic break
 #   * headers/footers are not in ``parts`` at all, so neither side can see them
+#
+# THE SYNTHESISED SECTION TITLES ARE NOW LOAD-BEARING TEXT. The trailing
+# ``## Footnotes`` / ``## Endnotes`` / ``## Comments`` / ``## Diagrams`` /
+# ``## Charts`` / ``## Figures`` sections used only to have to agree on a COUNT of
+# level-2 headings. ``heading_path`` compares their WORDS, so each literal below has
+# to be spelled here exactly as the other side spells it — a rename on one side is a
+# delta, which is the correct outcome (the reader is looking at a different word)
+# but a surprising one if the literals are not kept in step.
+#
+# WHAT IS NOT MIRRORED, ON PURPOSE. Emphasis used to be: ``_run_marks`` read direct
+# run formatting only and said in its own docstring that it "mirrors the converter's
+# contract". That is not a policy about markdown — markdown spells `**bold**` however
+# the .docx said it — it was this module inheriting the converter's blind spot on the
+# one fact it exists to police, so a template whose emphasis comes from a style could
+# lose all of it with the gate green and no warning. The cascade is now resolved here
+# from the styles part, and where the converter still disagrees, the gate says so.
 import re
 
 from ._ooxml_md import _attr, _local, _root, _SKIP_LOCALS
+
+__all__ = ["docx_source_structure", "policy_drops", "merged_cell_spans",
+           "tracked_changes", "embedded_objects"]
 
 # Word's canonical heading names. Written out again on purpose — a shared regex
 # would mean a bug in it lands identically on both sides and cancels out.
@@ -47,6 +73,14 @@ _CODE_NAMES = frozenset((
 # w:instrText (a field instruction) are excluded on BOTH sides — see the
 # _ooxml_md module docstring — so they are excluded here too.
 _TEXT_LOCAL = "t"
+
+# Word's toggle properties, and the w:val spellings that mean "off". They live up
+# here because both the STYLE reader and the run reader need them: a style can turn
+# bold on and a run inside it can turn that same bold back off.
+_OFF = ("0", "false", "off")
+_BOLD = ("b", "bCs")
+_ITALIC = ("i", "iCs")
+_STRIKE = ("strike", "dstrike")
 
 
 def _norm(name):
@@ -205,6 +239,66 @@ def _own_text(el, skip_boxes=True):
     return "".join(chunks)
 
 
+# Block-level locals: crossing one of these is a place the DOCUMENT separates two
+# pieces of text, so the words on either side are two words and never one.
+_BLOCK_LOCALS = ("p", "tr", "tc", "br", "tab", "cr")
+
+
+def _block_text(el, skip_boxes=True):
+    # type: (object, bool) -> str
+    """``_own_text`` with the document's own BLOCK boundaries kept, as spaces.
+
+    Concatenating with nothing between is right INSIDE one paragraph — Word splits a
+    single word across runs at every rsid, spell-check and formatting boundary — and
+    wrong the moment the subtree spans two blocks. A table cell holding the
+    paragraphs "Primary rota" and "Standby rota" read as the word ``rotastandby``, a
+    token that is in no document anywhere, and the shipped report.json said so. The
+    damage ran both ways: with the boundary gone from the source side, a markdown
+    that had WELDED the two paragraphs into one word compared equal and passed.
+
+    A w:br / w:tab / w:cr inside a run is the same boundary one level down, and a
+    nested table's rows and cells are blocks that the owning cell flattens.
+
+    The separator is a SPACE and nothing else. Anything matching ``[a-z0-9]+`` would
+    become a fabricated token in its own right, which is the bug being fixed.
+
+    Unlike ``_own_text`` this keeps walking THROUGH a text container: SmartArt's
+    ``dgm:t`` holds ``a:p/a:r/a:t`` children, so stopping at the first ``t`` local
+    reads a whole diagram point as empty."""
+    chunks = []  # type: list
+
+    def walk(node):
+        for ch in node:
+            loc = _local(ch.tag)
+            if loc in _SKIP_LOCALS:
+                continue
+            if skip_boxes and loc == "txbxContent":
+                continue
+            if loc in _BLOCK_LOCALS and chunks:
+                chunks.append(" ")
+            if loc == _TEXT_LOCAL and ch.text:
+                chunks.append(ch.text)
+            walk(ch)
+
+    walk(el)
+    return "".join(chunks)
+
+
+def _find_outermost(el, want, out):
+    # type: (object, tuple, list) -> None
+    """Descendants whose local name is in ``want``, in document order, without
+    descending into one that was found (a nested ``dgm:pt`` belongs to its parent
+    point, not to the list) or into a subtree the converter never enters."""
+    for ch in el:
+        loc = _local(ch.tag)
+        if loc in _SKIP_LOCALS:
+            continue
+        if loc in want:
+            out.append(ch)
+        else:
+            _find_outermost(ch, want, out)
+
+
 def _ppr_props(p):
     # type: (object) -> dict
     """A paragraph's own properties: style, numbering, outline level.
@@ -233,10 +327,42 @@ def _ppr_props(p):
     return props
 
 
+def _style_marks(style):
+    # type: (object) -> tuple
+    """``(turned_on, turned_off)`` — the emphasis one style's own ``w:rPr`` declares.
+
+    Word toggles are tri-state, so a style may also turn one OFF for everything based
+    on it. Only the style's DIRECT ``w:rPr`` child is read: ``w:pPr`` holds paragraph
+    geometry, and ``w:rPrChange`` is the formatting a tracked change replaced."""
+    on, off = set(), set()
+    for ch in style:
+        if _local(ch.tag) != "rPr":
+            continue
+        for prop in ch:
+            loc = _local(prop.tag)
+            if loc == "rPrChange":
+                continue
+            live = _attr(prop, "val") not in _OFF
+            if loc in _BOLD:
+                (on if live else off).add("strong")
+            elif loc in _ITALIC:
+                (on if live else off).add("em")
+            elif loc in _STRIKE:
+                (on if live else off).add("strike")
+    return frozenset(on), frozenset(off)
+
+
 def _style_map(styles_xml):
     # type: (str) -> dict
     """``{"heading": {sid: level}, "code_para": set, "code_char": set,
-    "num": {sid: (numId, ilvl)}}``.
+    "num": {sid: (numId, ilvl)}, "marks": {sid: frozenset}}``.
+
+    ``marks`` is the bold/italic/strike a style CARRIES, resolved down the
+    ``w:basedOn`` chain. It is here because emphasis is a fact about the DOCUMENT,
+    not about how the author typed it: Word's Styles gallery — and every HTML->Word
+    export and pandoc's docx writer — writes ``<w:rStyle w:val="Strong"/>`` where the
+    Bold button writes ``<w:b/>``, and the stock Quote / Intense Quote / Caption /
+    Subtitle paragraph styles carry their italic in exactly this place.
 
     Independently derived: this scans every ``w:style`` reachable from the root by
     ``iter()`` and reads the FIRST name it finds, where the converter iterates
@@ -251,7 +377,8 @@ def _style_map(styles_xml):
     at all is not optional: a custom ``NimbusH1 basedOn="Heading1"`` is an ``<h1>``
     to LibreOffice, and a ground truth that called it body prose would have agreed
     with a converter that deleted every heading in the document."""
-    out = {"heading": {}, "code_para": set(), "code_char": set(), "num": {}}
+    out = {"heading": {}, "code_para": set(), "code_char": set(), "num": {},
+           "marks": {}}
     root = _root(styles_xml)
     if root is None:
         return out
@@ -264,6 +391,7 @@ def _style_map(styles_xml):
             continue
         rec = {"name": "", "based": "", "outline": None, "num": "", "ilvl": "",
                "type": _attr(style, "type")}
+        rec["on"], rec["off"] = _style_marks(style)
         for ch in style.iter():
             loc = _local(ch.tag)
             if loc == "name" and not rec["name"]:
@@ -291,6 +419,7 @@ def _style_map(styles_xml):
             code.add(sid)
         if rec["num"]:
             numbered[sid] = (rec["num"], rec["ilvl"] or "0")
+    marks = dict((sid, rec["on"]) for sid, rec in raw.items())
     for _round in range(len(raw)):
         moved = False
         for sid, rec in raw.items():
@@ -306,11 +435,19 @@ def _style_map(styles_xml):
             if sid not in numbered and parent in numbered:
                 numbered[sid] = numbered[parent]
                 moved = True
+            # Emphasis propagates by VALUE, not by presence: a style based on a bold
+            # one that itself carries <w:b w:val="0"/> is NOT bold, so the parent's
+            # opinion is unioned in and the child's own "off" subtracted after.
+            merged = (marks[parent] | rec["on"]) - (rec["off"] - rec["on"])
+            if merged != marks[sid]:
+                marks[sid] = merged
+                moved = True
         if not moved:
             break
 
     out["heading"] = heading
     out["num"] = numbered
+    out["marks"] = dict((sid, m) for sid, m in marks.items() if m)
     for sid in code:
         # Filed under the DERIVED style's own w:type: a character style based on a
         # paragraph one is still an inline span, never a fenced block.
@@ -411,18 +548,43 @@ def _external(rels_xml):
     return out
 
 
-_OFF = ("0", "false", "off")
-_BOLD = ("b", "bCs")
-_ITALIC = ("i", "iCs")
-_STRIKE = ("strike", "dstrike")
+def _heading_level(props, styles):
+    # type: (dict, dict) -> object
+    """The heading level this paragraph renders at, or ``None``."""
+    level = styles["heading"].get(props["style"])
+    if level is None and props["outline"]:
+        try:
+            level = int(props["outline"]) + 1
+        except ValueError:
+            level = None
+    return level
 
 
-def _run_marks(run, code_chars):
-    # type: (object, object) -> tuple
-    """The formatting a run carries, from its own w:rPr. Mirrors the converter's
-    contract (direct formatting only, toggles tri-state, w:rPrChange ignored) but
-    reads it with its own loop."""
-    got = set()
+def _run_marks(run, code_chars, style_marks=None, inherited=()):
+    # type: (object, object, object, object) -> tuple
+    """The formatting a run carries: its own w:rPr, the character style it names,
+    and whatever the owning paragraph's style already put on it.
+
+    Read from the DOCUMENT, not from the converter's contract. Word has three ways to
+    say bold and a reader of the .docx sees no difference between them, so all three
+    are read here:
+
+      * ``<w:b/>`` on the run — the Bold button;
+      * ``<w:rStyle w:val="Strong"/>`` — the Styles gallery, and the ONLY spelling
+        HTML->Word and pandoc's docx writer produce;
+      * the owning paragraph's style, where stock Quote / Caption / Subtitle keep
+        their italic.
+
+    An earlier version read only the first, under a docstring saying it "mirrors the
+    converter's contract (direct formatting only)". That is the one thing this module
+    may never do: it made the fact vacuous exactly where it mattered, so a whole
+    template's emphasis could be deleted from the markdown and this ground truth
+    would independently report zero and agree that nothing was lost.
+
+    Toggles stay tri-state in both directions: a direct ``<w:b w:val="0"/>`` on a run
+    inside a bold style turns that bold OFF, so inherited marks are unioned in first
+    and the run's own "off" set subtracted after."""
+    on, off, from_style = set(), set(), set()
     for pr in run:
         if _local(pr.tag) != "rPr":
             continue
@@ -430,49 +592,148 @@ def _run_marks(run, code_chars):
             loc = _local(prop.tag)
             if loc == "rPrChange":
                 continue
-            on = _attr(prop, "val") not in _OFF
-            if loc in _BOLD and on:
-                got.add("strong")
-            elif loc in _ITALIC and on:
-                got.add("em")
-            elif loc in _STRIKE and on:
-                got.add("strike")
-            elif loc == "rStyle" and code_chars and _attr(prop, "val") in code_chars:
-                got.add("code")
+            live = _attr(prop, "val") not in _OFF
+            if loc in _BOLD:
+                (on if live else off).add("strong")
+            elif loc in _ITALIC:
+                (on if live else off).add("em")
+            elif loc in _STRIKE:
+                (on if live else off).add("strike")
+            elif loc == "rStyle":
+                sid = _attr(prop, "val")
+                if code_chars and sid in code_chars:
+                    on.add("code")
+                if style_marks:
+                    from_style |= style_marks.get(sid, frozenset())
+    got = (set(inherited) | from_style | on) - (off - on)
     return tuple(sorted(got))
 
 
-def _count_marked_spans(container, code_chars, out, pmap):
-    # type: (object, object, dict, dict) -> None
-    """Count formatted SPANS, coalescing adjacent runs that carry the same marks.
+def _para_marks(p, styles):
+    # type: (object, dict) -> object
+    """The emphasis every run in this paragraph inherits from its w:pStyle, or
+    ``None`` when the paragraph can carry no inline marks at all.
+
+    The two exceptions are statements about MARKDOWN, not about the converter:
+
+      * a code paragraph becomes a fenced line, and a fence has no inline syntax —
+        ``**`` inside one is two asterisks, not bold, so there is no span there to
+        count or to lose;
+      * a heading's own style bold IS the heading. Word's stock Heading1..9 all carry
+        ``<w:b/>`` in their rPr and ``# Title`` already renders bold, so counting it
+        would demand ``# **Title**`` of every heading in every document. A run inside
+        the heading that names a character style is still a real inline span and is
+        still counted."""
+    props = _ppr_props(p)
+    if props["style"] in styles["code_para"]:
+        return None
+    if _heading_level(props, styles) is not None:
+        return frozenset()
+    return styles["marks"].get(props["style"], frozenset())
+
+
+def _run_block(el, pmap):
+    # type: (object, dict) -> tuple
+    """``(coalescing key, owning w:p)`` for one run.
+
+    The key is the nearest w:p OR w:hyperlink ancestor — the two boundaries at which
+    the rendered document necessarily re-opens its markers, since every block is
+    written on its own and a hyperlink's inner text is rendered on its own before
+    being wrapped in ``[...](...)``.
+
+    ``el`` itself is never the answer, so passing a w:hyperlink returns the block it
+    SITS IN, which is where its own one-slot break belongs."""
+    key, para = None, None
+    for anc in _ancestors(el, pmap):
+        loc = _local(anc.tag)
+        if key is None and loc in ("p", "hyperlink"):
+            key = id(anc)
+        if loc == "p":
+            para = anc
+            break
+    return key, para
+
+
+def _count_marked_spans(container, styles, out, pmap):
+    # type: (object, dict, dict, dict) -> None
+    """Count formatted SPANS, coalescing adjacent runs with the same marks WITHIN
+    ONE BLOCK.
 
     Spans, not runs: Word splits one word across several w:r at every property
     boundary, so counting runs would report three bold spans where a reader sees
     one — and the converter, which coalesces, would be graded as wrong for being
-    right."""
-    groups = []  # type: list  # [(marks, joined_text)], consecutive equal marks fused
+    right.
+
+    Within one block. The coalescing used to run over the whole document as a single
+    flat stream, so two blocks that merely ENDED and BEGAN with the same marks fused
+    into one span: a two-cell bold header row counted as one bold span, and three
+    consecutive bold paragraphs counted as one. That failed every correct conversion
+    of an ordinary table, and — far worse — PASSED a markdown that had dropped the
+    bold on two of the three paragraphs, deltas empty. Markdown cannot carry emphasis
+    across a block boundary, so neither may this.
+
+    The blocks are derived from the XML, not borrowed from the converter: each run is
+    FILED under its nearest w:p (or w:hyperlink) ancestor in the parent map, and each
+    file is coalesced on its own. Filing rather than merely breaking the stream is
+    what keeps a text box — whose paragraphs are interleaved with their anchor's runs
+    in document order but rendered as separate blocks — from splitting the anchor
+    paragraph's own span in two."""
+    order = []      # type: list  # block keys, first-seen order
+    blocks = {}     # type: dict  # key -> [(marks, joined_text)]
+    inherited = {}  # type: dict  # id(w:p) -> the marks every run in it starts with
+
+    def file_under(key):
+        group = blocks.get(key)
+        if group is None:
+            group = []
+            blocks[key] = group
+            order.append(key)
+        return group
+
     for el in container.iter():
-        if _local(el.tag) != "r" or _skipped(el, pmap):
+        loc = _local(el.tag)
+        if loc == "hyperlink" and not _skipped(el, pmap):
+            # A link occupies ONE unmarked slot in the block it sits in: its text is
+            # rendered on its own and then wrapped, so `**See** [**spec**](u) **now**`
+            # is three spans and not one. Without this break the two halves of the
+            # sentence would be adjacent in their own block and fuse.
+            if _block_text(el).strip():
+                file_under(_run_block(el, pmap)[0]).append((None, ""))
             continue
-        text = _own_text(el)
+        if loc != "r" or _skipped(el, pmap):
+            continue
+        # w:br / w:tab inside a run are spaces on the other side, so a run holding
+        # nothing but one of them is a whitespace segment, not an absent one.
+        text = _block_text(el)
         if not text:
             continue        # a run with no text emits no segment on the other side
-        marks = _run_marks(el, code_chars)
-        if groups and groups[-1][0] == marks:
-            groups[-1] = (marks, groups[-1][1] + text)
+        key, para = _run_block(el, pmap)
+        start = frozenset()
+        if para is not None:
+            pid = id(para)
+            if pid not in inherited:
+                inherited[pid] = _para_marks(para, styles)
+            start = inherited[pid]
+            if start is None:
+                continue    # inside a fence: markdown has no inline marks to lose
+        marks = _run_marks(el, styles["code_char"], styles["marks"], start)
+        group = file_under(key)
+        if group and group[-1][0] == marks:
+            group[-1] = (marks, group[-1][1] + text)
         else:
-            groups.append((marks, text))
+            group.append((marks, text))
     # A WHITESPACE-ONLY run is a break, not a skip. Skipping it silently fused
     # `**Never** **reboot**` into one span here while the converter emitted two,
     # and the gate then failed a perfectly correct document. The converter's rule
     # is: group consecutive segments by marks, emit markers only when the group
     # has non-whitespace text. Both halves have to be mirrored, not just the first.
-    for marks, text in groups:
-        if not text.strip():
-            continue
-        for mark in marks:
-            key = "code_spans" if mark == "code" else mark
-            out[key] = out.get(key, 0) + 1
+    for key in order:
+        for marks, text in blocks[key]:
+            if marks is None or not text.strip():
+                continue
+            for mark in marks:
+                name = "code_spans" if mark == "code" else mark
+                out[name] = out.get(name, 0) + 1
 
 
 # Cell and item CONTENT, reduced to the token notion the recall gate already uses
@@ -485,6 +746,28 @@ _WORDS = re.compile(r"[a-z0-9]+")
 def _words(text):
     # type: (str) -> tuple
     return tuple(_WORDS.findall((text or "").lower()))
+
+
+def _add_heading(out, level, text):
+    # type: (dict, int, str) -> None
+    """Record one heading the rendered document shows — in BOTH heading facts.
+
+    ``headings`` is a level histogram and ``heading_path`` is the ordered,
+    text-bearing view of the same events. They are written together, in one place,
+    because the two only mean anything side by side: a histogram cannot see two
+    section titles exchanged (the levels are unchanged, the token multiset is
+    unchanged, and prose ends up reattached to the wrong chapter with every gate
+    green), and a path that drifted out of step with the histogram would be a second
+    opinion about a different document.
+
+    ``min(level, 6)`` because markdown stops at ``######``: a w:outlineLvl of 8 is an
+    h6 in the render, so it has to be an h6 here too or every deep outline would fail.
+    The title is reduced to the same ``[a-z0-9]+`` token notion the cell and list
+    facts use — escaping, emphasis markers and a hyperlink's URL are markup, not
+    content, and comparing them would fail faithful conversions."""
+    level = min(level, 6)
+    out["headings"][level] = out["headings"].get(level, 0) + 1
+    out["heading_path"].append((level, _words(text)))
 
 
 def _table_shape(tbl, pmap):
@@ -508,7 +791,9 @@ def _table_shape(tbl, pmap):
                         span = 1
                 elif loc == "vMerge":
                     vmerge = _attr(el, "val") or "continue"
-            text = _own_text(tc, skip_boxes=True).strip()
+            # Block-aware: a cell's own paragraphs, and the rows and cells of any
+            # nested table flattened into it, are boundaries the document declares.
+            text = _block_text(tc, skip_boxes=True).strip()
             # Mirror the converter's declared flattening: GFM has no rowspan, so a
             # vertical merge REPEATS its value down the continuation rows. Without
             # the same fill here the two sides would disagree on every merged
@@ -542,21 +827,41 @@ def _table_shape(tbl, pmap):
     return {"rows": len(grid), "cols": width, "has_header": True, "cells": cells}
 
 
-def _section_facts(xml, out):
-    # type: (str, dict) -> None
+_PICTURE_LOCALS = ("blip", "imagedata")
+
+
+def _has_picture(p):
+    # type: (object) -> bool
+    """Whether this paragraph places an embedded picture.
+
+    A picture is a BLOCK of its own in the rendered markdown — an image line cannot
+    sit inside a sentence — so a paragraph holding only one still ends whatever came
+    before it, even though it contributes no text. A picture that lives only in an
+    mc:Fallback is the shape copy of one drawn elsewhere and is never rendered."""
+    found = []  # type: list
+    _find_outermost(p, _PICTURE_LOCALS, found)
+    return bool(found)
+
+
+def _section_facts(xml, title, out):
+    # type: (str, str, dict) -> None
     """A trailing ``## Footnotes`` / ``## Endnotes`` / ``## Comments`` section:
-    one level-2 heading plus one top-level bullet per note that carries text."""
+    one level-2 heading plus one top-level bullet per note that carries text.
+
+    ``title`` is the heading's own text. It used to be irrelevant — the fact was a
+    count of level-2 headings, and one synthesised section was as good as another —
+    and it is now compared word for word, so the caller's literal is the fact."""
     root = _root(xml)
     if root is None:
         return
     items = []
     for note in root:
-        text = _own_text(note).strip()
+        text = _block_text(note).strip()
         if text:
             items.append(text)
     if not items:
         return
-    out["headings"][2] = out["headings"].get(2, 0) + 1
+    _add_heading(out, 2, title)
     out["list_items"][0] = out["list_items"].get(0, 0) + len(items)
     out["bullet_items"] += len(items)
     out["list_item_words"].extend(_words(t) for t in items)
@@ -564,6 +869,96 @@ def _section_facts(xml, out):
 
 _DIAGRAM = re.compile(r"^word/diagrams/data\d+\.xml$")
 _CHART = re.compile(r"^word/charts/chart(?:Ex)?\d+\.xml$")
+_FIGURE = re.compile(r"^word/media/[^/]+\.svg$")
+
+
+def _diagram_points(xml):
+    # type: (str) -> list
+    """The text of every SmartArt point that carries any — one rendered bullet each.
+
+    A diagram is a LIST in markdown, not a heading: the points are its items. The
+    ground truth used to count a heading per diagram part and no items at all, so an
+    ordinary document with one SmartArt graphic reported three fewer list items than
+    the document contains and the gate failed a faithful conversion."""
+    root = _root(xml)
+    if root is None:
+        return []
+    points = []  # type: list
+    _find_outermost(root, ("pt",), points)
+    out = []
+    for pt in points:
+        text = _block_text(pt, skip_boxes=False).strip()
+        if text:
+            out.append(text)
+    return out
+
+
+_CHART_VALUE_LOCALS = ("t", "v")
+
+
+def _has_chart_text(xml):
+    # type: (str) -> bool
+    """Whether a chart part shows any text at all: a title/axis run (``a:t``) or a
+    cached series name, category or value (``c:v``).
+
+    Emptiness has to be decided the same way the rendered document decides it. A
+    chart whose only text is its cached numbers still renders a section; a chart
+    bound to external data with the cache stripped renders nothing, and counting a
+    heading for it invents a section the document does not have."""
+    root = _root(xml)
+    if root is None:
+        return False
+    for el in root.iter():
+        if _local(el.tag) in _CHART_VALUE_LOCALS and (el.text or "").strip():
+            return True
+    return False
+
+
+def _has_figure_text(xml):
+    # type: (str) -> bool
+    """Whether an embedded SVG carries label text — the ``## Figures`` section."""
+    root = _root(xml)
+    if root is None:
+        return False
+    for el in root.iter():
+        if _local(el.tag) != "text":
+            continue
+        if "".join(t for t in el.itertext() if t).strip():
+            return True
+    return False
+
+
+def _embedded_facts(parts, out):
+    # type: (dict, dict) -> None
+    """The trailing ``## Diagrams`` / ``## Charts`` / ``## Figures`` sections.
+
+    ONE heading per KIND, not per part, and only when some part of that kind carries
+    text — which is what the document actually shows. Counting a heading per part
+    was wrong four ways at once: two charts read as two sections, a textless chart as
+    a section that does not exist, a SmartArt graphic as a heading instead of its
+    bullets, and the ``## Figures`` section of an embedded SVG was not counted at
+    all. The last two have opposite signs, so a document with an SVG and two charts
+    CANCELLED to a green gate with both sides wrong — a level-2 heading total that
+    was not a measurement of anything."""
+    points = []
+    for name in sorted(parts):
+        if _DIAGRAM.match(name):
+            points.extend(_diagram_points(parts[name]))
+    if points:
+        _add_heading(out, 2, "Diagrams")
+        out["list_items"][0] = out["list_items"].get(0, 0) + len(points)
+        out["bullet_items"] += len(points)
+        out["list_item_words"].extend(_words(t) for t in points)
+    # Charts before Figures, because that is the order they appear in: the chart
+    # section is assembled with the body and the figures section is appended after
+    # the whole document. `heading_path` is ORDERED, so a kind emitted out of turn
+    # here would report a permutation on a faithful conversion.
+    for pattern, title, has_text in ((_CHART, "Charts", _has_chart_text),
+                                     (_FIGURE, "Figures", _has_figure_text)):
+        for name in sorted(parts):
+            if pattern.match(name) and has_text(parts[name]):
+                _add_heading(out, 2, title)
+                break
 
 
 # ------------------------------------------------------- measured policy drops
@@ -746,8 +1141,26 @@ def docx_source_structure(parts):
     Same keys as ``backend.validate.md_structure`` so the two can be compared
     directly. Keys the two sides cannot meaningfully compare (images, which are
     HTML-comment sentinels at gate time and are graded by the ``images{}`` block
-    instead) are absent here on purpose."""
-    out = {"headings": {}, "list_items": {}, "ordered_items": 0, "bullet_items": 0,
+    instead) are absent here on purpose.
+
+    ``heading_path`` is ``[(level, tokens), ...]`` in DOCUMENT ORDER, one entry per
+    heading the rendered document shows, and it lines up entry-for-entry with the
+    ``headings`` histogram. Both facts are written by ``_add_heading``. A histogram
+    is a set of totals, so exchanging two section titles leaves it — and the token
+    multiset, and every other fact here — untouched; the ordered, text-bearing view
+    is what makes a permuted, retitled or re-levelled outline a difference.
+
+    ``thematic_breaks`` is 0, and always 0, because a .docx has no construct that
+    renders as a horizontal rule: Word's paragraph borders are furniture the
+    converter does not draw, and a body paragraph that reads ``-----`` or ``===`` is
+    escaped so it stays prose. A break on the markdown side is therefore never
+    something the source asked for — it is a paragraph that has been SUBSTITUTED for
+    a rule, and the substitution deletes the paragraph's own characters, so token
+    recall reads a vacuous 1.0 over it. Stating the zero is what gives the gate a
+    handle on that; saying nothing left the fact ``unmeasured`` and the damage
+    invisible."""
+    out = {"headings": {}, "heading_path": [], "thematic_breaks": 0,
+           "list_items": {}, "ordered_items": 0, "bullet_items": 0,
            "strong": 0, "em": 0, "strike": 0, "code_spans": 0, "code_blocks": 0,
            "links": 0, "tables": [], "list_item_words": [], "ordered_numbers": []}
     root = _root(parts.get("word/document.xml", ""))
@@ -760,30 +1173,62 @@ def docx_source_structure(parts):
 
     # Tables first: a data table's cells are cell content, so its paragraphs must
     # not also be counted as body headings or list items.
+    #
+    # A table nested inside a data cell is NOT a table of its own: GFM has no cell
+    # that can hold one, so its rows are flattened into the owning cell along with
+    # that cell's own text. Counting it a second time claimed the document held one
+    # more table than it does and failed every faithful conversion of a nested table.
+    # A table nested inside a 1x1 LAYOUT table is a different case — the layout
+    # wrapper is scaffolding that gets unwrapped, so the inner table is top level.
     in_data_table = set()
+    emits_block = set()   # ids of the tables that become a table block of their own
     for tbl in root.iter():
         if _local(tbl.tag) != "tbl" or _skipped(tbl, pmap):
             continue
         if _is_layout_table(tbl):
             continue
+        nested = False
+        for anc in _ancestors(tbl, pmap):
+            if _local(anc.tag) == "tbl" and not _is_layout_table(anc):
+                nested = True
+                break
+        if nested:
+            continue
         shape = _table_shape(tbl, pmap)
         if shape:
             out["tables"].append(shape)
+            emits_block.add(id(tbl))
         for el in tbl.iter():
-            in_data_table.add(id(el))
-    # A nested table inside a data cell was flattened into that cell, so it is not
-    # a table of its own — the loop above already skipped its paragraphs.
-    out["tables"] = [t for t in out["tables"] if t]
+            if el is not tbl:
+                in_data_table.add(id(el))
 
     code_run = False
     counters = {}  # type: dict  # numId -> {level: running number}
-    for p in root.iter():
-        if _local(p.tag) != "p" or _skipped(p, pmap):
+    for node in root.iter():
+        loc = _local(node.tag)
+        if loc == "tbl":
+            # A table the document renders as its own block ENDS a run of code
+            # paragraphs, exactly as a paragraph of prose does. Missing that left the
+            # source side fusing two listings across the results table between them,
+            # under-counting fences by the same amount the blank-line rule below used
+            # to over-count them — two errors of opposite sign on one scalar, so an
+            # ordinary runbook holding both cancelled to a green gate with both sides
+            # wrong.
+            if id(node) in emits_block:
+                code_run = False
             continue
+        if loc != "p" or _skipped(node, pmap):
+            continue
+        p = node
         if id(p) in in_data_table:
             continue
         if not _own_text(p).strip():
-            code_run = False
+            # A paragraph with no text of its own emits NO BLOCK, so it cannot break
+            # a fence: the blank line inside a shell transcript (which in Word carries
+            # the surrounding code style) is part of the listing, not a second one.
+            # A paragraph holding a picture is the exception — that is a block.
+            if _has_picture(p):
+                code_run = False
             continue
         props = _ppr_props(p)
         if not props["num"]:
@@ -802,14 +1247,12 @@ def docx_source_structure(parts):
                 code_run = True
             continue
         code_run = False
-        level = styles["heading"].get(props["style"])
-        if level is None and props["outline"]:
-            try:
-                level = int(props["outline"]) + 1
-            except ValueError:
-                level = None
+        level = _heading_level(props, styles)
         if level:
-            out["headings"][min(level, 6)] = out["headings"].get(min(level, 6), 0) + 1
+            # Block-aware text, for the reason the list items use it: a w:br inside a
+            # title is a space in the render, and welding the halves together would
+            # fabricate a token that is in no document.
+            _add_heading(out, level, _block_text(p))
         elif props["num"] and props["num"] != "0":
             try:
                 depth = int(props["ilvl"] or "0")
@@ -818,7 +1261,7 @@ def docx_source_structure(parts):
             out["list_items"][depth] = out["list_items"].get(depth, 0) + 1
             # Ordered item CONTENT: a procedure whose steps were swapped has the
             # same depth histogram and the same token multiset as the real one.
-            out["list_item_words"].append(_words(_own_text(p)))
+            out["list_item_words"].append(_words(_block_text(p)))
             fmt, start = numbering.get((props["num"], props["ilvl"] or "0"),
                                        ("bullet", 1))
             if fmt == "bullet":
@@ -832,7 +1275,7 @@ def docx_source_structure(parts):
                 out["ordered_numbers"].append(
                     _step(counters, props["num"], depth, start))
 
-    _count_marked_spans(root, styles["code_char"], out, pmap)
+    _count_marked_spans(root, styles, out, pmap)
 
     for el in root.iter():
         if _local(el.tag) != "hyperlink" or _skipped(el, pmap):
@@ -841,13 +1284,11 @@ def docx_source_structure(parts):
         if url.startswith(("http://", "https://")) and _own_text(el).strip():
             out["links"] += 1
 
-    for part, _title in (("word/footnotes.xml", "Footnotes"),
-                         ("word/endnotes.xml", "Endnotes"),
-                         ("word/comments.xml", "Comments")):
-        _section_facts(parts.get(part, ""), out)
-    for name in sorted(parts):
-        if _DIAGRAM.match(name) or _CHART.match(name):
-            out["headings"][2] = out["headings"].get(2, 0) + 1
+    for part, title in (("word/footnotes.xml", "Footnotes"),
+                        ("word/endnotes.xml", "Endnotes"),
+                        ("word/comments.xml", "Comments")):
+        _section_facts(parts.get(part, ""), title, out)
+    _embedded_facts(parts, out)
     return out
 
 

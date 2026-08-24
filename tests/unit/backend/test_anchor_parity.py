@@ -144,6 +144,26 @@ def test_a_lost_space_after_the_section_number_is_handled_like_a_present_one():
     assert normalize_title("1") == "1"
 
 
+def test_a_long_heading_publishes_the_anchor_the_renderer_really_emits():
+    """A heading over 120 characters used to be dropped from the outline entirely.
+    Now that it is a node, the second half of that fix has to hold too: the title is
+    published VERBATIM, so its anchor is the whole slug. A `[:120]` clip on the title
+    would advertise the slug of a TRUNCATED heading — a fragment no renderer emits,
+    which is precisely what the rubric's anchor cross-check grades as unaddressable.
+    """
+    long_title = ("Reset and Initialisation Sequence for the Kestrel Fabric Bridge, "
+                  "Including the Optional Retry Path and the Timeout Handling Rules")
+    assert len(long_title) > 120
+    body = "# Kestrel Databook\nintro\n## %s\nbody\n" % long_title
+    out = document_outline(body)["outline"]
+    node = out[0]["children"][0]
+    assert node["title"] == long_title                     # not clipped
+    assert node["anchor"] == gfm_anchor(long_title)
+    # ...and the three implementations still agree on it, end to end.
+    assert set(n["anchor"] for n in [out[0], node]) <= body_anchors(body)
+    assert heading_anchor(long_title) == rubric_anchor(long_title) == node["anchor"]
+
+
 def test_an_anchorless_title_still_yields_an_addressable_node():
     # A heading of pure punctuation slugs to "" in every implementation; the outline
     # must still hand the consumer something to address the node by.

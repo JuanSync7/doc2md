@@ -39,6 +39,8 @@ summary: Reads structural facts out of markdown under CommonMark's own rules —
 #     actual text cannot. Measured at <0.1% over 80k random delimiter strings.
 import re
 
+__all__ = ["md_structure"]
+
 TAB = 4
 
 # Block openers. Ordered-list markers accept both `.` and `)` per CommonMark.
@@ -73,11 +75,23 @@ _PUNCT = set("!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~\x00")
 # it against a source that never held it would fail every table with a link in it.
 _WORDS = re.compile(r"[a-z0-9]+")
 _INLINE_LINK = re.compile(r"!?\[([^\]]*)\]\([^)]*\)")
+# THE ONE PROJECT-SPECIFIC RULE IN THIS OTHERWISE CONVERTER-BLIND READER, and it is
+# a statement about RENDERING, not about the converter's intent: a GFM cell cannot
+# hold a newline, so a multi-paragraph table cell is written `a<br>b`, and every
+# renderer draws a line break there — the reader sees two lines, never the letters
+# "br". Tokenising the raw tag invented a word `br` that no source document can
+# contain, so EVERY multi-paragraph docx cell (and every list item holding a soft
+# line break) failed the fidelity gate on a perfect conversion.
+# `(?<!\\)` matters: the converter escapes `\<br>` when the document TALKS about the
+# tag, and that IS prose the source side carries. Deliberately NOT generalised to
+# `<[^>]*>` — an HTML comment sentinel or a `<stderr>` in prose is content.
+_BR = re.compile(r"(?<!\\)<br\s*/?>", re.I)
 
 
 def _words(text):
     # type: (str) -> tuple
-    return tuple(_WORDS.findall(_INLINE_LINK.sub(r"\1", text or "").lower()))
+    text = _INLINE_LINK.sub(r"\1", text or "")
+    return tuple(_WORDS.findall(_BR.sub(" ", text).lower()))
 
 
 def _expand(line):
@@ -97,6 +111,22 @@ def _expand(line):
 def _indent_of(line):
     # type: (str) -> int
     return len(line) - len(line.lstrip(" "))
+
+
+def _table_candidate(para):
+    # type: (list) -> bool
+    """Is the open paragraph a GFM table rather than prose?
+
+    Header row, delimiter row, and — the part that is easy to forget — the SAME
+    number of cells in both. GFM refuses the table outright when the counts differ,
+    so ``a | b | c`` over ``---|---`` is a paragraph (and its ``---`` underline a
+    setext h2), not a two-column table. Without that check, resolving the candidate
+    earlier would invent tables where a renderer sees a heading."""
+    if len(para) < 2 or "|" not in para[0]:
+        return False
+    if not _DELIM_ROW.match(para[1].strip()):
+        return False
+    return len(_split_row(para[0])) == len(_split_row(para[1]))
 
 
 class _List(object):
@@ -289,6 +319,8 @@ def md_structure(markdown):
     Returns a comparable "fact vector"::
 
         {"headings": {1: 2, 2: 3},        # level -> count
+         "heading_path": [(1, ("intro",)), (2, ("scope",))],   # IN DOCUMENT ORDER
+         "thematic_breaks": 0,
          "list_items": {0: 4, 1: 2},      # nesting depth -> count
          "ordered_items": 6, "bullet_items": 4,
          "ordered_numbers": [1, 2, 3, 1, 2, 3],   # what a renderer PRINTS
@@ -307,13 +339,28 @@ def md_structure(markdown):
     source meant — and that is the whole of the renumbering defect. Recording the
     rendered value is what makes a list split, a list wrongly merged, and a start
     that was ignored all show up as the same kind of difference.
+
+    ``heading_path`` is the same argument applied to prose. ``headings`` is a
+    HISTOGRAM, so exchanging two section titles leaves it identical, leaves the token
+    multiset identical, and every gate certified a document that no longer said what
+    the source said. Recording ``(level, tokens)`` IN DOCUMENT ORDER is what turns a
+    permuted, retitled or re-levelled outline into a difference. Tokens rather than
+    raw text, for the reason the table cells use them: escaping and emphasis markers
+    are markup, not content.
+
+    ``thematic_breaks`` counts the one construct that DELETES ITS OWN CHARACTERS.
+    A body paragraph of `-----` renders as an <hr> and carries no ASCII tokens, so
+    recall reads a vacuous 1.0 over text that has left the document; a count is the
+    only handle a gate can get on that substitution.
     """
     counter = {"strong": 0, "em": 0, "strike": 0, "code_spans": 0,
                "links": 0, "images": 0}
     headings = {}
     list_items = {}
     ordered_items = bullet_items = code_blocks = block_quotes = 0
+    thematic_breaks = 0
     list_item_words = []  # type: list
+    heading_path = []  # type: list
     ordered_numbers = []  # type: list
     tables = []
     # depth -> (ordered?, marker/delimiter, last rendered number) for the list open
@@ -330,6 +377,7 @@ def md_structure(markdown):
     lines = [_expand(l) for l in (markdown or "").split("\n")]
     stack = []                                    # open list items, outermost first
     fence = ""                                    # the open fence, "" when closed
+    fence_base = 0                                # content column of its container
     para = []                                     # the open paragraph's lines
     para_depth = 0                                # len(stack) where it opened
     in_icode = False                              # inside an indented code block
@@ -338,7 +386,7 @@ def md_structure(markdown):
 
     def flush_table():
         # Resolve the open paragraph: a header + delimiter row makes it a table.
-        if len(para) >= 2 and _DELIM_ROW.match(para[1].strip()) and "|" in para[0]:
+        if _table_candidate(para):
             cols = len([c for c in _split_row(para[1])])
             body = [r for r in para[2:] if "|" in r]
             cells = []
@@ -366,9 +414,25 @@ def md_structure(markdown):
         content = raw[indent:]
 
         if fence:
-            if stripped.startswith(fence) and set(stripped) <= set(fence[0] + " "):
+            # A CLOSING fence has two conditions, and this reader used to check only
+            # the first. (1) The run: at least as long as the opener, same character,
+            # nothing else on the line. (2) The POSITION: a closing fence may be
+            # indented at most three columns past its CONTAINER's content column —
+            # four is code content, not a close. Getting (2) wrong ended a col-0 fence
+            # early and swallowed the heading that followed it.
+            if (stripped.startswith(fence) and set(stripped) <= set(fence[0] + " ")
+                    and fence_base <= indent <= fence_base + 3):
                 fence = ""
-            continue
+                continue
+            if stripped and indent < fence_base:
+                # The list item (or quote) that HELD this fence has ended, so the code
+                # block ends with it — but it was never closed, so a renderer keeps
+                # reading. This line is a block in its own right: fall through and
+                # re-process it, which is how a stray col-0 ``` under an indented
+                # fence OPENS a new one instead of tidily closing the old.
+                fence = ""
+            else:
+                continue
 
         if not stripped:
             # A blank line ends the paragraph and the quote but NOT an indented
@@ -430,6 +494,7 @@ def md_structure(markdown):
         if fm:
             flush_table()
             fence = fm.group(1)
+            fence_base = base                     # the column its close is judged from
             code_blocks += 1
             continue
 
@@ -439,24 +504,39 @@ def md_structure(markdown):
         # it must reach the paragraph's own content column.
         if para and len(stack) == para_depth and indent >= base \
                 and _SETEXT.match(content):
-            level = 1 if content[0] == "=" else 2
-            headings[level] = headings.get(level, 0) + 1
-            close_lists(len(stack))               # `-` alone reads as a bullet above
-            for row in para:
-                _scan_inline(row, counter)
-            del para[:]
-            continue
+            if _table_candidate(para):
+                # The open paragraph is a GFM TABLE, and a table has no setext
+                # underline: `---` under its last row is a thematic break and the
+                # table stands. Resolving the candidate first is what stops the
+                # whole table being deleted and a heading nobody renders invented
+                # in its place.
+                flush_table()
+            else:
+                level = 1 if content[0] == "=" else 2
+                headings[level] = headings.get(level, 0) + 1
+                heading_path.append((level, _words(" ".join(para))))
+                close_lists(len(stack))           # `-` alone reads as a bullet above
+                for row in para:
+                    _scan_inline(row, counter)
+                del para[:]
+                continue
 
         atx = _ATX.match(content)
         if atx:
             flush_table()
             level = len(atx.group(1))
             headings[level] = headings.get(level, 0) + 1
+            heading_path.append((level, _words(atx.group(2) or "")))
             _scan_inline(atx.group(2) or "", counter)
             continue
 
         if _THEMATIC.match(stripped):
             flush_table()
+            # A thematic break DELETES its own characters from the render: `-----`
+            # typed as a body paragraph draws an <hr> and the hyphens are gone. It
+            # carries no tokens, so recall is blind to it; counting it is the only
+            # way the fidelity gate can see that substitution happen.
+            thematic_breaks += 1
             continue
 
         if bm or om:
@@ -513,6 +593,8 @@ def md_structure(markdown):
     flush_table()
     result = {
         "headings": headings,
+        "heading_path": heading_path,
+        "thematic_breaks": thematic_breaks,
         "list_items": list_items,
         "ordered_items": ordered_items,
         "bullet_items": bullet_items,

@@ -42,7 +42,8 @@ from difflib import SequenceMatcher
 from backend.ingest import parse_block, render_block
 
 from ._lint import ERROR, INFO, WARN
-from ._schema import FIELDS, field, group_vocab, proposed_key, record_vocab
+from ._schema import (FIELDS, SCHEMA_VERSION, field, group_vocab, proposed_key,
+                      record_vocab)
 
 __all__ = ["CorpusFinding", "apply_promotions", "corpus_findings",
            "alias_suggestions", "norm_key",
@@ -181,9 +182,9 @@ def _parse_similar_ok(raw):
     Without a way to record that, a false collision would fail every build forever
     with nothing a human could do about it.
 
-    Both the raw pair and the normalised pair are stored, so an entry works whether
-    it names two spellings that merely resemble each other or two that collapse to
-    the same key. An entry may be scoped to a vocabulary/context or left bare.
+    THREE forms are stored, so an entry works whether it names two spellings that
+    merely resemble each other, two that differ only in case, or two that collapse to
+    the same identity key. An entry may be scoped to a vocabulary/context or left bare.
     """
     out = set()
     for item in (raw or []):
@@ -195,6 +196,17 @@ def _parse_similar_ok(raw):
         if len(parts) != 2:
             continue
         scope = scope.strip()
+        # CASE-SENSITIVE, and stored IN ADDITION to the lowered form rather than
+        # instead of it. `Docker` and `docker` are one identity key AND one lowered
+        # pair, so both of the forms below degenerate to a single element and the
+        # `len(pair) != 2` guard in `_accepted` skipped them — which made the ERROR
+        # for a case-only collision unclearable by any configuration, while the
+        # finding printed the exact entry that provably does nothing. The lowered
+        # form stays because a punctuation-only pair binds through it whatever case
+        # the operator typed.
+        raw_pair = frozenset(parts)
+        if len(raw_pair) == 2:
+            out.add((scope, raw_pair))
         out.add((scope, frozenset(p.lower() for p in parts)))
         # The normalised pair is stored ONLY when it stays a pair. For the collision
         # case the two spellings share one identity key by definition, so the
@@ -212,7 +224,11 @@ def _accepted(similar_ok, scope, a, b):
     # type: (set, str, str, str) -> bool
     if not similar_ok:
         return False
-    for pair in (frozenset([("%s" % (a,)).strip().lower(),
+    # Raw first, then lowered, then normalised. Each is tried only when it is still a
+    # PAIR: a one-element candidate would match any two spellings sharing that form
+    # and whitelist a whole identity instead of the one pair somebody cleared.
+    for pair in (frozenset([("%s" % (a,)).strip(), ("%s" % (b,)).strip()]),
+                 frozenset([("%s" % (a,)).strip().lower(),
                             ("%s" % (b,)).strip().lower()]),
                  frozenset([norm_key(a), norm_key(b)])):
         if len(pair) != 2:
@@ -687,7 +703,17 @@ def synonym_report(docs, vocab):
                 groups.setdefault(key, []).append(spelling)
 
         collisions = 0
-        for key, members in groups.items():
+        # `sorted(groups)`, not `groups.items()`: `where` is filled by iterating a
+        # per-document SET, so `groups` inherits an order that varies with the
+        # process's hash seed — and `suggestions` is filled in this loop's order, so
+        # two runs over byte-identical input wrote a different `alias_suggestions`
+        # block into `kb_lint --json`. Sorting the members inside a group (below) only
+        # ever ordered the variants WITHIN one collision; it is the order OF THE
+        # GROUPS that was loose. Sorted HERE rather than at the traversal point on
+        # purpose: `sweep_keys` below is handed to a truncating similarity sweep, and
+        # reordering its input would trade one nondeterminism for a less visible one.
+        for key in sorted(groups):
+            members = groups[key]
             if len(members) < 2:
                 continue
             if _all_accepted(similar_ok, vname, members):
@@ -864,13 +890,19 @@ def entity_report(docs, vocab):
             continue          # recorded as deliberately distinct spellings
         collisions += 1
         canonical = _canonical(members, where, prefer_lower=False)
+        # EVERY unaccepted pair, not just the first two. `_all_accepted` demands all
+        # of them, so a three-way group whose message named one pair printed a remedy
+        # that, pasted back verbatim, reprinted the identical message.
+        todo = ["entities:%s|%s" % (a, b)
+                for i, a in enumerate(sorted(members))
+                for b in sorted(members)[i + 1:]
+                if not _accepted(similar_ok, "entities", a, b)]
         findings.append(_f(
             "entity-collision", ERROR, "entities/%s" % key,
             "one entity, %d spellings — these are %d nodes in the graph, not one "
             "(suggested canonical: %r). If they are genuinely different things, "
             "record the pair as `lint.similar_ok: [%s]`"
-            % (len(members), len(members), canonical,
-               "entities:%s|%s" % (sorted(members)[0], sorted(members)[1])),
+            % (len(members), len(members), canonical, ", ".join(todo)),
             [_where_line(m, where[m])
              for m in sorted(members, key=lambda m: (-len(where[m]), m))]))
 
@@ -1051,8 +1083,8 @@ def graph_report(docs, vocab):
                                      int(sum(unresolved.values())))])}
 
 
-def skew_report(docs):
-    # type: (object) -> dict
+def skew_report(docs, schema_current="", vocab_current=""):
+    # type: (object, str, str) -> dict
     """Which documents are behind the current schema — the backfill work list.
 
     This is the check that makes "bump the version and re-run" a bounded operation
@@ -1062,12 +1094,24 @@ def skew_report(docs):
     ``vocab_version`` moving means the TERM LIST changed, which invalidates
     classifications while leaving every other field untouched.
 
+    "CURRENT" IS THE VERSION THE RUNNING CODE EMITS, not the newest one the corpus
+    happens to hold. Measured corpus-relative, a UNIFORMLY STALE corpus — every
+    document at the old number, which is the exact state a bump leaves behind and the
+    exact state this check exists to name — reported zero backfill work, zero
+    warnings and exit 0 even under ``--strict``, and stamped the stale number into
+    ``kb_lint.json`` as ``current`` while the same file's run header printed the real
+    one. Both authoritative values are keyword arguments with empty defaults so an
+    existing caller keeps working; passing neither restores the corpus-relative
+    reading, which is honest only when the code's own version is genuinely unknown.
+
     A block with no version is a WARN, not an error: it is still backfillable — a
     selective pass must simply be written as "not the current version" rather than
     "less than the current version", or it skips these forever.
     """
     rows, findings = _rows(docs)
     metrics = OrderedDict()
+    authoritative = {"schema_version": ("%s" % (schema_current,)).strip(),
+                     "vocab_version": ("%s" % (vocab_current,)).strip()}
     for key in ("schema_version", "vocab_version"):
         counts = Counter()
         behind = []  # type: list
@@ -1079,7 +1123,21 @@ def skew_report(docs):
             else:
                 counts["%s" % (meta.get(key),)] += 1
         stamped = [v for v in counts if v != "<unset>"]
-        current = _newest(stamped)
+        code_version = authoritative.get(key) or ""
+        corpus_newest = _newest(stamped)
+        # `_newest` over both, rather than the code's value outright: a corpus that
+        # has run AHEAD of this checkout (a colleague's newer build) is a real state,
+        # and calling every one of those documents "behind" would invert the work
+        # list. What must never happen again is the corpus deciding what current is
+        # while the code silently agrees.
+        current = _newest(stamped + [code_version]) if code_version else corpus_newest
+        if code_version and stamped and corpus_newest != current:
+            findings.append(_f(
+                "schema-corpus-behind", WARN, key,
+                "the WHOLE corpus is behind: the newest `%s` any document carries is "
+                "%s and the running code writes %s, so every stamped document (%d) "
+                "needs a backfill — corpus-relative this check saw nothing to do"
+                % (key, corpus_newest, current, len(rows) - len(unstamped))))
         for path, meta in rows:
             # The SAME predicate both loops. Using `is None` here while the loop
             # above also treats blank as unstamped puts a blank-stamped document in
@@ -1274,6 +1332,33 @@ def vocabulary_hygiene(vocab):
     return {"findings": findings, "metrics": metrics}
 
 
+def _binding_fields():
+    # type: () -> dict
+    """vocabulary name -> the metadata fields that can put a value in it.
+
+    Resolved through the schema rather than hardcoded, and covering all three ways a
+    field binds one: directly (``type`` -> ``document_types``), through a record
+    sub-key (``relations.mode`` -> ``failure_modes``) and through a group role
+    (``entities`` -> ``entity_types``).
+    """
+    out = OrderedDict()
+
+    def bind(vname, fname):
+        if not vname:
+            return
+        names = out.setdefault(vname, [])
+        if fname not in names:
+            names.append(fname)
+
+    for f in FIELDS:
+        bind(f.vocab, f.name)
+        for _sub, vname in record_vocab(f.name).items():
+            bind(vname, f.name)
+        for _role, vname in group_vocab(f.name).items():
+            bind(vname, f.name)
+    return out
+
+
 def vocabulary_usage(docs, vocab):
     # type: (object, object) -> dict
     """Which governed terms the corpus never draws on.
@@ -1322,6 +1407,18 @@ def vocabulary_usage(docs, vocab):
             for cat in links.keys():
                 bump(link_vocab, cat, path)
 
+    # Which BINDING SITES the corpus populates. `coverage-absent` grades FIELD
+    # presence, so the deferral below is only sound for a vocabulary whose binding
+    # field is itself empty — see the comment at the deferral.
+    binds = _binding_fields()
+    populated = Counter()
+    for _path, meta in rows:
+        for f in FIELDS:
+            val = meta.get(f.name)
+            if val is None or (isinstance(val, (list, dict, str)) and not val):
+                continue
+            populated[f.name] += 1
+
     metrics = OrderedDict()
     for name, node in vocab.fields():
         if node.get("governance") != "closed":
@@ -1336,18 +1433,49 @@ def vocabulary_usage(docs, vocab):
             ("unused", unused),
             ("single_document", singles),
         ])
-        if unused and len(rows) >= min_docs and len(unused) < len(values):
-            # All-unused means the field is simply not populated yet, which
-            # `coverage-absent` reports directly and by field name. Reporting it here
-            # too would bury the case that matters: a list that IS in use, with dead
-            # terms sitting in it inviting a model to pick one. (This deferral is
-            # only sound BECAUSE coverage_report has a zero branch — without one,
-            # both gates deferred to each other and the field vanished entirely.)
+        if not unused or len(rows) < min_docs:
+            continue
+        if len(unused) < len(values):
             findings.append(_f(
                 "vocab-unused", INFO, name,
                 "%d/%d terms are used by no document — a model choosing from this "
                 "enum is offered values the corpus has never needed"
                 % (len(unused), len(values)), unused))
+            continue
+        # ALL of them dead. The deferral to `coverage-absent` is sound only when that
+        # gate will actually name something: it grades tier-2, non-authored-only
+        # FIELD presence, so it says nothing about a vocabulary bound through an
+        # OPTIONAL record sub-key of a field that IS populated. `failure_modes` is
+        # exactly that (`relations.mode` / `risks.mode`), and the result was a
+        # monotonicity inversion — 3 of 4 dead terms reported, 4 of 4 silent, the
+        # worse corpus being the quieter one. That is the inversion the zero-branch
+        # in `coverage_report` exists to prevent, arriving through the other door.
+        #
+        # A vocabulary bound ONLY to `authored_only` fields stays silent on purpose:
+        # `coverage_report` declines to warn about those ("an authored-only field
+        # being rare is a fact about the organisation rather than about the
+        # pipeline"), and contradicting that here would fire on every fresh corpus
+        # for `document_status`, `confidentiality` and `review_cadence`.
+        # EVERY binding field, not any: the deferral is only the whole story when
+        # `coverage-absent` names them all. One populated binding field with not a
+        # single term drawn from the vocabulary is the case nothing else can see, and
+        # "risks is populated on no document" tells an operator nothing about a
+        # qualifier that also hangs off `relations`.
+        graded = [n for n in binds.get(name) or []
+                  if field(n).tier == 2 and not field(n).authored_only]
+        live = [n for n in graded if populated[n]]
+        if not graded or not live:
+            continue
+        findings.append(_f(
+            "vocab-dead", INFO, name,
+            "0/%d terms are used by any document, yet %s populated — "
+            "`coverage-absent` grades FIELD presence, so it cannot name this one and "
+            "the whole vocabulary was invisible in both gates"
+            % (len(values),
+               "the field(s) that bind it are" if len(live) > 1
+               else "the field that binds it is"),
+            ["%s (populated on %d document(s))" % (n, populated[n]) for n in live]
+            + ["unused: %s" % ", ".join(unused)]))
     return {"findings": findings, "metrics": metrics}
 
 
@@ -1439,7 +1567,14 @@ def corpus_findings(docs, vocab, partial=False, unreadable=()):
                         ("synonyms", lambda: synonym_report(rows, vocab)),
                         ("entities", lambda: entity_report(rows, vocab)),
                         ("graph", lambda: graph_report(rows, vocab)),
-                        ("skew", lambda: skew_report(rows)),
+                        # The authoritative versions, FORWARDED. `corpus_findings`
+                        # already holds the vocabulary and `SCHEMA_VERSION` is one
+                        # import away; calling `skew_report(rows)` bare is what let a
+                        # uniformly stale corpus grade itself against itself.
+                        ("skew", lambda: skew_report(
+                            rows, schema_current="%s" % (SCHEMA_VERSION,),
+                            vocab_current=("%s" % (getattr(vocab, "version", ""),)
+                                           if vocab is not None else ""))),
                         ("coverage", lambda: coverage_report(rows, vocab)),
                         ("vocab_usage", lambda: vocabulary_usage(rows, vocab))):
         if partial and name in _NEEDS_WHOLE_CORPUS:

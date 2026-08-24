@@ -117,15 +117,47 @@ dropped.
 That `run{}` block is what makes the conversion **repeatable**, not just measured:
 
 ```console
-$ python3 scripts/replay_run.py --report bundles/602f96677581c18b/report.json \
+$ python3 scripts/replay_run.py --report bundles/8d05365303a6e4ee/report.json \
       --src ./docs-in --out /tmp/replay --execute --compare
-no divergences: same code, same interpreter, same resolved settings
-REPRODUCED 602f96677581c18b markdown_sha256 26aafd2740f8644d
+run       GUIDEDEMO  (build_bundle)
+code      {"name": "doc2md", "version": "0.1.0", "commit": "dda2d7a7…", "dirty": true}
+host      {"python": "3.6.8", "implementation": "CPython", "platform": "Linux-4.18.0-…"}
+corpus    1a53f9c7b3389e1c…  (recorded)
+
+DIVERGENCES (2) — this machine is not the recorded one:
+  code     the RECORDED run had uncommitted changes: the code that produced this report is not in any commit
+  code     this checkout has uncommitted changes
+
+command   … scripts/build_bundle.py --src ./docs-in --out /tmp/replay --run-id GUIDEDEMO
+REPRODUCED 8d05365303a6e4ee markdown_sha256 1886cb1ef0dc33d5
 ```
+
+That is a real capture, from a development checkout — which is why it names two
+`code` divergences rather than printing the clean line. On a committed tree the last
+two lines are preceded by `no divergences:` followed by **all seven** claims it is
+entitled to make: *same code, same interpreter, same external tools, same resolved
+settings, same `DOC2MD_*` environment, same source bytes, same corpus*. The sentence
+is built from the classes that actually ran, so it can never claim one that did not.
 
 Point it at a machine with a different commit, a dirty checkout or a changed
 `DOC2MD_*` value and it names each difference **before** running anything. A replay
 that quietly produced a different answer would be worse than no replay at all.
+
+**And it distinguishes "I checked and nothing moved" from "I did not check."** Drop
+the `--src` and the two byte classes have nothing to hash:
+
+```console
+$ python3 scripts/replay_run.py --report bundles/8d05365303a6e4ee/report.json
+UNVERIFIED (2) — never compared, which is not the same as unchanged:
+  source   no --src was given, so source_sha256 was never re-hashed: UNVERIFIED, which is not the same as unchanged
+  corpus   corpus_sha256 1a53f9c7b338 was recorded and no --src was given, so it was never re-hashed: UNVERIFIED
+```
+
+An unverified class exits **4**, never `0`. It is not an all-clear, and the tool
+used to say it was — the inspect-only call printed `same source bytes` over a source
+tree it had never opened. `0` now means *everything applicable was compared and none
+of it moved*; `3` means a difference was demonstrated; `1` is a usage error. The
+full table is in [`reference/configuration.md`](reference/configuration.md).
 
 **`structure.json`** — each node carries `line_span`, `self_tokens`,
 `subtree_tokens`, plus full nodes for images and links:

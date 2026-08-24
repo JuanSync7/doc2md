@@ -370,6 +370,49 @@ def test_a_recorded_pair_clears_a_collision_that_is_genuinely_two_things(vocab):
     assert codes(entity_report(other, cleared))["entity-collision"]
 
 
+def test_a_case_only_collision_can_be_recorded_as_deliberate_too(vocab):
+    # THE ESCAPE HATCH THE FINDING PRINTS HAS TO WORK. `similar_ok` stored only the
+    # LOWERED pair and the NORMALISED pair, and for `Docker`/`docker` both of those
+    # degenerate to a single element — which the pair guard then skips. So the ERROR
+    # named the exact entry to paste, the operator pasted it, and the identical error
+    # came back on the next run with nothing else a person could do about it.
+    # `kb_lint` exits 1 on a corpus error with or WITHOUT --strict, so the build was
+    # red on a default run.
+    rows = [doc("a.md", entities={"software": [{"name": "Docker", "type": "Software"}]}),
+            doc("b.md", entities={"software": [{"name": "docker", "type": "Package"}]})]
+    f = codes(entity_report(rows, vocab))["entity-collision"][0]
+    assert "lint.similar_ok: [entities:Docker|docker]" in f.message
+
+    text = _VOCAB.replace("    - review_cadence:annual|biannual",
+                          "    - review_cadence:annual|biannual\n"
+                          "    - entities:Docker|docker")
+    cleared = load_vocab(text=text)
+    assert "entity-collision" not in codes(entity_report(rows, cleared))
+
+    # It clears THAT PAIR only. A third case-only spelling is a new, unrecorded
+    # decision and must come back, or one entry would whitelist a whole identity.
+    third = rows + [doc("c.md", entities={"software": [{"name": "DOCKER",
+                                                        "type": "Software"}]})]
+    assert codes(entity_report(third, cleared))["entity-collision"]
+
+
+def test_the_collision_hint_names_every_pair_a_three_way_group_needs(vocab):
+    # `_all_accepted` demands EVERY pair, so a message naming `sorted(members)[0]`
+    # and `[1]` printed a remedy that, pasted back verbatim, reprinted itself.
+    rows = [doc("a.md", entities={"paths": [{"path": "/etc/a-b", "type": "Path"}]}),
+            doc("b.md", entities={"paths": [{"path": "/etc/a_b", "type": "Path"}]}),
+            doc("c.md", entities={"paths": [{"path": "/etc/a.b", "type": "Path"}]})]
+    f = codes(entity_report(rows, vocab))["entity-collision"][0]
+    pasted = f.message.split("`lint.similar_ok: [")[1].split("]`")[0]
+    entries = [e.strip() for e in pasted.split(",")]
+    assert len(entries) == 3
+
+    text = _VOCAB.replace("    - review_cadence:annual|biannual",
+                          "    - review_cadence:annual|biannual\n"
+                          + "\n".join("    - %s" % e for e in entries))
+    assert "entity-collision" not in codes(entity_report(rows, load_vocab(text=text)))
+
+
 def test_an_entity_with_no_name_is_reported_rather_than_dropped(vocab):
     # A node with no identity can never collide, be reused, or be an endpoint.
     # Dropping it makes the corpus look CLEANER for containing it.
@@ -492,6 +535,60 @@ def test_a_half_migrated_corpus_names_the_unstamped_documents():
     assert "`!= 2`" in f.message
 
 
+def test_a_uniformly_stale_corpus_is_behind_the_version_the_code_emits():
+    # "CURRENT" USED TO MEAN "THE NEWEST ONE IN THE CORPUS", which made this check
+    # structurally incapable of firing on the one state it exists to name: every
+    # document at the old number, i.e. the bump that has not been re-run. It reported
+    # zero backfill work, zero warnings and exit 0 even under --strict, and wrote the
+    # stale number into kb_lint.json as `current` while the same file's run header
+    # printed the real one.
+    rows = [doc("a.md", schema_version=2, vocab_version=1),
+            doc("b.md", schema_version=2, vocab_version=1)]
+
+    corpus_relative = skew_report(rows)["metrics"]
+    assert corpus_relative["schema_version"]["current"] == "2"   # the old reading,
+    assert corpus_relative["schema_version"]["behind"] == 0      # still the default
+
+    res = skew_report(rows, schema_current="3", vocab_current="2")
+    m = res["metrics"]
+    assert m["schema_version"]["current"] == "3" and m["schema_version"]["behind"] == 2
+    assert m["vocab_version"]["current"] == "2" and m["vocab_version"]["behind"] == 2
+    behind = codes(res)["schema-corpus-behind"]
+    assert sorted(f.where for f in behind) == ["schema_version", "vocab_version"]
+    assert all(f.severity == WARN for f in behind)
+    assert "the WHOLE corpus is behind" in behind[0].message
+
+
+def test_a_corpus_already_on_the_current_version_reports_nothing_to_backfill():
+    rows = [doc("a.md", schema_version=3, vocab_version=2),
+            doc("b.md", schema_version=3, vocab_version=2)]
+    res = skew_report(rows, schema_current="3", vocab_current="2")
+    assert res["findings"] == []
+    assert res["metrics"]["schema_version"]["behind"] == 0
+
+
+def test_a_corpus_ahead_of_this_checkout_is_not_called_behind():
+    # A colleague's newer build is a real state. Taking the code's number outright
+    # would call every one of those documents "behind" and invert the work list.
+    rows = [doc("a.md", schema_version=4), doc("b.md", schema_version=4)]
+    res = skew_report(rows, schema_current="3")
+    assert res["metrics"]["schema_version"]["current"] == "4"
+    assert "schema-corpus-behind" not in codes(res)
+    assert "schema-skew" not in codes(res)
+
+
+def test_corpus_findings_forwards_the_versions_it_already_holds(vocab):
+    # The gate had BOTH numbers within reach — `SCHEMA_VERSION` is one import away
+    # and the Vocabulary object is a parameter — and used neither.
+    from backend.kb import SCHEMA_VERSION
+    rows = [doc("%d.md" % i, id="d%d" % i, schema_version=1, vocab_version=0)
+            for i in range(3)]
+    m = corpus_findings(rows, vocab)["metrics"]["skew"]
+    assert m["schema_version"]["current"] == "%s" % SCHEMA_VERSION
+    assert m["vocab_version"]["current"] == "%s" % vocab.version
+    assert m["schema_version"]["behind"] == 3
+
+
 def test_a_blank_version_is_one_state_not_two():
     # Both loops must use one predicate. Treating blank as unstamped when counting
     # and as a version when comparing put the document in BOTH lists — reported once
@@ -598,6 +695,49 @@ def test_dead_terms_are_reported_but_an_unpopulated_field_is_not(vocab):
     assert dead and dead[0].severity == INFO
     assert sorted(dead[0].detail) == ["design", "policy", "report"]
     assert [f for f in found["vocab-unused"] if f.where == "impact"] == []
+
+
+def test_a_vocabulary_bound_only_to_an_optional_sub_key_cannot_hide_between_gates(
+        vocab):
+    # THE DOUBLE DEFERRAL the deferral's own comment says is impossible. `vocab-unused`
+    # suppresses itself when ALL terms are dead and defers to `coverage-absent` — but
+    # that gate grades FIELD presence, and `failure_modes` is bound only through the
+    # OPTIONAL `relations.mode` / `risks.mode` qualifiers. With `relations` populated
+    # on every document and `mode` written on none, coverage-absent has nothing to
+    # name and vocab-unused has stood down, so neither gate says a word.
+    #
+    # The sharpest form is the monotonicity inversion: 3 of 4 dead terms is reported
+    # and 4 of 4 is silent, so the WORSE corpus is the quieter one.
+    rels = [{"s": "a", "p": "runs_on", "o": "b", "ref": "#h"}]
+    rows = [doc("%d.md" % i, relations=list(rels)) for i in range(4)]
+    found = codes(vocabulary_usage(rows, vocab))
+    dead = [f for f in found.get("vocab-dead") or [] if f.where == "failure_modes"]
+    assert dead and dead[0].severity == INFO
+    assert any("relations" in d for d in dead[0].detail)
+    assert "vocab-unused" not in [f.code for f in found.get("vocab-unused") or []
+                                  if f.where == "failure_modes"]
+
+    # One document writing ONE mode makes it the ordinary partial case again.
+    partial = [doc("0.md", relations=[dict(rels[0], mode="silent")])] + rows[1:]
+    codes_partial = codes(vocabulary_usage(partial, vocab))
+    assert [f.where for f in codes_partial.get("vocab-dead") or []
+            if f.where == "failure_modes"] == []
+    assert [f for f in codes_partial["vocab-unused"]
+            if f.where == "failure_modes"][0].detail == ("adversarial", "delayed",
+                                                         "overt")
+
+
+def test_an_unpopulated_field_still_defers_to_coverage_absent(vocab):
+    # The deferral is SOUND wherever the target actually covers the vocabulary, and
+    # double-reporting the young-corpus case is what the guard was written to stop.
+    rows = [doc("a.md", type="runbook"), doc("b.md", type="runbook")]
+    found = codes(vocabulary_usage(rows, vocab))
+    assert [f for f in found.get("vocab-dead") or [] if f.where == "impact"] == []
+    # ... and an authored-only vocabulary stays silent by the same documented policy
+    # coverage_report follows: being rare is a fact about the organisation.
+    assert [f for f in found.get("vocab-dead") or []
+            if f.where in ("document_status", "confidentiality",
+                           "review_cadence")] == []
 
 
 def test_usage_counts_a_value_reached_through_a_record_or_an_entity_group(vocab):

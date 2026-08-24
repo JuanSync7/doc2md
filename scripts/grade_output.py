@@ -16,6 +16,11 @@ rubric row and prints a per-dimension letter.
 
 Exit codes: ``0`` every dimension is A, ``1`` not yet, ``2`` the run itself broke.
 
+``--json`` owns stdout completely: exactly one document, either ``{summary, rows}``
+on 0/1 or ``{error}`` on 2. Every progress note, suite result and housekeeping line
+goes to stderr, so the machine-readable mode stays parseable on the runs a consumer
+most needs it for — the failing ones.
+
 The rubric lives in ``backend.validate`` as pure predicates; this file is the
 transport that gives them something to look at.
 """
@@ -24,10 +29,12 @@ from __future__ import print_function
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import traceback
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _REPO = os.path.dirname(_HERE)
@@ -169,34 +176,168 @@ def load_view(out, docs_root, suites):
 
 # ----------------------------------------------------------------- suite rows
 
+PASS, FAIL, SKIP = "pass", "fail", "skip"     # backend.validate._rubric's statuses
+
+# What a `pytest -v` line and a run_eval result row can say about one check.
+_PYTEST_OUTCOMES = ("PASSED", "FAILED", "ERROR", "SKIPPED", "XFAIL", "XPASS")
+_EVAL_OUTCOMES = ("PASS", "FAIL", "SKIP")
+_BROKEN = ("FAILED", "ERROR", "FAIL")
+# An xfail is a KNOWN failure and an xpass is a surprise; neither demonstrates the
+# condition a row asserts, so both are unproven rather than passing.
+_UNPROVEN = ("SKIPPED", "SKIP", "XFAIL", "XPASS")
+
+
+# `path.py::test_name[a param with spaces] PASSED  [ 42%]`. Matched with a regex
+# rather than split() because a parametrised id may contain whitespace, and the
+# node the outcome belongs to is everything before the verdict word.
+_NODE_LINE = re.compile(
+    r"^(?P<node>\S.*?\.py::.+?)\s+(?P<outcome>%s)\b" % "|".join(_PYTEST_OUTCOMES))
+
+
+def _pytest_outcomes(text):
+    # type: (str) -> dict
+    """{test function name: [outcome, ...]} from a ``pytest -v`` transcript.
+
+    Parametrised cases collapse onto the function that owns them, so a row that
+    names ``test_x`` is answered by every ``test_x[...]`` the run reported."""
+    seen = {}
+    for line in text.splitlines():
+        if line.split(" ", 1)[0] in _PYTEST_OUTCOMES:
+            continue          # the short summary prints "FAILED path::test - reason"
+        m = _NODE_LINE.match(line)
+        if not m:
+            continue
+        name = m.group("node").rsplit("::", 1)[-1].split("[", 1)[0]
+        seen.setdefault(name, []).append(m.group("outcome"))
+    return seen
+
+
+def _eval_outcomes(text):
+    # type: (str) -> dict
+    """{fixture relpath: [PASS|FAIL|SKIP]} from run_eval's result table."""
+    seen = {}
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) < 2 or parts[0] not in _EVAL_OUTCOMES:
+            continue
+        seen.setdefault(parts[1], []).append(parts[0])
+    return seen
+
+
+def _row_verdict(row, observed, note):
+    # type: (object, dict, str) -> tuple
+    """What one suite row's own named evidence actually did.
+
+    Four outcomes, and the last two are the point of this function. A named check
+    that no longer EXISTS is a failure: the demonstration the row is graded on was
+    deleted or renamed, and a rubric that keeps printing pass over evidence nobody
+    can run is the exact thing this file is supposed to prevent. A named check
+    that was SKIPPED is unproven, never passed — a wholly skipped pytest target
+    exits 0, and an exit code cannot tell "it holds" from "nobody looked"."""
+    names = list(row.selector) or [row.target]
+    if observed is None:
+        return (SKIP, "%s reported no per-check outcome (%s), so nothing was "
+                      "demonstrated" % (row.target, note))
+    missing = [n for n in names if n not in observed]
+    if missing:
+        return (FAIL, "%s no longer contains %s — the evidence this row is graded "
+                      "on has disappeared" % (row.target, ", ".join(missing)))
+    broke = [n for n in names if set(observed[n]) & set(_BROKEN)]
+    if broke:
+        return (FAIL, "%s FAILED in %s" % (", ".join(broke), row.target))
+    unproven = [n for n in names if set(observed[n]) & set(_UNPROVEN)]
+    if unproven:
+        return (SKIP, "%s was skipped in %s, and a skip is not a demonstration"
+                % (", ".join(unproven), row.target))
+    shown = names if len(names) <= 4 else names[:4] + ["(+%d more)" % (len(names) - 4)]
+    return (PASS, "%s: %s" % (row.target, ", ".join(shown)))
+
+
+def _eval_census(observed):
+    # type: (dict) -> str
+    """The whole eval's pass/skip census, so a row's own green never hides it.
+
+    ``grade_output`` hardcodes ``--skip-pdf``, so the PDF expectations are skipped
+    on every ring but the nightly one. That is a DECLARED exclusion, and declaring
+    it is the difference between a measurement and a rubber stamp — but the census
+    also surfaces an UNdeclared skip (a fixture whose generator was missing), which
+    no row grades today."""
+    tally = {}
+    for outcomes in observed.values():
+        for outcome in outcomes:
+            tally[outcome] = tally.get(outcome, 0) + 1
+    skipped = sorted(rel for rel, o in observed.items() if "SKIP" in o)
+    note = "eval census: %d pass, %d fail, %d skip" % (
+        tally.get("PASS", 0), tally.get("FAIL", 0), tally.get("SKIP", 0))
+    if skipped:
+        note += " (not evaluated: %s)" % ", ".join(skipped)
+    return note
+
+
 def run_suites(rows, quiet=True):
     # type: (list, bool) -> dict
-    """Execute each distinct pytest target a suite row names.
+    """Answer each suite row from the specific checks it names.
 
-    A target that does not exist yet is left as ``None`` — "not run" — rather than
-    False. The distinction matters: an absent test is a missing check, and the
-    rubric refuses to call that either a pass or a failure."""
-    verdicts = {}
+    Each distinct target runs ONCE, verbosely, and every row that names it is then
+    answered from the per-check outcomes that run reported. Running per file and
+    filtering per row is deliberate twice over: it keeps three rows on one parity
+    suite to one execution, and it means an unrelated test in the file can neither
+    earn a row nor sink it.
+
+    A target that does not exist yet is left as "not run" rather than False. The
+    distinction matters: an absent test is a missing check, and the rubric refuses
+    to call that either a pass or a failure.
+
+    Every line this function prints goes to STDERR. Stdout belongs to the verdict,
+    and ``--json`` puts a single document there; progress notes mixed into it made
+    the machine-readable mode unparseable exactly on the runs a consumer cares
+    about."""
+    seen_by_target, note_by_target = {}, {}
     for target in sorted(set(r.target for r in rows if r.kind == "suite")):
         path = os.path.join(_REPO, target)
         if not os.path.exists(path):
-            verdicts[target] = None
+            seen_by_target[target] = None
+            note_by_target[target] = "no such file in the repo"
             continue
         if target.endswith("run_eval.py"):
             # The eval harness is its own runner, not a pytest module. --skip-pdf
             # keeps it to the lanes that run without the PDF interpreter; the PDF
             # expectations report SKIP, which the harness prints as such.
             cmd = [sys.executable, path, "--skip-pdf"]
+            parse = _eval_outcomes
         else:
-            cmd = [sys.executable, "-m", "pytest", target, "-q", "--no-header"]
+            # -v is what makes the row answerable: it prints one line per test, so
+            # the runner can see WHICH check held rather than only whether the file
+            # exited 0.
+            cmd = [sys.executable, "-m", "pytest", target, "-v", "--no-header",
+                   "--tb=line", "-p", "no:cacheprovider"]
+            parse = _pytest_outcomes
         proc = subprocess.Popen(cmd, cwd=_REPO, stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT)
         out = proc.communicate()[0].decode("utf-8", "replace")
-        verdicts[target] = proc.returncode == 0
-        if not quiet or proc.returncode != 0:
-            print("  %-58s %s" % (target, "ok" if proc.returncode == 0 else "FAILED"))
-            if proc.returncode != 0:
-                print("    " + out.strip().splitlines()[-1][:110] if out.strip() else "")
+        observed = parse(out)
+        if not observed:
+            # Nothing ran: a collection error, an import failure, a harness that
+            # died before its table. Exit 0 would have read as a pass.
+            seen_by_target[target] = None
+            note_by_target[target] = "exit %d, no check reported an outcome" \
+                                     % proc.returncode
+        else:
+            seen_by_target[target] = observed
+            note_by_target[target] = "exit %d" % proc.returncode
+        if not quiet:
+            print("  %-58s %s" % (target, note_by_target[target]), file=sys.stderr)
+
+    verdicts = {}
+    for row in [r for r in rows if r.kind == "suite"]:
+        observed = seen_by_target.get(row.target)
+        status, evidence = _row_verdict(row, observed, note_by_target.get(row.target, ""))
+        if row.target.endswith("run_eval.py") and observed:
+            evidence = "%s; %s" % (evidence, _eval_census(observed))
+        verdicts[row.rid] = (status, evidence)
+        if not quiet or status != PASS:
+            print("  %-4s %-4s %s" % (status.upper(), row.rid, evidence),
+                  file=sys.stderr)
     return verdicts
 
 
@@ -223,6 +364,27 @@ def report(results, summary, verbose=True):
         print("A requires every row to pass. A skipped row is an unproven row.")
 
 
+def _broke(as_json, stage, message, detail=""):
+    # type: (bool, str, str, str) -> int
+    """Exit 2 — "the run itself broke" — and say so on whichever channel is in use.
+
+    The JSON document is deliberately NOT ``{summary, rows}``: a consumer must not
+    be able to read a break as a grade with no failing rows. It carries ``error``
+    and nothing else, so a reader keyed on ``summary`` raises rather than
+    concluding that nothing went wrong.
+
+    Only UNEXPECTED breaks come here. ``return 1`` — one or more rows did not pass
+    — is a real verdict about real output, and converting that into an error would
+    turn a failing grade into a tooling problem."""
+    print("%s: %s" % (stage, message), file=sys.stderr)
+    if detail:
+        print(detail, file=sys.stderr)
+    if as_json:
+        print(json.dumps({"error": {"stage": stage, "message": message,
+                                    "detail": detail}}, indent=2, sort_keys=True))
+    return 2
+
+
 def main(argv=None):
     # type: (list) -> int
     ap = argparse.ArgumentParser(description=__doc__.strip().splitlines()[0])
@@ -241,15 +403,28 @@ def main(argv=None):
     workdir = args.workdir or tempfile.mkdtemp(prefix="doc2md-grade-")
     src, out = os.path.join(workdir, "src"), os.path.join(workdir, "out")
     try:
-        build_corpus(src)
-        if convert(src, out) != 0:
-            print("the graded run itself failed; nothing to grade", file=sys.stderr)
-            return 2
-        suites = {} if args.no_suites else run_suites(RUBRIC_ROWS,
-                                                      quiet=args.as_json)
-        view = load_view(out, _REPO, suites)
-        results = grade(view)
-        summary = summarize(results)
+        try:
+            build_corpus(src)
+            rc = convert(src, out)
+            if rc != 0:
+                return _broke(args.as_json, "convert",
+                              "the graded run itself failed; nothing to grade",
+                              "the build stage exited %d" % rc)
+            suites = {} if args.no_suites else run_suites(RUBRIC_ROWS,
+                                                          quiet=args.as_json)
+            view = load_view(out, _REPO, suites)
+            results = grade(view)
+            summary = summarize(results)
+        except Exception as exc:                                    # noqa: BLE001
+            # A half-written report.json from a killed run, an unwritable workdir,
+            # a corpus generator that raised: all of these used to escape as a
+            # traceback and exit 1 — the code that means "not yet an A". They are
+            # the run breaking, not a verdict about the output.
+            traceback.print_exc()
+            return _broke(args.as_json, "grade", "the grading run broke",
+                          "%s: %s" % (type(exc).__name__, exc))
+        # Outside the except on purpose: `return 1` is an honest verdict about real
+        # output and must never be dressed up as a tooling failure.
         if args.as_json:
             print(json.dumps({
                 "summary": summary,
@@ -263,7 +438,8 @@ def main(argv=None):
         if not (args.keep or args.workdir):
             shutil.rmtree(workdir, ignore_errors=True)
         elif args.keep:
-            print("\nartifacts kept in %s" % workdir)
+            # stderr: stdout is the verdict, and under --json it is one document.
+            print("\nartifacts kept in %s" % workdir, file=sys.stderr)
 
 
 if __name__ == "__main__":

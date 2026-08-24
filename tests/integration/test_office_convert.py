@@ -8,7 +8,9 @@ summary: office_convert reads real .docx/.pptx/.xlsx zips, writes gated markdown
 import importlib.util
 import json
 import os
+import struct
 import zipfile
+import zlib
 
 import pytest
 
@@ -33,13 +35,13 @@ CORE = ('<cp:coreProperties xmlns:cp="x" xmlns:dc="y"><dc:title>%s</dc:title>'
         '</cp:coreProperties>')
 
 
-def _zip(path, members):
-    with zipfile.ZipFile(path, "w") as zf:
+def _zip(path, members, compression=zipfile.ZIP_STORED):
+    with zipfile.ZipFile(path, "w", compression) as zf:
         for name, data in members.items():
             zf.writestr(name, data)
 
 
-def _docx(path):
+def _docx(path, compression=zipfile.ZIP_STORED):
     doc = ('<w:document %s><w:body>'
            '<w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr>'
            '<w:r><w:t>Radar Overview</w:t></w:r></w:p>'
@@ -52,7 +54,7 @@ def _docx(path):
     styles = ('<w:styles %s><w:style w:type="paragraph" w:styleId="Heading1">'
               '<w:name w:val="heading 1"/></w:style></w:styles>' % W)
     _zip(path, {"word/document.xml": doc, "word/styles.xml": styles,
-                "docProps/core.xml": CORE % "Radar Spec"})
+                "docProps/core.xml": CORE % "Radar Spec"}, compression)
 
 
 def _xlsx(path):
@@ -69,6 +71,248 @@ def _xlsx(path):
                 "xl/sharedStrings.xml": sst, "xl/worksheets/sheet1.xml": sheet})
 
 
+def _docx_with_embedded_object(path):
+    """A docx that carries an embedded OLE workbook — the shape soffice produces when
+    it exports an .odt holding a spreadsheet sub-document."""
+    doc = ('<w:document %s><w:body>'
+           '<w:p><w:r><w:t>Quarterly figures follow.</w:t></w:r></w:p>'
+           '<w:p><w:r><w:t>End of report.</w:t></w:r></w:p>'
+           '</w:body></w:document>' % W)
+    _zip(path, {"word/document.xml": doc,
+                "word/embeddings/oleObject1.xlsx": b"PK\x03\x04not-walked",
+                "docProps/core.xml": CORE % "Quarterly"})
+
+
+def _odf_package(path):
+    """A stock ODF text package. Its member names (mimetype / content.xml /
+    ``Object N/...``) can never match an OOXML part pattern — which is the whole
+    reason a drop check must not be pointed at the pre-conversion source."""
+    _zip(path, {"mimetype": "application/vnd.oasis.opendocument.text",
+                "content.xml": "<x/>", "Object 1/content.xml": "<x/>"})
+
+
+def _row(oc, src_path, ext, lane, out_dir):
+    return {"id": "d0", "rel": os.path.basename(src_path), "src": src_path,
+            "ext": ext, "lane": lane,
+            "dest": os.path.join(out_dir, "d0.md")}
+
+
+def test_an_embedded_object_dropped_on_the_libreoffice_lane_is_reported(
+        tmp_path, monkeypatch):
+    """The drop check must read the package the CONVERTER walked, not the source.
+
+    On the LibreOffice lane the converter walks the soffice-PRODUCED .docx, so
+    reading the member list off the original .odt/.doc made
+    ``dropped_embedded_objects`` a check that could never fire on that whole lane:
+    an embedded workbook's text is genuinely gone from the markdown, the drop is
+    symmetric so the recall gate still says 1.0, and the warning was the only record
+    that anything was lost. A drop nobody counted reads exactly like a bug.
+    """
+    oc = _mod("office_convert")
+    src = tmp_path / "srcdocs"
+    src.mkdir()
+    odt = str(src / "quarterly.odt")
+    _odf_package(odt)
+
+    # The pre-conversion source is why the old call site could not fire: not one of
+    # its members is an OOXML part name.
+    assert not [n for n in oc.zip_members(odt) if n.startswith("word/embeddings/")]
+
+    produced_dir = tmp_path / "produced"
+    produced_dir.mkdir()
+    produced = str(produced_dir / "quarterly.docx")
+    _docx_with_embedded_object(produced)
+    monkeypatch.setattr(oc, "soffice_to_ooxml",
+                        lambda soffice, src_path, target, timeout=180: produced)
+    monkeypatch.setattr(oc, "soffice_version", lambda soffice, timeout=20: "")
+
+    info = oc.bundle_inputs(_row(oc, odt, "odt", oc.ROUTE_LIBREOFFICE, str(tmp_path)),
+                            soffice="/nonexistent/soffice")
+    assert info["error"] == ""
+    codes = [w["code"] for w in info["warnings"]]
+    assert "libreoffice_preconvert" in codes
+    assert "dropped_embedded_objects" in codes, codes
+    drop = [w for w in info["warnings"] if w["code"] == "dropped_embedded_objects"][0]
+    assert drop["parts"] == 1
+    # ... and the text really is absent, which is what makes the warning load-bearing.
+    assert "not-walked" not in info["body"]
+
+
+def test_a_document_with_no_embedded_object_reports_no_drop(tmp_path, monkeypatch):
+    """The other direction: an ordinary document must not gain a phantom warning.
+
+    Same LibreOffice lane, same threading, produced package WITHOUT an embedding.
+    """
+    oc = _mod("office_convert")
+    src = tmp_path / "srcdocs"
+    src.mkdir()
+    odt = str(src / "plain.odt")
+    _odf_package(odt)
+    produced_dir = tmp_path / "produced"
+    produced_dir.mkdir()
+    produced = str(produced_dir / "plain.docx")
+    _docx(produced)
+    monkeypatch.setattr(oc, "soffice_to_ooxml",
+                        lambda soffice, src_path, target, timeout=180: produced)
+    monkeypatch.setattr(oc, "soffice_version", lambda soffice, timeout=20: "")
+
+    info = oc.bundle_inputs(_row(oc, odt, "odt", oc.ROUTE_LIBREOFFICE, str(tmp_path)),
+                            soffice="/nonexistent/soffice")
+    assert info["error"] == ""
+    assert "dropped_embedded_objects" not in [w["code"] for w in info["warnings"]]
+    assert "Radar Overview" in info["body"]
+
+
+def test_the_direct_ooxml_lane_still_reports_its_embedded_objects(tmp_path):
+    """Threading the member list out of the reader must not move the direct lane:
+    a .docx handed straight to the converter reports the same drop it always did."""
+    oc = _mod("office_convert")
+    src = tmp_path / "srcdocs"
+    src.mkdir()
+    docx = str(src / "spec.docx")
+    _docx_with_embedded_object(docx)
+    info = oc.bundle_inputs(_row(oc, docx, "docx", oc.ROUTE_OOXML, str(tmp_path)))
+    assert info["error"] == ""
+    assert "dropped_embedded_objects" in [w["code"] for w in info["warnings"]]
+
+
+# --- one damaged package must cost that document, never the batch ------------
+
+def _member_data_offset(path, member):
+    """Byte offset of a member's COMPRESSED data inside the zip file."""
+    with zipfile.ZipFile(path) as zf:
+        info = zf.getinfo(member)
+    with open(path, "rb") as fh:
+        raw = fh.read()
+    off = info.header_offset
+    name_len, extra_len = struct.unpack("<HH", raw[off + 26:off + 30])
+    return off + 30 + name_len + extra_len, info.compress_size
+
+
+def _corrupt_deflate(path, member):
+    """Scramble the middle of a member's deflate stream: an ordinary bit-rotted or
+    text-mode-transferred .docx, not an adversarial one. The zip still OPENS and
+    ``namelist()`` still works — the failure only surfaces inside ``read``."""
+    start, size = _member_data_offset(path, member)
+    with open(path, "rb") as fh:
+        raw = bytearray(fh.read())
+    for i in range(start + 4, start + max(8, min(size, 40))):
+        raw[i] ^= 0xFF
+    with open(path, "wb") as fh:
+        fh.write(bytes(raw))
+
+
+def _force_compression_method(path, method=99):
+    """Rewrite every member's compression method (local header + central directory).
+    Method 99 is AES/7-Zip encryption; 93 is zstd. Both come off real repacking
+    tools, and both make ``ZipFile.read`` raise NotImplementedError."""
+    with open(path, "rb") as fh:
+        raw = bytearray(fh.read())
+    for sig, off in ((b"PK\x03\x04", 8), (b"PK\x01\x02", 10)):
+        i = 0
+        while True:
+            i = raw.find(sig, i)
+            if i < 0:
+                break
+            raw[i + off:i + off + 2] = struct.pack("<H", method)
+            i += 4
+    with open(path, "wb") as fh:
+        fh.write(bytes(raw))
+
+
+def test_a_corrupt_deflate_stream_fails_that_document_and_only_that_document(tmp_path):
+    """A damaged package is a finding about THAT document, not about the corpus.
+
+    ``ZipFile.read`` hands the member to a decompressor, and zlib's failure is a
+    ``zlib.error`` — an ``Exception``, not an ``OSError``. It used to escape the
+    reader's guard entirely, so one bit-rotted .docx aborted the whole batch mid-run:
+    every bundle already written kept a ``config_ref`` pointing at a runs.jsonl row
+    that was never appended, and a later run skips those bundles as already-built, so
+    the dangling reference is permanent.
+    """
+    oc = _mod("office_convert")
+    src = tmp_path / "srcdocs"
+    out = tmp_path / "md"
+    src.mkdir()
+    _docx(str(src / "a good.docx"))
+    bad = str(src / "b damaged.docx")
+    _docx(bad, compression=zipfile.ZIP_DEFLATED)   # Word and soffice both deflate
+    _corrupt_deflate(bad, "word/document.xml")
+
+    # Precondition, pinned so this test can never pass vacuously: the raw read really
+    # does raise zlib.error, and the package still opens and lists its members.
+    assert "word/document.xml" in zipfile.ZipFile(bad).namelist()
+    with pytest.raises(zlib.error):
+        zipfile.ZipFile(bad).read("word/document.xml")
+
+    assert oc.read_parts(bad, "docx") == {}            # named failure, not a crash
+
+    rc = oc.main(["--src", str(src), "--out", str(out)])
+    assert rc == 1                                     # the batch reports the failure
+    recs = [json.loads(line)
+            for line in open(str(out / "_coverage_ooxml.jsonl"), encoding="utf-8")]
+    by_rel = dict((r["rel"], r) for r in recs)
+    assert by_rel["b damaged.docx"]["valid"] is False
+    assert by_rel["b damaged.docx"]["error"] == "unreadable-zip"
+    # ... and the healthy document beside it still converted.
+    assert by_rel["a good.docx"]["valid"] is True
+    assert len([f for f in os.listdir(str(out)) if f.endswith(".md")]) == 1
+
+
+def test_an_unsupported_compression_method_fails_that_document_only(tmp_path):
+    """Same contract for a package this interpreter has no decompressor for
+    (AES/99, zstd/93, LZMA on a build without the module): NotImplementedError used
+    to escape the guard and kill the run."""
+    oc = _mod("office_convert")
+    src = tmp_path / "srcdocs"
+    out = tmp_path / "md"
+    src.mkdir()
+    _docx(str(src / "a good.docx"))
+    bad = str(src / "b weird.docx")
+    _docx(bad)
+    _force_compression_method(bad, 99)
+
+    with pytest.raises(NotImplementedError):
+        zipfile.ZipFile(bad).read("word/document.xml")
+
+    assert oc.read_parts(bad, "docx") == {}
+    assert oc.read_media(bad) == {}
+
+    rc = oc.main(["--src", str(src), "--out", str(out)])
+    assert rc == 1
+    recs = [json.loads(line)
+            for line in open(str(out / "_coverage_ooxml.jsonl"), encoding="utf-8")]
+    by_rel = dict((r["rel"], r) for r in recs)
+    assert by_rel["b weird.docx"]["error"] == "unreadable-zip"
+    assert by_rel["a good.docx"]["valid"] is True
+
+
+def test_an_unreadable_package_never_fabricates_a_drop_warning(tmp_path):
+    """``members_out`` must stay EMPTY on the unreadable path.
+
+    Otherwise a package nobody could open could report drops it never made — and the
+    document must fail on the parts side, which is the only honest verdict."""
+    oc = _mod("office_convert")
+    bad = str(tmp_path / "broken.docx")
+    _docx_with_embedded_object(bad)
+    _force_compression_method(bad, 99)
+    members = []
+    assert oc.read_parts(bad, "docx", None, members) == {}
+    assert members == []
+
+
+def test_a_readable_package_fills_the_member_list(tmp_path):
+    """The other direction of the same parameter: an ordinary package reports every
+    member, so the drop check has something true to match against."""
+    oc = _mod("office_convert")
+    good = str(tmp_path / "spec.docx")
+    _docx_with_embedded_object(good)
+    members = []
+    parts = oc.read_parts(good, "docx", None, members)
+    assert "word/document.xml" in parts
+    assert sorted(members) == sorted(zipfile.ZipFile(good).namelist())
+
+
 def test_office_lane_end_to_end(tmp_path):
     oc = _mod("office_convert")
     src = tmp_path / "srcdocs"
@@ -82,7 +326,7 @@ def test_office_lane_end_to_end(tmp_path):
     mds = [f for f in os.listdir(str(out)) if f.endswith(".md")]
     assert len(mds) == 2
 
-    recs = [json.loads(line) for line in open(str(out / "_coverage_ooxml.jsonl"))]
+    recs = [json.loads(line) for line in open(str(out / "_coverage_ooxml.jsonl"), encoding="utf-8")]
     assert len(recs) == 2 and all(r["valid"] and r["recall"] == 1.0 for r in recs)
 
     blob = "".join(open(str(out / f), encoding="utf-8").read() for f in mds)
@@ -96,7 +340,7 @@ def test_office_lane_end_to_end(tmp_path):
     # Idempotent: second run skips everything (valid record + md present).
     rc2 = oc.main(["--src", str(src), "--out", str(out)])
     assert rc2 == 0
-    recs2 = [json.loads(line) for line in open(str(out / "_coverage_ooxml.jsonl"))]
+    recs2 = [json.loads(line) for line in open(str(out / "_coverage_ooxml.jsonl"), encoding="utf-8")]
     assert len(recs2) == 2                          # no new records appended
 
     # validate-only re-gates existing markdown without rewriting it.
@@ -184,7 +428,7 @@ def test_libreoffice_declines_cleanly_when_soffice_absent(tmp_path, monkeypatch)
     (src / "legacy.odt").write_bytes(b"PK\x03\x04 not really an odt")
     rc = oc.main(["--src", str(src), "--out", str(out)])
     assert rc == 1                                        # a doc failed
-    recs = [json.loads(line) for line in open(str(out / "_coverage_ooxml.jsonl"))]
+    recs = [json.loads(line) for line in open(str(out / "_coverage_ooxml.jsonl"), encoding="utf-8")]
     assert recs[-1]["error"] == "libreoffice-unavailable"
     assert recs[-1]["valid"] is False
 
@@ -215,7 +459,7 @@ def test_libreoffice_odf_routes_through_ooxml(tmp_path):
     assert len(mds) == 1
     body = open(str(out / mds[0]), encoding="utf-8").read()
     assert "Mailbox controller overview" in body and "Eight channels" in body
-    recs = [json.loads(line) for line in open(str(out / "_coverage_ooxml.jsonl"))]
+    recs = [json.loads(line) for line in open(str(out / "_coverage_ooxml.jsonl"), encoding="utf-8")]
     assert recs[-1]["valid"] is True and recs[-1]["recall"] == 1.0
     assert recs[-1]["ext"] == "odt"                       # record keeps the ORIGINAL format
 

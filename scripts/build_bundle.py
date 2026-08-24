@@ -32,6 +32,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import sys
 import time
 
@@ -349,6 +350,95 @@ def _count_outline_images(structure):
     return total[0]
 
 
+# What a SUCCESSFUL build publishes, and therefore what a failed one must take out
+# of publication. The suffix is not a decoration: every downstream selector tests
+# for these names exactly (`enrich_metadata` and `kb_lint` both walk bundles by
+# `document.md`), so a withdrawn artifact is invisible to them while still being
+# on disk for a person.
+_PUBLISHED_FILES = ("document.md", "structure.json", "knowledge.json")
+_PUBLISHED_DIRS = ("images",)
+STALE_SUFFIX = ".stale"
+
+
+def _withdraw_published(doc_dir):
+    # type: (str) -> list
+    """Take a PREVIOUS run's artifacts out of publication when this run FAILED.
+
+    ``docs/reference/output-schema.md`` says it plainly: *a failed document
+    publishes ``report.json`` only*. The failure branches honoured that on a first
+    build — where there is nothing to leave behind — and broke it on every rebuild
+    of a document that used to convert: they rewrote ``report.json`` to
+    ``status: failed`` and returned, leaving the last good ``document.md``,
+    ``structure.json`` and ``images/`` standing. The bundle then asserted
+    ``lossless: "true"`` over the OLD source under the OLD ``source_sha256`` beside
+    a report saying the conversion failed, and every consumer keys off "does
+    document.md exist": enrichment published a fresh ``knowledge.json`` describing
+    the stale body and stamped a ``doc_meta`` gate into the failed report, and
+    ``kb_lint`` graded the result clean. Nothing after the writer could see it.
+
+    RENAMED, NOT DELETED. When the failure is environmental rather than about the
+    document (soffice missing on the legacy lane, a truncated copy of the source),
+    deleting would destroy the only good copy of a bundle to punish a transient
+    fault. ``document.md.stale`` is unpublished — no selector matches it — and
+    still there for a person. A later successful build clears it (see
+    ``_clear_withdrawn``), because by then it is superseded rather than salvage.
+    """
+    moved = []  # type: list
+    for name in _PUBLISHED_FILES:
+        path = os.path.join(doc_dir, name)
+        if not os.path.isfile(path):
+            continue
+        try:
+            os.replace(path, path + STALE_SUFFIX)      # atomic, overwrites an older one
+            moved.append(name)
+        except OSError:
+            pass
+    for name in _PUBLISHED_DIRS:
+        path = os.path.join(doc_dir, name)
+        if not os.path.isdir(path):
+            continue
+        dest = path + STALE_SUFFIX
+        try:
+            shutil.rmtree(dest, ignore_errors=True)
+            os.rename(path, dest)
+            moved.append(name + "/")
+        except OSError:
+            pass
+    return moved
+
+
+def _clear_withdrawn(doc_dir):
+    # type: (str) -> int
+    """Drop the withdrawn copies once a build has published a current bundle again."""
+    removed = 0
+    for name in _PUBLISHED_FILES:
+        path = os.path.join(doc_dir, name + STALE_SUFFIX)
+        if os.path.isfile(path):
+            try:
+                os.remove(path)
+                removed += 1
+            except OSError:
+                pass
+    for name in _PUBLISHED_DIRS:
+        path = os.path.join(doc_dir, name + STALE_SUFFIX)
+        if os.path.isdir(path):
+            shutil.rmtree(path, ignore_errors=True)
+            removed += 1
+    return removed
+
+
+def _announce_withdrawn(row, withdrawn):
+    # type: (dict, list) -> None
+    """Say what stopped being published, and where it went. Never silent: an
+    artifact that quietly disappears from a bundle is indistinguishable from one
+    that was never written, and the two mean opposite things about the corpus."""
+    if withdrawn:
+        print("  WITHDRAWN %s %s -> *%s (this run failed; the previous bundle is "
+              "no longer published)" % (row.get("rel", row.get("id", "")),
+                                        ", ".join(withdrawn), STALE_SUFFIX),
+              file=sys.stderr)
+
+
 def _failure_report(row, error, warnings, run_id="", converter="", run=None,
                     decisions=None):
     # type: (dict, str, list, str, str, dict, list) -> dict
@@ -433,6 +523,9 @@ def build_one(row, soffice, out_root, run_id, token_count=None, token_model=None
         os.makedirs(doc_dir, exist_ok=True)
         rep = _failure_report(row, info["error"], info["warnings"], run_id,
                               converter, run, decisions)
+        # A conversion this run could not do must not leave the LAST one's bundle
+        # standing as if it were current — see _withdraw_published.
+        _announce_withdrawn(row, _withdraw_published(doc_dir))
         _write_json(os.path.join(doc_dir, "report.json"), rep)
         return {"doc_id": row["id"], "source_relpath": row["rel"], "lane": "office",
                 "status": "failed", "markdown_sha256": "",
@@ -488,6 +581,10 @@ def build_one(row, soffice, out_root, run_id, token_count=None, token_model=None
         rep["decisions"] = stamp_stage(decisions, ENTRYPOINT)
         if run:
             record_stage_run(rep, run, writer=True)
+        # The likeliest route to this branch in this project is a converter or
+        # ground-truth change that drops a document that passed last week — and the
+        # bundle it passed with is exactly what must stop being published.
+        _announce_withdrawn(row, _withdraw_published(doc_dir))
         _write_json(os.path.join(doc_dir, "report.json"), rep)
         return {"doc_id": row["id"], "source_relpath": row["rel"], "lane": "office",
                 "status": "failed", "markdown_sha256": rep["markdown_sha256"],
@@ -547,6 +644,10 @@ def build_one(row, soffice, out_root, run_id, token_count=None, token_model=None
     _write_json(os.path.join(doc_dir, "report.json"), rep)
     _write_atomic(os.path.join(doc_dir, "document.md"), bundle["document_md"])
     _write_json(os.path.join(doc_dir, "structure.json"), bundle["structure"])
+    # This bundle is current again, so anything a previous failure withdrew is
+    # superseded rather than salvage — and leaving a `document.md.stale` beside a
+    # fresh `document.md` invites somebody to read the wrong one.
+    _clear_withdrawn(doc_dir)
     return {"doc_id": row["id"], "source_relpath": row["rel"], "lane": "office",
             "status": rep["status"], "markdown_sha256": rep["markdown_sha256"],
             "source_sha256": src_sha, "error": ""}

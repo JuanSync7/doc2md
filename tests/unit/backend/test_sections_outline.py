@@ -289,6 +289,62 @@ def test_outline_coverage_detects_a_dropped_region():
     assert cov["covered_lines"] == 2
 
 
+def test_a_heading_swallowed_by_its_ancestors_span_is_not_covered():
+    """THE reason line coverage alone was unfalsifiable: when a builder drops a
+    heading node, the ancestor's span still tiles every one of those lines, so
+    ``uncovered_lines`` stayed 0 over a document that had lost a whole section.
+
+    Asking whether a node OPENS on the marked-up heading line is the question the
+    ancestor cannot backfill, and it is what makes this a measurement rather than
+    arithmetic.
+    """
+    text = "# Top\nintro\n## Lost\nlost body\n"
+    swallowed = [{"line_span": [0, 4], "children": []}]   # "## Lost" has no node
+    cov = outline_coverage(text, swallowed)
+    assert cov["uncovered_lines"] == 1
+    assert cov["first_uncovered"] == [2]
+    # the rest of the document is still accounted for, so the number is a count of
+    # the loss and not a blanket failure
+    assert cov["covered_lines"] == cov["content_lines"] - 1
+
+
+def test_the_real_builder_covers_every_marked_up_heading_including_a_long_one():
+    """The counter-direction, driven through the REAL builder rather than a
+    hand-built or monkeypatched node list: an ordinary document — including a
+    heading well past the old 120-char cutoff — must come out fully covered."""
+    long_title = ("Reset and Initialisation Sequence for the Kestrel Fabric Bridge, "
+                  "Including the Optional Retry Path and the Timeout Handling Rules")
+    text = ("Contents\n"
+            "Intro .......... 1\n"
+            "\n"
+            "# Kestrel Databook\n"
+            "intro prose\n"
+            "## %s\n"
+            "The bridge asserts nreset for eight cycles.\n"
+            "```sh\n"
+            "# reset the board\n"
+            "kestrelctl board reset\n"
+            "```\n"
+            "## Clocking\n"
+            "The reference clock runs at one hundred megahertz.\n" % long_title)
+    out = document_outline(text)
+    cov = outline_coverage(text, out["outline"])
+    assert cov["uncovered_lines"] == 0, cov
+    assert cov["first_uncovered"] == []
+    # the three real headings are nodes; the shell comment inside the fence is not,
+    # and is not counted against coverage either — the outline is right to skip it.
+    assert cov["covered_lines"] + cov["toc_lines"] == cov["content_lines"]
+    assert out["has_toc"] is True
+
+
+def test_a_shell_comment_inside_a_fence_is_not_an_uncovered_heading():
+    # The exclusion, on its own: a `#` line inside a transcript is code. Counting it
+    # as a lost heading would degrade every document that ships a shell transcript.
+    text = "# Runbook\n```sh\n# reset the board\nkestrelctl reset\n```\n"
+    out = document_outline(text)
+    assert outline_coverage(text, out["outline"])["uncovered_lines"] == 0
+
+
 def test_line_span_covers_whole_subtree():
     text = "# Top\nintro\n## Child\nc body\n# Next\nn body\n"
     out = document_outline(text)

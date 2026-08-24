@@ -212,24 +212,74 @@ _FLOAT = re.compile(r"^[+-]?(?:\d+\.\d*|\.\d+)(?:[eE][+-]?\d+)?$")
 _UNSUPPORTED_LEAD = ("&", "*", "!", "?", "|", ">", "{", "[")
 
 
-def _strip_comment(s):
-    # type: (str) -> str
-    """Drop a trailing ``#`` comment that is not inside quotes."""
+def _quote_mask(s):
+    # type: (str) -> tuple
+    """``(mask, unterminated)`` — which characters of ``s`` sit inside a quote.
+
+    ``mask[i]`` is True when ``s[i]`` belongs to a quoted scalar (its delimiters
+    included). One scanner serves ``_strip_comment``, ``_flow_depth`` and
+    ``_split_flow`` so they can no longer disagree with each other.
+
+    A ``'`` or ``"`` opens a quoted scalar ONLY at the START OF A TOKEN — the
+    start of the line, or just after ``[``, ``,``, a block-sequence ``- ``, or a
+    ``key: `` — which is precisely the rule ``_scalar_value`` already applies
+    (it checks ``s[0]``). Anywhere else a quote is an ordinary character, so the
+    apostrophe in ``title: The Operator's Guide  # from OCR`` no longer opens a
+    phantom quote that swallows the comment, hides a closing ``]``, or merges two
+    flow items. The scanners used to say "a quote ANYWHERE opens", disagreeing
+    with ``_scalar_value`` about the very same bytes.
+
+    Inside a double quote ``\\x`` escapes the next character; inside a single
+    quote ``''`` is an escaped apostrophe (YAML's own rule), so
+    ``note: 'it''s # fine'`` keeps its ``#``.
+    """
+    mask = [False] * len(s)
     quote = ""
+    start = True   # the next non-blank character begins a token
     i = 0
-    while i < len(s):
+    n = len(s)
+    while i < n:
         ch = s[i]
         if quote:
-            if ch == "\\" and quote == '"':
+            mask[i] = True
+            if ch == "\\" and quote == '"' and i + 1 < n:
+                mask[i + 1] = True
+                i += 2
+                continue
+            if ch == "'" and quote == "'" and i + 1 < n and s[i + 1] == "'":
+                mask[i + 1] = True
                 i += 2
                 continue
             if ch == quote:
                 quote = ""
-        elif ch in ("'", '"'):
+                start = False
+            i += 1
+            continue
+        if ch in (" ", "\t"):
+            i += 1
+            continue
+        if start and ch in ("'", '"'):
             quote = ch
-        elif ch == "#" and (i == 0 or s[i - 1] in " \t"):
-            return s[:i]
+            mask[i] = True
+        elif ch in ("[", ","):
+            start = True
+        elif ch == ":" and (i + 1 >= n or s[i + 1] in " \t"):
+            start = True
+        elif not (ch == "-" and start and (i + 1 >= n or s[i + 1] in " \t")):
+            # A leading `- ` opens a block-sequence item, so the item's own first
+            # token starts after it; every other character ends a token start.
+            start = False
         i += 1
+    return (mask, bool(quote))
+
+
+def _strip_comment(s):
+    # type: (str) -> str
+    """Drop a trailing ``#`` comment that is not inside quotes."""
+    mask = _quote_mask(s)[0]
+    for i, ch in enumerate(s):
+        if ch == "#" and not mask[i] and (i == 0 or s[i - 1] in " \t"):
+            return s[:i]
     return s
 
 
@@ -310,24 +360,15 @@ def _scalar_value(raw):
 def _flow_depth(s):
     # type: (str) -> int
     """Net ``[`` minus ``]`` outside quotes — how many brackets are still open."""
+    mask = _quote_mask(s)[0]
     depth = 0
-    quote = ""
-    i = 0
-    while i < len(s):
-        ch = s[i]
-        if quote:
-            if ch == "\\" and quote == '"':
-                i += 2
-                continue
-            if ch == quote:
-                quote = ""
-        elif ch in ("'", '"'):
-            quote = ch
-        elif ch == "[":
+    for i, ch in enumerate(s):
+        if mask[i]:
+            continue
+        if ch == "[":
             depth += 1
         elif ch == "]":
             depth -= 1
-        i += 1
     return depth
 
 
@@ -352,35 +393,30 @@ def _gather_flow(lines, first, no):
 def _split_flow(body):
     # type: (str) -> list
     """Split a flow sequence body on top-level commas, respecting quotes."""
+    mask, unterminated = _quote_mask(body)
     items = []  # type: list
-    cur = []  # type: list
-    quote = ""
-    i = 0
-    while i < len(body):
-        ch = body[i]
-        if quote:
-            cur.append(ch)
-            if ch == "\\" and quote == '"' and i + 1 < len(body):
-                cur.append(body[i + 1])
-                i += 2
-                continue
-            if ch == quote:
-                quote = ""
-        elif ch in ("'", '"'):
-            quote = ch
-            cur.append(ch)
-        elif ch in "[]{}":
+    start = 0
+    for i, ch in enumerate(body):
+        if mask[i]:
+            continue
+        if ch in "[]{}":
             raise YamlSubsetError("nested flow collections are not supported: %r"
                                   % body)
-        elif ch == ",":
-            items.append("".join(cur))
-            cur = []
-        else:
-            cur.append(ch)
-        i += 1
-    if quote:
+        if ch == ":" and (i + 1 == len(body) or body[i + 1] in " \t,"):
+            # ``[a: b]`` is an implicit flow MAPPING — the brace-less spelling of
+            # the ``{a: b}`` this subset already refuses two lines above. Reading
+            # it as the plain string "a: b" is the one outcome the module forbids:
+            # PyYAML returns {'a': 'b'} and nothing downstream would ever notice
+            # the disagreement. A colon NOT followed by space stays an ordinary
+            # character, so a bare URL — `prov: http://www.w3.org/ns/prov#` is
+            # authored that way in config/vocab.yaml — is still a plain scalar.
+            raise YamlSubsetError("flow mappings are not supported: %r" % body)
+        if ch == ",":
+            items.append(body[start:i])
+            start = i + 1
+    if unterminated:
         raise YamlSubsetError("unterminated quote in flow sequence: %r" % body)
-    items.append("".join(cur))
+    items.append(body[start:])
     return [_scalar_value(x) for x in items if x.strip() != ""]
 
 
@@ -429,15 +465,21 @@ class _Lines(object):
 
     def raw_from(self, indent):
         # type: (int) -> list
-        """Consume raw lines for a block scalar: everything indented deeper."""
+        """Consume raw lines for a block scalar: everything indented deeper.
+
+        Returns ``(lineno, text)`` pairs, not bare text: ``_block_scalar`` has to
+        be able to NAME the line when a continuation line is less indented than
+        the block's own first line, and by then the cursor has already moved past
+        it.
+        """
         out = []  # type: list
         while self.i < len(self.rows):
             no, ind, raw = self.rows[self.i]
             if raw.strip() and ind < indent:
                 break
-            out.append(raw[indent:] if len(raw) >= indent else "")
+            out.append((no, raw[indent:] if len(raw) >= indent else ""))
             self.i += 1
-        while out and not out[-1].strip():
+        while out and not out[-1][1].strip():
             out.pop()
         return out
 
@@ -460,11 +502,26 @@ def _block_scalar(lines, style, indent):
     body = lines.raw_from(indent + 1)
     # Re-align: the block's own indentation is the first non-empty line's.
     base = 0
-    for row in body:
+    for _no, row in body:
         if row.strip():
             base = len(row) - len(row.lstrip(" "))
             break
-    rows = [r[base:] if len(r) >= base else "" for r in body]
+    # A non-blank continuation line LESS indented than that first line is outside
+    # the subset, and slicing it blind is exactly the silent misread this module
+    # exists to prevent: it shaves the first characters off the line, and a line
+    # shorter than `base` disappears entirely — which inside a folded (>) block
+    # becomes a manufactured paragraph break that splits the author's sentence in
+    # two. PyYAML raises a ParserError on the same input; so do we, naming the
+    # line, because a one-space indentation slip in a hand-maintained file is an
+    # ordinary typo and the reader has no other way to learn about it.
+    # Blank lines are exempt: they are legitimately less indented (or empty).
+    for no, row in body:
+        if row.strip() and len(row) - len(row.lstrip(" ")) < base:
+            raise YamlSubsetError(
+                "line %d is less indented than the block scalar's first line "
+                "(%d spaces where at least %d are required): %r"
+                % (no, len(row) - len(row.lstrip(" ")), base, row.strip()[:60]))
+    rows = [row[base:] for _no, row in body]
     if style[0] == "|":
         text = "\n".join(rows)
     else:

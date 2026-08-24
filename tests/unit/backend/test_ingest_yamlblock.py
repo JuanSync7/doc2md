@@ -6,6 +6,7 @@ summary: render/parse round-trip the nested metadata block, hold the no-bare-fen
 """
 # Pure string policy — no disk, no PyYAML (the 3.6 CI ring has pytest and nothing
 # else, which is the whole reason this codec is hand-rolled).
+import itertools
 import re
 from collections import OrderedDict
 
@@ -172,6 +173,12 @@ def test_split_front_matter_leaves_a_document_without_front_matter_untouched():
     ("unterminated flow sequence", "a: [1, 2\n"),
     ("trailing content after a flow sequence", "a: [1, 2] junk\n"),
     ("nested flow collection", "a: [1, [2]]\n"),
+    # `[a: b]` is the brace-less spelling of the `{a: b}` two rows up. It used to
+    # come back as the plain STRING "a: b" while PyYAML returns {'a': 'b'} — a
+    # silent misparse of a construct this subset already says it rejects.
+    ("implicit flow mapping inside a flow sequence", "a: [k: v, x]\n"),
+    ("implicit flow mapping with an empty value", "a: [k:]\n"),
+    ("implicit flow mapping with a quoted key", 'a: ["k": v]\n'),
     ("key with no space after the colon", "a:1\n"),
     ("sequence where a mapping was expected", "- 1\n"),
 ])
@@ -254,6 +261,122 @@ def test_escapes_round_trip_exactly_and_carriage_return_is_not_folded():
     assert "\\r" in rendered and "\\n" in rendered
     assert parse_block(rendered)["v"] == value
     assert parse_block('v: "a\\r\\nb"')["v"] == "a\r\nb"
+
+
+@pytest.mark.parametrize("label,text", [
+    # What the shaved value USED to be, before the guard, is in the comment.
+    ("literal block, one space short",
+     "r: |\n    alpha\n   bravo\n   charlie\ntail: 1\n"),        # 'alpha\nravo\nharlie\n'
+    ("literal block, a short line deleted outright",
+     "r: |\n    alpha\n  hi\n  omega\n"),                        # 'alpha\n\nega\n'
+    ("folded block, a manufactured paragraph break",
+     "r: >\n    alpha\n   bravo\n"),                             # 'alpha ravo\n'
+    ("a nested mapping key swallowed into the block",
+     "a:\n  b: |\n      text\n    c: 1\n"),                      # b == 'text\n 1\n'
+    ("a `- |` sequence item",
+     "l:\n  - |\n      alpha\n     bravo\n"),                    # ['alpha\nravo\n']
+])
+def test_a_block_scalar_refuses_a_line_less_indented_than_its_own_first_line(label, text):
+    # A one-space indentation slip in a hand-maintained file (config/vocab.yaml is
+    # the only thing that reaches a block scalar — the renderer never emits `|`/`>`)
+    # used to be sliced BLIND: `line[base:]` shaves the first characters off an
+    # under-indented line, and `else ""` deletes a line shorter than `base`
+    # outright — which inside a folded block manufactures a paragraph break that
+    # splits the author's sentence in two. The corruption then republishes verbatim
+    # into the generated docs/reference/vocabulary.md, and the staleness gate
+    # cannot see it because it regenerates from the same corrupted parse.
+    # PyYAML raises a ParserError on every one of these; so do we now.
+    with pytest.raises(YamlSubsetError) as exc:
+        parse_block(text)
+    assert "less indented" in str(exc.value)
+    assert re.search(r"line \d+", str(exc.value))     # the message names the line
+
+
+def test_a_block_scalar_still_keeps_blank_and_more_indented_lines():
+    # The other direction: the guard must not start rejecting correct blocks. Blank
+    # lines are legitimately less indented (or empty), and a MORE indented line is
+    # meaningful content in a literal block — only the folded style refuses it, and
+    # for its own separate, already-documented reason.
+    got = parse_block("r: |\n"
+                      "    alpha\n"
+                      "\n"                     # truly empty
+                      "    beta\n"
+                      "  \n"                   # whitespace-only, shallower than base
+                      "      deeper\n"
+                      "    gamma\n"
+                      "tail: 1\n")
+    assert got["r"] == "alpha\n\nbeta\n\n  deeper\ngamma\n"
+    assert got["tail"] == 1
+    assert parse_block("f: >\n  one two\n\n  three\n")["f"] == "one two\nthree\n"
+    assert parse_block("l:\n  - |\n      a\n\n      b\n  - 2\n")["l"] == ["a\n\nb\n", 2]
+
+
+def test_an_apostrophe_inside_a_plain_scalar_does_not_open_a_quote():
+    # `_scalar_value` has always treated a quote as OPENING a quoted scalar only in
+    # first position; `_strip_comment`, `_flow_depth` and `_split_flow` used to open
+    # one at ANY offset, so they misread the same bytes the parser then read
+    # correctly. An apostrophe is ordinary prose — "the operator's guide" — and
+    # PyYAML reads every line below the way this asserts.
+    #
+    # 1. the line's own trailing comment was absorbed into the value
+    assert parse_block("note: the writer's default # tuned 2026-05\n") == od(
+        ("note", "the writer's default"))
+    assert parse_block("rules:\n  - the doc's id must resolve  # added\n") == od(
+        ("rules", ["the doc's id must resolve"]))
+    # 2. an even number of apostrophes across a comma merged two flow items into one
+    assert parse_block("values: [don't, isn't]\n") == od(
+        ("values", ["don't", "isn't"]))
+    # 3. an odd number hid the closing `]`, so `_gather_flow` ran to EOF and raised
+    #    "unterminated flow sequence" on a sequence that is perfectly terminated
+    assert parse_block("authors: [O'Neill, Smith]\n") == od(
+        ("authors", ["O'Neill", "Smith"]))
+    assert parse_block('q: [a, don"t]\n') == od(("q", ["a", 'don"t']))
+    # and the control: the same lines without the apostrophe always worked
+    assert parse_block("note: the writer default # tuned\n") == od(
+        ("note", "the writer default"))
+
+
+def test_a_quote_still_opens_a_quoted_scalar_at_every_token_start():
+    # The dangerous half of the fix. `_strip_comment` sees whole raw lines with no
+    # structural knowledge, so "only at column 0" would stop recognising the opening
+    # quote of `title: "a # b"` and truncate every MACHINE-RENDERED value at its
+    # interior `#` — silent data loss on the one path that works today. Token start
+    # means: start of line, or after `[`, `,`, a block-sequence `- `, or a `key: `.
+    assert parse_block('q: "a # b"\n') == od(("q", "a # b"))
+    assert parse_block("q: 'a # b'\n") == od(("q", "a # b"))
+    assert parse_block('l:\n  - "a # b"\n') == od(("l", ["a # b"]))
+    assert parse_block('l:\n  - k: "a # b"\n') == od(("l", [od(("k", "a # b"))]))
+    assert parse_block("q: ['a, b', \"c, d\"]  # note\n") == od(
+        ("q", ["a, b", "c, d"]))
+    assert parse_block('q: ["a]b", c]\n') == od(("q", ["a]b", "c"]))
+    # a colon NOT followed by a space is an ordinary character, so a bare URL —
+    # config/vocab.yaml authors `prov: http://www.w3.org/ns/prov#` — survives the
+    # implicit-flow-mapping refusal, and so does a quoted one carrying a space.
+    assert parse_block("q: [http://x/ns#, a]\n") == od(("q", ["http://x/ns#", "a"]))
+    assert parse_block('q: ["a: b", c]\n') == od(("q", ["a: b", "c"]))
+    # `''` is YAML's escaped apostrophe inside a single-quoted scalar, so the `#`
+    # here is part of the value and the scalar does not end at the middle quote.
+    assert parse_block("q: 'it''s # not a comment'\n") == od(("q", "it's # not a comment"))
+    # a still-open quote in a flow sequence is refused, not guessed at
+    with pytest.raises(YamlSubsetError):
+        parse_block('q: ["a, b]\n')
+
+
+_FUZZ_ALPHABET = ["a", "'", '"', "#", "[", "]", ",", ":", " ", "\\", "-", "{",
+                  "}", "\n", "\t", "|", ">", "*", "&", "!"]
+
+
+def test_render_then_parse_round_trips_every_adversarial_three_character_value():
+    # The property the whole codec rests on, over the alphabet that breaks it:
+    # quotes, comment markers, flow punctuation, block-scalar headers, anchors,
+    # tags, and the line-breaking whitespace. 8000 values in three container
+    # positions each — a scalar, a sequence item and a nested mapping value —
+    # because the three scanners are reached by different call paths.
+    for combo in itertools.product(_FUZZ_ALPHABET, repeat=3):
+        value = "".join(combo)
+        block = od(("v", value), ("l", [value, "x" + value]),
+                   ("m", od(("k", value))))
+        assert parse_block(render_block(block)) == block, repr(value)
 
 
 def test_a_vocab_shaped_document_parses_as_authored():

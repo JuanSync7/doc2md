@@ -30,10 +30,11 @@ summary: Grade one document's metadata block and a whole corpus's registry healt
 # that cannot see a field is not the same as a field that is correct.
 from collections import namedtuple, Counter, OrderedDict
 
+from ._enrich import EVIDENCE_KEY
 from ._schema import (FIELDS, META_KEY, PROVENANCE_KEY, REF_FIELDS, field,
-                      field_names, group_vocab, model_writable, proposed_key,
-                      record_required, record_vocab, SOURCE_AUTHORED,
-                      SOURCE_GENERATED)
+                      field_names, group_required, group_vocab, model_writable,
+                      proposed_key, record_required, record_vocab, SCHEMA_VERSION,
+                      SOURCE_AUTHORED, SOURCE_EXTRACTED, SOURCE_GENERATED)
 
 __all__ = ["Finding", "FacetRow", "facet_report", "lint_document",
            "normalize_document", "corpus_report", "ERROR", "WARN", "INFO",
@@ -54,28 +55,73 @@ VERDICT_SPARSE = "sparse"        # too few values to grade — not a pass, not a
 
 # --------------------------------------------------------------- cardinality
 
+def _sample_floor(terms, warn, fail, min_uses):
+    # type: (int, float, float, int) -> int
+    """How many uses a facet needs before its distinct/used ratio MEANS anything.
+
+    ``min_uses`` alone is not enough when the field is governed by a CLOSED
+    vocabulary, and the arithmetic is not a judgement call. ``distinct`` can never
+    exceed the number of legal spellings, so ``ratio <= terms / used``: with 17
+    governed predicates and 9 relations, a document that draws on nine different
+    governed predicates — every one of them a term somebody curated, nothing
+    invented — is FORCED to ratio 1.00 and condemned as "documentation, not a
+    facet". The prescribed remedy ("move it to an unindexed note") is impossible for
+    a required discriminator, so the only edit that clears the gate is deleting
+    structure, which inverts this project's thesis.
+
+    Run the inequality the other way and the floor falls out: an adverse verdict is
+    only EVIDENCE rather than arithmetic once ``terms / used <= warn``, i.e. once the
+    sample is large enough that a document using every governed term can still come
+    out ok. Below that the ratio says how varied one document is, which is not the
+    question this gate asks, so the row is ``sparse`` — reported, aggregatable, and
+    neither a pass nor a fail.
+
+    The consequence is worth stating plainly rather than discovering later: above the
+    floor a closed facet's ratio is bounded BY that floor, so a closed facet can only
+    ever come out ``ok`` or ``sparse``. Per-document cardinality is a discovery
+    heuristic for fields somebody can invent a new value in, and for a closed field
+    membership already answers the stricter question — which is the same reasoning
+    ``_corpus`` records for declining to grade these five corpus-wide.
+    """
+    floor = int(min_uses)
+    if terms > 0:
+        rate = min([t for t in (float(warn), float(fail)) if t > 0] or [0.0])
+        if rate > 0:
+            need = int(terms / rate)
+            if need * rate < terms:          # ceil, without importing math
+                need += 1
+            floor = max(floor, need)
+    return floor
+
+
 def facet_report(pairs, warn=0.45, fail=0.75, min_uses=8):
     # type: (list, float, float, int) -> list
     """``[(name, values)]`` -> one FacetRow each, worst ratio first.
 
+    A pair may carry a third element, ``terms``: how many distinct spellings the
+    field's vocabulary allows (0 = ungoverned, or unbounded). It raises the sample
+    floor — see ``_sample_floor`` — and nothing else.
+
     ``ratio`` is distinct/used. Empty fields are reported with ratio 0 rather than
     dropped, so a field that stopped being populated is visible instead of absent.
 
-    Below ``min_uses`` the verdict is ``sparse`` and NOT a judgement: a document
+    Below the sample floor the verdict is ``sparse`` and NOT a judgement: a document
     with one relation has a distinct/used ratio of 1.00, which would condemn every
     short document as "not a facet" while saying nothing at all about the field.
     Sparse is deliberately neither a pass nor a fail — the ratio is reported so it
     can be aggregated across a corpus, where the sample does exist.
     """
     rows = []  # type: list
-    for name, vals in pairs:
+    for entry in pairs:
+        name, vals = entry[0], entry[1]
+        terms = int(entry[2]) if len(entry) > 2 else 0
         vals = [v for v in vals if v is not None]
         if not vals:
             rows.append(FacetRow(name, 0, 0, 0.0, VERDICT_OK))
             continue
         counts = Counter("%s" % (v,) for v in vals)
         ratio = float(len(counts)) / float(len(vals))
-        if len(vals) < min_uses:
+        if len(vals) < _sample_floor(terms, warn, fail, min_uses):
             verdict = VERDICT_SPARSE
         elif ratio > fail:
             verdict = VERDICT_NOT_A_FACET
@@ -176,18 +222,52 @@ def _entity_rows(meta, vocab, findings):
     return out
 
 
+def _closed_terms(vocab, vname):
+    # type: (object, str) -> int
+    """How many distinct spellings a CLOSED vocabulary legitimately allows, 0 if not.
+
+    Aliases count: the facet lists hold RAW values, so a document writing both
+    ``targets`` and its alias ``threatens`` contributes two distinct strings. The
+    number is the cap on ``distinct``, so it has to be the cap on what the linter
+    actually sees, not on the canonical set.
+
+    Registry vocabularies deliberately return 0. Their whole failure mode is a value
+    nobody governs being invented one per document, which is precisely what the
+    cardinality ratio is a good heuristic for — so they stay fully graded.
+    """
+    try:
+        if vocab is None or not vocab.has(vname):
+            return 0
+        if vocab.governance(vname) != "closed":
+            return 0
+        return len(vocab.values(vname)) + len(vocab.aliases(vname) or {})
+    except Exception:
+        return 0
+
+
 def _facet_pairs(meta, vocab, findings):
     # type: (dict, object, list) -> list
     """The value lists the cardinality gate grades — the pasted linter's five, plus
-    the entity types it could not see."""
+    the entity types it could not see. Each carries its vocabulary's size, which is
+    what stops the ratio from condemning a document for using the terms it was given
+    (see ``_sample_floor``)."""
     rels = _records(meta, "relations")
+    rv_rel = record_vocab("relations")
+    rv_risk = record_vocab("risks")
+    rv_dec = record_vocab("decisions")
+    ent_vocab = group_vocab("entities").get("member_type", "")
     return [
-        ("relations.p", [r.get("p") for _i, r in rels]),
-        ("entities.type", [t for _, t in _entity_rows(meta, vocab, findings)]),
-        ("risks.mode", [r.get("mode") for _i, r in _records(meta, "risks")]),
-        ("risks.impact", [r.get("impact") for _i, r in _records(meta, "risks")]),
+        ("relations.p", [r.get("p") for _i, r in rels],
+         _closed_terms(vocab, rv_rel.get("p", ""))),
+        ("entities.type", [t for _, t in _entity_rows(meta, vocab, findings)],
+         _closed_terms(vocab, ent_vocab)),
+        ("risks.mode", [r.get("mode") for _i, r in _records(meta, "risks")],
+         _closed_terms(vocab, rv_risk.get("mode", ""))),
+        ("risks.impact", [r.get("impact") for _i, r in _records(meta, "risks")],
+         _closed_terms(vocab, rv_risk.get("impact", ""))),
         ("decisions.status", [r.get("status")
-                              for _i, r in _records(meta, "decisions")]),
+                              for _i, r in _records(meta, "decisions")],
+         _closed_terms(vocab, rv_dec.get("status", ""))),
     ]
 
 
@@ -235,6 +315,112 @@ def _check_value(vocab, vname, value, where, findings, registry_proposals):
         # error, so one document may not be told it is wrong for coining a term.
         if value not in vocab.values(vname):
             registry_proposals.setdefault(vname, []).append(value)
+
+
+# --------------------------------------------------------------- required keys
+
+# `ref` became required on every knowledge record at SCHEMA_VERSION 3. A document
+# that DECLARES an older revision is graded against the revision it declares: the
+# missing citation is a backfill item there, not a defect in a block that never
+# promised one. Grading it as an ERROR would turn every pre-v3 bundle red on the
+# first run after the bump, which is the same run the skew gate exists to hand an
+# operator as a work list. A block carrying NO schema_version is treated as current —
+# it is hand-authored or hand-edited, and it is being written now.
+_REF_REQUIRED_FROM = 3
+
+
+def _empty(val):
+    # type: (object) -> bool
+    """Absent, for the purpose of a required key.
+
+    The same rule the ACCEPTANCE layer applies (``_enrich._missing_required``): a
+    key present with ``None``, ``""``, ``[]`` or ``{}`` is not carried. Deliberately
+    NOT falsiness — ``0`` and ``False`` are values a record may legitimately hold,
+    and a `line: 0` that read as absent would reject a real citation.
+    """
+    if val is None:
+        return True
+    if isinstance(val, str):
+        return not val.strip()
+    if isinstance(val, (list, tuple, dict, set)):
+        return not val
+    return False
+
+
+def _declared_schema(meta):
+    # type: (dict) -> int
+    try:
+        return int("%s" % ((meta or {}).get("schema_version"),))
+    except (TypeError, ValueError):
+        return SCHEMA_VERSION
+
+
+def _cited(rec):
+    # type: (dict) -> bool
+    """Does this record answer "which part of the document asserts this?"
+
+    A ``ref`` does. So does a HARVESTED record carrying the body line it was lifted
+    from: a URL in the lede sits above the first heading, in a region no renderer
+    emits a fragment for, so a ``ref`` there would be a DEAD link and the line is the
+    better answer. This is the same latitude the fidelity rubric's D5 row grants,
+    written the same way on purpose — two gates disagreeing about what counts as a
+    citation would make one of them wrong about every harvested link.
+
+    A MODEL-PROPOSED record gets no such latitude: the point of requiring a citation
+    is that a claim nobody can locate cannot be checked, quoted or repaired.
+    """
+    if not _empty(rec.get("ref")):
+        return True
+    line = rec.get("line")
+    return (rec.get(EVIDENCE_KEY) == SOURCE_EXTRACTED
+            and isinstance(line, int) and not isinstance(line, bool))
+
+
+def _check_required(name, where, rec, required, rv, schema_version, findings):
+    # type: (str, str, dict, tuple, dict, int, list) -> None
+    """Every required sub-key of one record, INDEPENDENTLY of any vocabulary.
+
+    This used to live inside the loop over vocabulary-bound sub-keys, which turned
+    ``record_required`` into a mere FILTER over that loop: of the thirteen required
+    slots the schema declares, only the three that also carry a vocabulary
+    (``relations.p``, ``decisions.status``, ``risks.impact``) could ever produce a
+    finding. A bundle where not one record cited a section anchor — the exact state
+    ``SCHEMA_VERSION = 3`` was bumped for — linted clean and exited 0 even under
+    ``--strict``. ``open_questions`` binds no vocabulary at all, so its loop body
+    never ran, and the members of a ``groups`` field were never walked for required
+    keys at all.
+    """
+    for sub in required:
+        if sub == "ref":
+            if _cited(rec):
+                continue
+            severity = (ERROR if schema_version >= _REF_REQUIRED_FROM else WARN)
+            findings.append(Finding(
+                "record-uncited", severity, "%s.%s" % (where, sub),
+                "no `ref` (and no extracted `line`), so \"which section asserts "
+                "this?\" is unanswerable — a record nobody can locate cannot be "
+                "checked, quoted or repaired%s"
+                % ("" if severity == ERROR else
+                   "; this block declares schema_version=%d, and `ref` became "
+                   "required at %d, so this is backfill rather than a defect"
+                   % (schema_version, _REF_REQUIRED_FROM))))
+            continue
+        if sub in rv:
+            # A GOVERNED sub-key that is present but empty is already reported by the
+            # membership check — as a retyped scalar or as a term nobody governs —
+            # so only ABSENCE is this branch's business. Reporting it twice would be
+            # the same double-count the shape gate was duplicating.
+            if rec.get(sub) is None:
+                findings.append(Finding(
+                    "record-untyped", ERROR, "%s.%s" % (where, sub),
+                    "record has no %r, so nothing checks it against %r"
+                    % (sub, rv[sub])))
+            continue
+        if _empty(rec.get(sub)):
+            findings.append(Finding(
+                "record-missing-required", ERROR, "%s.%s" % (where, sub),
+                "record has no %r, which this field requires — a %s record without "
+                "it is not a fact, it is a fragment" % (sub, where.split("[")[0])))
 
 
 def _check_refs(meta, anchors, known_ids, findings, unreadable=0):
@@ -439,10 +625,13 @@ def lint_document(meta, vocab, anchors=None, known_ids=None, unreadable=0):
             continue
         if f.kind == "list":
             if not isinstance(val, list):
-                findings.append(Finding("field-malformed", ERROR,
-                                        "%s.%s" % (META_KEY, f.name),
-                                        "expected a list, got %s"
-                                        % type(val).__name__))
+                # REPORTED ABOVE, by the container shape gate, and reported there for
+                # every list field rather than only the governed ones. Repeating it
+                # here made one mis-typed `tags: urgent` two ERROR rows in the JSON
+                # report and two in the corpus error count, so the same slip cost 1
+                # or 2 depending purely on whether the field happened to have a
+                # vocabulary. The `continue` still matters: without it the per-item
+                # loop walks a string one character at a time.
                 continue
             for i, v in enumerate(val):
                 _check_value(vocab, f.vocab, v, "%s[%d]" % (f.name, i),
@@ -451,8 +640,10 @@ def lint_document(meta, vocab, anchors=None, known_ids=None, unreadable=0):
             _check_value(vocab, f.vocab, val, f.name, findings, proposals)
 
     # Record lists: every one is WALKED (so a junk member is reported even in a
-    # list with no vocabulary, like open_questions), and where a vocabulary binds a
-    # sub-key, a record missing it is reported rather than passing as clean.
+    # list with no vocabulary, like open_questions), every vocabulary-bound sub-key
+    # is checked, and every REQUIRED sub-key is checked separately from that — the
+    # two questions are independent and nesting them made the second unaskable.
+    schema_version = _declared_schema(meta)
     for f in FIELDS:
         if f.kind != "records":
             continue
@@ -463,16 +654,43 @@ def lint_document(meta, vocab, anchors=None, known_ids=None, unreadable=0):
                 if sub in rec and rec.get(sub) is not None:
                     _check_value(vocab, vname, rec.get(sub),
                                  "%s[%d].%s" % (f.name, i, sub), findings, proposals)
-                elif sub in required:
-                    findings.append(Finding(
-                        "record-untyped", ERROR, "%s[%d].%s" % (f.name, i, sub),
-                        "record has no %r, so nothing checks it against %r"
-                        % (sub, vname)))
+            _check_required(f.name, "%s[%d]" % (f.name, i), rec, required, rv,
+                            schema_version, findings)
 
     # Grouped fields: entity types (with the group fallback) and link categories.
     for where, etype in _entity_rows(meta, vocab, findings):
         _check_value(vocab, "entity_types", etype, "%s.type" % where,
                      findings, proposals)
+    # ... and their MEMBERS' required keys, which nothing walked at all: the links
+    # group was only ever graded on its group NAMES. Applied to the LIST shape only —
+    # a group written as a mapping keys its members by name, so demanding a `name`
+    # sub-key there would reject the one shape that cannot omit it.
+    for gname in ("entities", "links"):
+        groups = meta.get(gname)
+        required = group_required(gname)
+        if not required or not isinstance(groups, dict):
+            continue
+        for group, members in groups.items():
+            if not isinstance(members, list):
+                # `_entity_rows` already reports both non-list shapes for entities,
+                # with more to say about each. `links` had no walk at all, so a
+                # group that is neither a list nor a mapping read as clean.
+                if gname != "entities" and not isinstance(members, dict):
+                    findings.append(Finding(
+                        "group-malformed", ERROR, "%s.%s" % (gname, group),
+                        "expected a list of records, got %s — nothing in it is "
+                        "checked" % type(members).__name__))
+                continue
+            for i, member in enumerate(members):
+                where = "%s.%s[%d]" % (gname, group, i)
+                if not isinstance(member, dict):
+                    if gname != "entities":     # entity-malformed covers that side
+                        findings.append(Finding(
+                            "record-malformed", ERROR, where,
+                            "expected a mapping, got %s" % type(member).__name__))
+                    continue
+                _check_required(gname, where, member, required, {},
+                                schema_version, findings)
     if isinstance(meta.get("links"), dict):
         gv = group_vocab("links")
         for cat in meta["links"].keys():
