@@ -15,10 +15,11 @@ Deterministic **document → Markdown** conversion for RAG ingestion, with an
 independent second-pass validator: every conversion is *measured*, never
 assumed. Office documents are converted from their OOXML XML directly and hard-gated
 **twice** — at **token recall = 1.0**, and against a converter-blind OOXML
-structural ground truth (`structure_fidelity`, fifteen facts: headings and their
+structural ground truth (`structure_fidelity`, sixteen facts: headings and their
 titles, list nesting, printed ordered numbers, emphasis, fences, links, every table
-cell, every list item in order). Structure *is* content, so a document whose
-headings flattened or whose table rows scrambled fails even at recall 1.0. PDF/HTML
+cell, every list item in order, and the order the blocks themselves appear in).
+Structure *is* content, so a document whose headings flattened, whose table rows
+scrambled, or whose table moved to a different section fails even at recall 1.0. PDF/HTML
 go through a best-effort lane whose loss is quantified and surfaced, never hidden.
 
 ## What it produces

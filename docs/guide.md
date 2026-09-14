@@ -320,11 +320,51 @@ fourth, converter-blind walk of the source XML:
 | strong / em / strike runs | formatting silently dropped |
 | inline-code and fenced blocks | a command indistinguishable from narration |
 | link count | a hyperlink flattened to its text |
-| table rows × columns | a table flattened into a paragraph |
+| table rows × columns, **and every cell** | a table flattened into a paragraph; two values transposed between rows |
+| every heading's **title**, in order | two section titles exchanged |
+| the **order the blocks appear in** | a table moved from under one heading to under another |
 
 A mismatch is a **hard fail on the office lane**, the markdown is withheld, and
-the report names the delta rather than just failing. Formats with no second
-implementation yet (pptx, xlsx) report `unmeasured` — not `pass`.
+the report names the delta rather than just failing.
+
+**Which formats are graded.** All of them, as of P9.6. `docx`, `xlsx` and `pptx`
+each have their own second implementation; every other office input reaches one of
+those three through LibreOffice before either gate runs, so `doc`/`odt`/`rtf`,
+`xls`/`ods` and `ppt`/`odp` are graded by the sibling they are converted to —
+measured, an `.odp` reports `gate: pass, compared: 7`. On that lane a `pass` also
+carries `pre_conversion_structure` in `blind_to`: both halves read the package
+soffice produced, so it means "faithful from the converted package onward", not
+"nothing was lost". `.odp` and `.ods` have **no corpus fixture**, so their gate is
+live and unexercised; the eval covers `.doc`, `.odt`, `.rtf`, `.xls` and `.ppt`.
+Read three fields together and the verdict is unambiguous:
+
+| Field | Question it answers |
+|---|---|
+| `compared` / `facts` | how many of the sixteen actually observed something here |
+| `unmeasured` | facts this ground truth does not supply **yet** — a gap code closes, and as of P9.8 it is empty on every office bundle |
+| `blind_to` | structure this format has that **no fact can express** — so `pass` never claimed it |
+
+**What closing `unmeasured` took.** It was never a matter of writing the zeros. A
+fact the converter drops must be OMITTED rather than stated as zero — a stated
+`strong: 0` over a deck that draws bold makes the ground truth inherit the
+converter's blind spot on the very axis it exists to police, and CERTIFIES the loss.
+So the list emptied by the converter learning to emit what it had been dropping: a
+deck's and a workbook's bold, italic, strikethrough and hyperlinks, and a deck's
+auto-numbered ordinals — the last resolved through the whole
+`a:pPr` → shape `a:lstStyle` → slide layout → slide master `p:txStyles` cascade,
+because reading only the first says "no numbering" over a deck numbered from its
+theme. Four warning codes narrowed or retired with them, because a receipt for a
+loss nobody suffered teaches a reader to discount the whole vocabulary.
+
+`blind_to` is why a workbook's `pass` is honest rather than absolute: a cell's
+address, its formula and its number format have no name in the list, so each is
+declared there. Two of the three are also **counted** in a warning
+(`dropped_cell_formulas` / `empty_cell_formulas`, `unformatted_cell_values`); a
+cell's address is declared and not counted, because a value in the wrong cell of the
+right row is a difference `tables` already reports and a value at an address the
+grid never renders is not in the document a reader is handed. On the LibreOffice lane it also
+carries `pre_conversion_structure`, because both halves of the gate read the package
+soffice produced — `pass` there means "faithful from the converted package onward".
 
 You can run the whole quality rubric yourself:
 
