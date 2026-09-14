@@ -110,6 +110,13 @@ def gfm_anchor(title):
     Published here because two places in the codebase need to agree on it and the
     rubric is what grades that agreement (quality-plan C3)."""
     text = (title or "").strip().lower()
+    # An HTML comment contributes no character to the heading a reader sees, and its
+    # dashes are `-` — which this rule KEEPS. `_render_runs` writes `<!---->` between
+    # two emphasis spans whose delimiters would fuse (P9.9), so a heading can hold
+    # one, and `***read***<!---->*only*` slugged `read-only` where the rendered
+    # heading is `readonly`. All three copies had it; agreeing with each other is
+    # what made it invisible.
+    text = re.sub(r"<!--.*?-->", "", text, flags=re.S)
     text = re.sub(r"[^\w\s-]", "", text, flags=re.U)
     return re.sub(r"[-\s]+", "-", text).strip("-")
 

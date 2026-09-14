@@ -34,7 +34,16 @@ pytestmark = pytest.mark.unit
 # the other two hyphenated it. `# Overview - part 2` published `overview-part-2` in
 # structure.json and `overview---part-2` in the KB — one heading, two fragments,
 # and `kb._lint._check_refs` grading the live one as dead.
+# P9.9. `_render_runs` writes an empty HTML comment between two emphasis spans whose
+# delimiters would otherwise fuse, and a heading is one of the places it can land. Its
+# DASHES are `\w\s-` characters, so they survived the drop class and collapsed into a
+# separator: `***read***<!---->*only*` slugged `read-only`, while the heading a
+# renderer shows is `readonly` and GitHub's fragment for it has no hyphen. One
+# heading, two fragments — exactly the divergence the rest of this corpus exists for.
 TITLES = [
+    "***read***<!---->*only*",
+    "Mode<!---->**(2:0)**",
+    "<!---->leading",
     "1.2 Scope",
     "1.2reference documents",
     "1 Introduction",
@@ -72,6 +81,14 @@ def test_the_three_implementations_agree_on_every_title(title):
 
 
 @pytest.mark.parametrize("title,want", [
+    # P9.9. Agreement between the three copies is not the same as being RIGHT: all
+    # three collapsed the separator's dashes into a hyphen, so a heading a renderer
+    # shows as `readonly` published the fragment `read-only` and a reader who copied
+    # the link off the rendered page landed nowhere. The comment is markup and
+    # contributes no character to the heading a reader sees.
+    ("***read***<!---->*only*", "readonly"),
+    ("Mode<!---->**(2:0)**", "mode20"),
+    ("<!---->leading", "leading"),
     ("Overview - part 2", "overview-part-2"),
     ("Reset -- sequence", "reset-sequence"),
     ("Trailing hyphen -", "trailing-hyphen"),
