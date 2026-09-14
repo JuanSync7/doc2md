@@ -32,6 +32,7 @@ __all__ = ["run_block", "decision", "stamp_stage", "config_provenance",
 DECISION_CODES = (
     "lane_selected",          # which lane converted this document, and why
     "preconvert",             # a legacy format went through soffice first
+    "slide_order",            # which order a deck's slides were published in
     "ocr_routed",             # a PDF page went to OCR, with the evidence that decided it
     "body_source",            # docling | text-layer | hybrid
     "tokenizer_selected",     # which tokenizer backed every token count

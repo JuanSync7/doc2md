@@ -1,7 +1,7 @@
 """
-title: OOXML -> markdown deterministic converters (private)
+title: OOXML -> markdown deterministic converters
 layer: backend
-public_api: no
+public_api: yes
 summary: Full docx/pptx/xlsx to markdown by walking the OOXML parts; no ML, no inference.
 """
 # 3.6-compatible. Stdlib only. Pure policy — operates on a dict of OOXML *parts*
@@ -24,15 +24,41 @@ summary: Full docx/pptx/xlsx to markdown by walking the OOXML parts; no ML, no i
 #   * tracked-change deletions (w:delText) and field instructions (w:instrText)
 #     are source metadata, not visible text — excluded on both sides.
 import re
-import xml.etree.ElementTree as _ET
 
 from ._figures import ooxml_image_sentinel
+# The leaf primitives — see `_ooxml_leaf`'s header for which helpers are allowed to
+# be shared between readers of the same bytes and why these four qualify.
+from ._ooxml_leaf import (_local, _root, _WS,               # noqa: F401
+                          _BREAK_LOCALS, _SKIP_LOCALS)
+# The deck and workbook TOKEN ground truths. They are imported rather than defined
+# here precisely so they cannot reach this module's helpers: a ground truth that
+# shares the converter's reading of a document cannot disagree with it, and
+# disagreeing is the only thing it is for. This import is why `_ooxml_leaf` exists —
+# `_SOURCES` below binds at module scope, so those modules must not import back.
+from ._ooxml_struct import docx_source_text
+from ._pptx_struct import pptx_source_text
+from ._xlsx_struct import xlsx_source_text
 
-__all__ = ["docx_markdown", "pptx_markdown", "xlsx_markdown",
+
+def _attr(el, local):
+    # type: (object, str) -> str
+    """Attribute value by LOCAL attribute name (``r:id``/``w:val`` -> ``id``/``val``).
+
+    Written out in every reader rather than shared, and the six lines are the point.
+    An attribute read is where a cell's ADDRESS comes from, so a shared one is
+    called on both sides of the comparison: measured, a shared `_attr` that lost
+    every `@r` shifted every value into a different column while `token_recall`,
+    `n_source_tokens`, `compared` and the delta list all stayed exactly as they
+    were. Nothing in the report moved. Four copies of five lines buys the one thing
+    the second gate exists for."""
+    for key, value in el.attrib.items():
+        if key.rsplit("}", 1)[-1] == local:
+            return value
+    return ""
+
+__all__ = ["docx_markdown", "pptx_markdown", "xlsx_markdown", "pptx_slide_order",
            "docx_source_text", "pptx_source_text", "xlsx_source_text",
            "ooxml_markdown", "ooxml_source_text", "svg_text", "OOXML_MAIN_PARTS"]
-
-_WS = re.compile(r"\s+")
 
 # The text-bearing parts each converter consumes, as regexes on part names.
 # office_convert.py reads these; its --audit-parts mode uses the same list to
@@ -43,11 +69,24 @@ OOXML_MAIN_PARTS = {
              r"^word/_rels/document\.xml\.rels$", r"^word/charts/chart(?:Ex)?\d+\.xml$",
              r"^word/diagrams/data\d+\.xml$", r"^word/media/[^/]+\.svg$",
              r"^docProps/(core|app)\.xml$"),
-    "pptx": (r"^ppt/slides/slide\d+\.xml$", r"^ppt/slides/_rels/slide\d+\.xml\.rels$",
+    # `ppt/presentation.xml` and its rels are read but never RENDERED: they carry no
+    # text at all. They are here because the deck's ORDER lives in `p:sldIdLst`, and
+    # while the part was absent from this list the converter could not read it, so
+    # `## Slide N` numbered by filename — the order the slides were created in.
+    "pptx": (r"^ppt/presentation\.xml$", r"^ppt/_rels/presentation\.xml\.rels$",
+             r"^ppt/slides/slide\d+\.xml$", r"^ppt/slides/_rels/slide\d+\.xml\.rels$",
              r"^ppt/notesSlides/notesSlide\d+\.xml$", r"^ppt/diagrams/data\d+\.xml$",
              r"^ppt/charts/chart(?:Ex)?\d+\.xml$", r"^ppt/comments/[^/]+\.xml$",
              r"^ppt/media/[^/]+\.svg$", r"^docProps/(core|app)\.xml$"),
+    # `xl/styles.xml` is read but never RENDERED: the converter emits no cell
+    # emphasis and no number formatting. It is loaded so the drop can be COUNTED —
+    # a workbook's bold header, its struck-through cancelled row and its date
+    # serials are real losses, and while the part was absent from this list the two
+    # warnings that name them could not fire at all, which is a stronger kind of
+    # silence than merely not emitting the formatting. `word/styles.xml` was here
+    # from the start; the workbook lane simply never gained it.
     "xlsx": (r"^xl/workbook\.xml$", r"^xl/_rels/workbook\.xml\.rels$",
+             r"^xl/styles\.xml$",
              r"^xl/sharedStrings\.xml$", r"^xl/worksheets/[^/]+\.xml$",
              r"^xl/drawings/drawing\d+\.xml$", r"^xl/drawings/_rels/drawing\d+\.xml\.rels$",
              r"^xl/comments\d*\.xml$",
@@ -60,46 +99,6 @@ OOXML_MAIN_PARTS = {
 # captures them and the gate holds them to recall 1.0. Raster/metafile image text is a
 # separate opt-in VLM pass (see docs/design/ooxml-lane.md).
 _MEDIA_SVG = re.compile(r"^(word|ppt|xl)/media/[^/]+\.svg$")
-
-
-def _local(tag):
-    # type: (str) -> str
-    """Local name of a namespaced ET tag (``{uri}p`` -> ``p``).
-
-    Matching on local names keeps the walkers generic across the transitional and
-    strict OOXML namespace URIs (and mixed w:/a: content inside drawings)."""
-    if isinstance(tag, str):
-        return tag.rsplit("}", 1)[-1]
-    return ""                       # comments/PIs have non-str tags
-
-
-def _attr(el, local):
-    # type: (object, str) -> str
-    """Attribute value by LOCAL attribute name (``r:id``/``w:val`` -> ``id``/``val``)."""
-    for k, v in el.attrib.items():
-        if k.rsplit("}", 1)[-1] == local:
-            return v
-    return ""
-
-
-def _root(xml):
-    # type: (str) -> object
-    """Parsed root or None — malformed parts degrade to empty output, never raise."""
-    if not xml:
-        return None
-    try:
-        return _ET.fromstring(xml)
-    except _ET.ParseError:
-        return None
-
-
-# Elements that stand for whitespace but carry no text.
-_BREAK_LOCALS = ("tab", "br", "cr")
-# Subtrees skipped EVERYWHERE (converter and ground truth): Fallback duplicates
-# Choice; rPh is furigana phonetic duplication of its base text; moveFrom is the
-# tracked-changes "moved away" OLD copy of relocated content (the live copy is in
-# moveTo) — keeping it resurrects stale text and duplicates whole sections.
-_SKIP_LOCALS = ("Fallback", "rPh", "moveFrom")
 
 
 def _collect_text(el, parts, skip=None, value_locals=("t",)):
@@ -246,13 +245,24 @@ def _blip_rids(el):
     return rids
 
 
-def _emit_image_blocks(rids, rels, blocks):
-    # type: (list, dict, list) -> None
-    """Append an ``("img", sentinel)`` block for each rId that resolves to a media part."""
+def _emit_image_blocks(rids, rels, blocks, pad=""):
+    # type: (list, dict, list, str) -> None
+    """Append an ``("img", sentinel)`` block for each rId that resolves to a media part.
+
+    ``pad`` is the content column of the list item the picture falls inside, and it
+    is load-bearing rather than cosmetic. ``_join_blocks`` separates any non-``li``
+    block with a blank line, so a sentinel at COLUMN 0 closes the list it interrupts
+    and every item after it restarts at depth 0 — the source's nesting silently gone
+    at ``recall: 1.0``. Indented to the open item's content column it is a
+    continuation of that item instead, and the items below keep their depth. The
+    blank lines stay: they close the item's PARAGRAPH without closing the ITEM,
+    which is what lets an ordered sub-list whose marker is not `1` survive (a list
+    may interrupt a paragraph only at `1`, so gluing the picture on with a single
+    newline would swallow the next step into its prose)."""
     for rid in rids:
         part = rels.get(rid)
         if part:
-            blocks.append(("img", ooxml_image_sentinel(part)))
+            blocks.append(("img", pad + ooxml_image_sentinel(part)))
 
 
 # Markdown metacharacters that would REINTERPRET literal source text when rendered:
@@ -261,13 +271,26 @@ def _emit_image_blocks(rids, rels, blocks):
 # so every literal text is escaped — the source must round-trip through a GFM
 # renderer character-perfect.
 _MD_SPECIAL = re.compile(r"([*`<\[\]~])|(_+)")
-_LEAD_LIST_NUM = re.compile(r"^(\d+)([.)])(\s)")
+# CommonMark caps an ordered marker at NINE digits, which is also what
+# `_mdstructure._ORDERED` reads. Without the cap a ten-digit part number or
+# order reference (`1234567890. `) was escaped for a danger it cannot pose,
+# and a backslash a renderer hides is still a byte an index and a grep see.
+# The `|$` is not a nicety. A bullet whose whole text is `15.` emits `- 15.`,
+# which CommonMark reads as an EMPTY nested ordered list — the characters are
+# deleted from the render, and because `markdown_to_text` still reports them the
+# token gate sees `recall: 1.0`. Measured on a three-bullet deck, marko 2.2.3:
+#     - alpha / - 15. / - beta   renders   "alpha beta"   recall 1.0 valid True
+# The same holds for `10)`, `1.` and `1)`.
+_LEAD_LIST_NUM = re.compile(r"^(\d{1,9})([.)])(\s|$)")
 # LINE-LEADING constructs a body paragraph must never be mistaken for.
 #   * an ATX heading opens on ONE TO SIX hashes followed by whitespace or nothing
 #     at all; seven hashes is not a heading and neither is `#1 priority`, so
 #     escaping either would add a visible backslash to text never at risk.
 #   * `+ `/`- `/`* ` is a bullet marker (a lone `*` is already escaped by `_esc`).
-_LEAD_MARK = re.compile(r"^(?:#{1,6}(?:\s|$)|[+*-]\s)")
+#   * a bare `+` is a bullet with an empty item and vanishes exactly as `15.`
+#     does; `-` alone is caught by `_LEAD_RULE` and `*` alone by `_esc`, so `+`
+#     was the one marker nothing covered.
+_LEAD_MARK = re.compile(r"^(?:#{1,6}(?:\s|$)|[+*-](?:\s|$))")
 # A line made ONLY of dashes or ONLY of equals signs (spaces allowed between) is a
 # thematic break or a setext heading underline: it renders as a rule, or as nothing,
 # and either way the paragraph's own characters are gone. `_` and `*` rules cannot
@@ -278,6 +301,9 @@ _LEAD_RULE = re.compile(r"^(?:-[- \t]*|=[= \t]*)$")
 # and because `markdown_to_text` does not model definitions, both gates see a
 # document that is still intact.
 _LEAD_REFDEF = re.compile(r"^\[[^\]]*\]:")
+# A GFM table's delimiter row. Made only of dashes, colons, pipes and spaces, so it
+# carries no token — which is exactly why the gates cannot see the table it builds.
+_LEAD_DELIM_ROW = re.compile(r"^\|?[ \t]*:?-+:?[ \t]*(\|[ \t]*:?-+:?[ \t]*)*\|?$")
 _WORD_CH = re.compile(r"[0-9A-Za-z]")
 
 
@@ -356,7 +382,7 @@ def _num_val(value, default):
 
 def _list_indent(cols, depth, marker):
     # type: (list, int, str) -> str
-    """Indentation for a list item at ``depth``, tracking ancestor CONTENT columns.
+    """Indentation for a list item at source level ``depth``, by CONTAINMENT.
 
     CommonMark nests a child item only when it is indented to at least its parent's
     **content column** — the column after the parent's marker and the space following
@@ -366,17 +392,28 @@ def _list_indent(cols, depth, marker):
     runbook then instructs a different action for every step after the first sub-step,
     and no gate can object — indentation is not a token.
 
-    ``cols[i]`` is the content column produced by level ``i``. A shallower item closes
-    every level below it. An item deeper than anything actually emitted — the source
-    skipped a level, or a paragraph closed the list and the next item is still marked
-    as a sub-item — is CLAMPED to the deepest open level rather than indented on
-    faith: markdown cannot express a child of a parent that is not there, and an
-    invented indent of four or more spaces would silently become a code block."""
-    if depth > len(cols):
-        depth = len(cols)
-    del cols[depth:]                              # a shallower item closes deeper levels
-    indent = cols[-1] if cols else 0
-    cols.append(indent + len(marker) + 1)
+    ``cols`` is the stack of ancestors still open, as ``(source level, content
+    column)``. An item closes every ancestor at its own level or deeper and then sits
+    one step in from what remains, so **two items at the same source level are always
+    siblings** and an item deeper than anything open costs one step of depth rather
+    than the level it names. That is what markdown can hold: a child of a parent that
+    is not there cannot be written, and an invented indent of four or more columns
+    past the open item stops being a list item at all.
+
+    THE CLAMP HAS TO BE STICKY, and this one was not. Clamping to the HEIGHT of the
+    stack — "one deeper than the deepest thing open" — is right for the FIRST item at
+    a skipped level and wrong for every one after it, because each successive item
+    finds the stack one entry taller. Three PEER bullets at outline level 2 came out
+    as a three-deep chain, so a bring-up slide read as though its steps nested; a
+    sweep of every level sequence of length 2-4 over levels 0-3 found 199 of 336
+    misrepresented. Recall could not see it (indentation is not a token) and neither
+    could the deck's structure gate, because the ground truth had been written to
+    mirror this function instead of deriving containment for itself."""
+    depth = max(0, depth)
+    while cols and cols[-1][0] >= depth:
+        cols.pop()                                # a peer or shallower item closes it
+    indent = cols[-1][1] if cols else 0
+    cols.append((depth, indent + len(marker) + 1))
     return " " * indent
 
 
@@ -470,6 +507,102 @@ def _esc_lead(text):
     if _LEAD_MARK.match(text) or _LEAD_RULE.match(text) or _LEAD_REFDEF.match(text):
         return "\\" + text
     return text
+
+
+# CommonMark lets an ATX heading end with an optional CLOSING SEQUENCE of `#`s —
+# a run preceded by whitespace, optionally followed by whitespace — and DELETES it
+# from the rendered heading. So a heading whose own text ends in a hash loses that
+# character: `# Drain procedure #` renders as "Drain procedure", and a revision
+# marker (`Rev #`), an issue reference or a C preprocessor line ends up one
+# character short. Both gates certify it — `#` carries no token, so recall stays
+# 1.0, and the heading is still a heading of the same level, so the fact vector
+# reports nothing. Measured on a real docx: `# Drain procedure #` -> rendered words
+# ['Drain', 'procedure'], recall 1.0, valid True.
+_TRAIL_HASH = re.compile(r"(?:^|[ \t])(#+)[ \t]*$")
+
+
+def _esc_heading(text):
+    # type: (str) -> str
+    """Heading text that must survive its own trailing `#` run.
+
+    One backslash on the first `#` of that run is enough: a closing sequence is a
+    run of literal hashes, and an escaped one is not a hash. `markdown_to_text`
+    strips the backslash again, so no token moves. Inline escaping is the caller's
+    (the text arrives already `_esc`-ed); nothing here needs `_esc_lead`, because a
+    block cannot open inside a heading line."""
+    m = _TRAIL_HASH.search(text)
+    if not m:
+        return text
+    return text[:m.start(1)] + "\\" + text[m.start(1):]
+
+
+def _esc_block_start(text):
+    # type: (str) -> str
+    """Source text that will sit where a markdown BLOCK can open — a line of its
+    own, or a list item's content column right after ``- ``.
+
+    A list item's content column is a block start exactly as column 0 is. After
+    ``- ``, CommonMark opens a heading, a nested list, a block quote, a fence or a
+    thematic break just as it would at the left margin, and every one of those is a
+    block the source document never wrote. Measured on the shipped corpus deck with
+    one bullet's text replaced by ``- - -``::
+
+        pristine   bullet_items=16  thematic_breaks=0  recall=1.0  valid=True
+        poisoned   bullet_items=15  thematic_breaks=1  recall=1.0  valid=True
+
+    The bullet came out as ``- - - -``, which is a thematic break, and DELETED
+    ITSELF: a break carries no tokens for recall to miss, so both gates certified
+    it. ``15. step`` fails the other way and is no better — it becomes a nested
+    ordered list whose marker ``markdown_to_text`` swallows, so a FAITHFUL deck
+    refuses to publish at ``recall: 0.990``.
+
+    Both halves are needed and in this order: ``_esc`` neutralises inline syntax
+    (including the backtick and tilde runs that would open a fence), ``_esc_lead``
+    the block openers. Every construct that survived that pipeline was checked
+    against marko 2.2.3 rather than against this project's own reader — a
+    converter's author does not get to rule on what its markdown means.
+
+    A GFM DELIMITER ROW is escaped unconditionally, and that is the one rule here
+    that does not ask what the line says on its own. A table needs a delimiter row
+    directly under a line holding a pipe, so the danger is a property of a PAIR of
+    lines — and no emitter can see its own neighbour. `svg_text` joins a figure's
+    labels with newlines, `_join_blocks` stacks consecutive list items with a single
+    newline, and both put two pieces of SOURCE TEXT on adjacent lines: three labels
+    reading `| Path | Cycles |`, `| --- | --- |`, `| display read | 40 |` published a
+    real two-column TABLE the drawing never had (`tables: [{rows: 2, cols: 2,
+    has_header: True}]` at token recall 1.0), and the same three as bullets did it
+    again inside a list item, where the fact vector does not even see it.
+
+    Escaping it whatever precedes it costs nothing worth having: a line that matches
+    is made only of dashes, colons, pipes and spaces, so it carries no token at all,
+    and `markdown_to_text` strips the backslash. Tracking the previous line instead
+    would mean threading that state through six emitters and the block joiner, and
+    would still miss whichever emitter came next.
+
+    No ``line`` context parameter, unlike ``_esc``: every caller here hands over a
+    WHOLE line — a list item's content, a comment, a note, a caption — so the text
+    speaks for itself and there is no neighbouring piece a bracket could combine
+    with. A parameter nothing fills reads as an option somebody chose not to use."""
+    esc = _esc_lead(_esc(text))
+    return "\\" + esc if _LEAD_DELIM_ROW.match(esc) else esc
+
+
+def _esc_block_start_md(md):
+    # type: (str) -> str
+    """The same guard for text that has ALREADY been inline-escaped and marked.
+
+    `_esc_block_start` does both halves — `_esc` then `_esc_lead` — and running the
+    first half over rendered markdown would escape the converter's own `**`, `*`,
+    `~~` and `[](...)` back into literal punctuation. The deck lane escapes inline
+    per RUN, because that is the only place that knows which characters are the
+    document's and which are the converter's, so only the line-leading half is left
+    to do here.
+
+    Safe on every marker this converter emits, checked rather than assumed: `_LEAD_MARK`
+    wants `[+*-]` followed by whitespace, and `**bold**` puts an asterisk there;
+    `_LEAD_REFDEF` wants `]:`, and a rendered link puts `](` there."""
+    esc = _esc_lead(md)
+    return "\\" + esc if _LEAD_DELIM_ROW.match(esc) else esc
 
 
 def _md_cell(text):
@@ -852,6 +985,72 @@ def _edge_char(group, first, merges):
     return "*"
 
 
+# The separator, and why it is an html comment. Two rendered spans written against
+# each other can be UNREADABLE to CommonMark, in two distinct ways:
+#
+#   MERGE      `***alpha***` + `*beta*` is a delimiter run of FOUR asterisks, and the
+#              parser pairs them as one em span, not two. Measured at HEAD on an
+#              ordinary Word paragraph of that shape: `structure_fidelity` fails on
+#              `em`, `token_recall` reads 0.0, and the document refuses to publish.
+#   FLANK      `**~~beta~~**` after a letter cannot OPEN: the `**` is preceded by a
+#              word character and followed by punctuation, which is not left-flanking.
+#              `_wrap_marks` shifts a text unit out to fix exactly this, and cannot
+#              when the inner neighbour is another delimiter — its docstring says so.
+#
+# An empty html comment renders as nothing, carries no token, and breaks a delimiter
+# run. Verified against marko 2.2.3 over every sequence of one to three spans drawn
+# from an eight-mark alphabet — 576 documents, 0 misreads with this rule, 326 without
+# it. Both of this project's readers remove it to NOTHING (`markdown_to_text`,
+# `_mdstructure._words`), which they must: it only ever stands where the two spans are
+# adjacent with NO whitespace, which is to say between two halves of one word.
+#
+# It is NOT written at every boundary. Emphasis with spaces around it — almost all
+# emphasis — needs nothing, and every shipped document stays byte-identical.
+_SPAN_SEP = "<!---->"
+_DELIMS = "*~`"
+
+
+def _delim_run(text, at_end):
+    # type: (str, bool) -> str
+    """The run of delimiter characters at one end of a rendered span, or ``""``."""
+    if not text:
+        return ""
+    ch = text[-1] if at_end else text[0]
+    if ch not in _DELIMS:
+        return ""
+    i = 0
+    while i < len(text) and (text[-1 - i] if at_end else text[i]) == ch:
+        i += 1
+    return ch * i
+
+
+def _needs_separator(left, right):
+    # type: (str, str) -> bool
+    """Would writing ``right`` straight after ``left`` be misread?
+
+    Three questions, each a property of the BOUNDARY rather than of either span:
+    whether two runs of the same delimiter would fuse into one, and whether either
+    span's outermost delimiter would be left unable to flank by what lands beside it.
+    ``left`` empty means this is the start of the line, where the separator must never
+    go: a line beginning `<!--` is an HTML BLOCK and nothing in it is parsed as inline
+    markdown at all."""
+    if not left or not right:
+        return False
+    if left[-1] in _DELIMS and left[-1] == right[0]:
+        return True                       # the two runs fuse into one
+    open_run = _delim_run(right, False)
+    if open_run and left[-1].isalnum():
+        inner = right[len(open_run):len(open_run) + 1]
+        if inner and not inner.isalnum():
+            return True                   # cannot LEFT-flank: word outside, punct in
+    close_run = _delim_run(left, True)
+    if close_run and right[0].isalnum():
+        inner = left[-len(close_run) - 1:-len(close_run)]
+        if inner and not inner.isalnum():
+            return True                   # cannot RIGHT-flank, the mirror of above
+    return False
+
+
 def _render_runs(segments):
     # type: (list) -> str
     """Coalesce adjacent identically-marked segments, then apply the markers.
@@ -878,7 +1077,10 @@ def _render_runs(segments):
         star = _stars(group[0])
         prev = _edge_char(groups[k - 1], False, star) if k else ""
         nxt = _edge_char(groups[k + 1], True, star) if k + 1 < len(groups) else ""
-        out.append(_wrap_marks(group[1], group[0], prev, nxt))
+        rendered = _wrap_marks(group[1], group[0], prev, nxt)
+        if out and _needs_separator(out[-1], rendered):
+            out.append(_SPAN_SEP)
+        out.append(rendered)
     return "".join(out)
 
 
@@ -949,11 +1151,29 @@ def _join_blocks(blocks):
     a blank line is part of the program. Leading and trailing ones are dropped —
     they emit no block, so they neither open a fence nor close one, which is exactly
     what the structural ground truth counts."""
+    # An image sentinel indented to an open list item's content column is a
+    # CONTINUATION of that item, and that is what keeps the items AFTER it at their
+    # depth (`_emit_image_blocks` says why). When no item follows, there is no depth
+    # left to keep and the indent would claim only that the picture sits inside the
+    # last bullet — a position the source does not state. So it is settled back to
+    # column 0, which is also what keeps this fix from moving a single byte of any
+    # document whose pictures merely follow a list rather than interrupting one.
+    flat = set()
+    for n, (kind, text) in enumerate(blocks):
+        if kind != "img" or text == text.lstrip():
+            continue
+        after = n + 1
+        while after < len(blocks) and blocks[after][0] == "img":
+            after += 1
+        if after >= len(blocks) or blocks[after][0] not in ("li", "lib"):
+            flat.add(n)
     parts = []  # type: list
     prev_kind = None
     i = 0
     while i < len(blocks):
         kind, text = blocks[i]
+        if i in flat:
+            text = text.lstrip()
         if kind == "code":
             run = []  # type: list
             while i < len(blocks) and blocks[i][0] == "code":
@@ -1007,7 +1227,7 @@ def _diagram_items(data_xml):
 
 def _diagram_list_md(data_xml):
     # type: (str) -> str
-    return "\n".join("- " + _esc(i) for i in _diagram_items(data_xml))
+    return "\n".join("- " + _esc_block_start(i) for i in _diagram_items(data_xml))
 
 
 def _embedded_sections(parts, pattern_titles):
@@ -1025,8 +1245,14 @@ def _embedded_sections(parts, pattern_titles):
         if items:
             blocks.append(("h", "## " + title))
             for t in items:
-                # pre-formatted bullet lists pass through; prose gets lead-escaped
-                blocks.append(("p", t if t.startswith("- ") else _esc_lead(t)))
+                # Each renderer escapes its OWN text, because only it knows
+                # whether it built a bullet list or rendered free prose. This
+                # used to be guessed here, from whether the value started with
+                # "- " — so a text box whose content was the three characters
+                # `- - -` was taken for a pre-formatted list, passed through
+                # unescaped, and published as a THEMATIC BREAK: the box's text
+                # gone from the document at recall 1.0, gate pass.
+                blocks.append(("p", t))
     return blocks
 
 
@@ -1554,8 +1780,9 @@ def _docx_blocks(el, styles, numbering, links, blocks, img=None, lst=None, sty=N
     sub-list inside a numbered procedure its own w:numId, and discarding the ancestor
     columns on that change unparents the sub-list — the notes stop belonging to the
     step they were written under. An item deeper than anything open is already
-    clamped by ``_list_indent``, which is the real defence against a list that starts
-    at ilvl 2 with no parent.
+    CONTAINED by ``_list_indent`` — it costs one step of depth, not the level it
+    names — which is the real defence against a list that starts at ilvl 2 with no
+    parent.
 
     ``sty`` is the style context from ``_docx_style_ctx``. Its ``para``/``char``
     code-style sets make a paragraph in a code style a ``("code", ...)`` block —
@@ -1603,7 +1830,8 @@ def _docx_blocks(el, styles, numbering, links, blocks, img=None, lst=None, sty=N
             elif text:
                 if level:
                     _close_list(lst)
-                    blocks.append(("h", "#" * min(level, 6) + " " + _esc_lead(text)))
+                    blocks.append(("h", "#" * min(level, 6) + " "
+                                    + _esc_heading(_esc_lead(text))))
                 elif num_id and num_id != "0":
                     fmt, start = numbering.get((num_id, ilvl or "0"), ("bullet", 1))
                     depth = _num_val(ilvl, 0)
@@ -1622,21 +1850,31 @@ def _docx_blocks(el, styles, numbering, links, blocks, img=None, lst=None, sty=N
                     # step 4 is swallowed as step 4's prose. One blank line closes that
                     # paragraph and the sub-list survives.
                     blocks.append((("lib" if (pad and restart) else "li"),
-                                   pad + marker + " " + text))
-                    item_pad = " " * cols[-1]
+                                   pad + marker + " " + _esc_lead(text)))
+                    item_pad = " " * cols[-1][1]
                 else:
                     _close_list(lst)
                     blocks.append(("p", _esc_lead(text)))
             if images:
                 img_blocks = []  # type: list
                 _emit_image_blocks(images, rels, img_blocks)
-                if item_pad:
-                    # The picture sits INSIDE this step. Indented to the step's
-                    # content column it is a list-item continuation, so the steps
-                    # below keep counting; emitted at column 0 it closes the list,
-                    # which is how a screenshot in a runbook renumbered every step
-                    # after it back to 1.
-                    blocks.extend([(k, item_pad + t) for k, t in img_blocks])
+                # The picture sits INSIDE this step. Indented to the step's
+                # content column it is a list-item continuation, so the steps below
+                # keep counting; emitted at column 0 it closes the list, which is
+                # how a screenshot in a runbook renumbered every step after it back
+                # to 1.
+                #
+                # `item_pad` is set when the picture shares the step's own paragraph.
+                # A picture in a paragraph of its OWN — which is how a Word document
+                # actually carries a screenshot between a step and its sub-step — has
+                # no `item_pad`, and went out at column 0: measured, `list_items`
+                # {0: 1, 1: 1} became {0: 2} with every token still present, so the
+                # structure gate FAILED a faithful conversion of an ordinary runbook
+                # and the document refused to publish. An open list is an open list
+                # however the picture is anchored.
+                pad = item_pad or (" " * cols[-1][1] if cols else "")
+                if pad:
+                    blocks.extend([(k, pad + t) for k, t in img_blocks])
                 else:
                     blocks.extend(img_blocks)
                     _close_list(lst)          # a column-0 sentinel closes the list
@@ -1689,7 +1927,7 @@ def _docx_notes_section(xml, title):
         return ""
     items = []
     for note in root:
-        t = _esc(_text_of(note, value_locals=("t", "text")))
+        t = _esc_block_start(_text_of(note, value_locals=("t", "text")))
         if t:
             items.append("- " + t)
     if not items:
@@ -1749,35 +1987,29 @@ def docx_markdown(parts, emit_images=False):
             blocks.append(("section", section))
     blocks.extend(_embedded_sections(parts, (
         (_DOCX_DIAGRAM, "Diagrams", _diagram_list_md),
-        (_DOCX_CHART, "Charts", lambda x: _esc(_chart_text(x))))))
+        (_DOCX_CHART, "Charts", lambda x: _esc_block_start(_chart_text(x))))))
     md = _join_blocks(blocks)
     return md + "\n" if md else ""
 
 
-def docx_source_text(parts):
-    # type: (dict) -> str
-    """Exhaustive ground truth for the docx conversion gate: EVERY text run in
-    word/document.xml (+ foot/endnotes, embedded diagram/chart parts), regardless
-    of structure, under the same shared content policy. Independent of the
-    converter's structural walk."""
-    chunks = []
-    for name in ("word/document.xml", "word/footnotes.xml", "word/endnotes.xml",
-                 "word/comments.xml"):
-        root = _root(parts.get(name, ""))
-        if root is not None:
-            chunks.append(_text_of(root, value_locals=("t", "text")))
-    for name in sorted(parts):
-        if _DOCX_DIAGRAM.match(name):
-            chunks.append(" ".join(_diagram_items(parts[name])))
-        elif _DOCX_CHART.match(name):
-            chunks.append(_chart_text(parts[name]))
-    return _WS.sub(" ", " ".join(c for c in chunks if c)).strip()
+# `docx_source_text` used to live here, and its docstring claimed to be
+# "independent of the converter's structural walk". It was not independent of the
+# converter's TEXT reader: it called `_text_of`, which the converter also reaches
+# through `_docx_p_text`, so bugging `_collect_text` under it drove the source token
+# count from 400 to 0 while the gate held at `recall: 1.0, valid: true`. It now lives
+# in `_ooxml_struct` beside the structural facts, built from that module's own
+# walkers — see its docstring for the measurement.
 
 
 # Page furniture at PART granularity: word header/footer parts are the one
 # unambiguous case (see _media.py, which uses the same rule to classify chrome
-# images). pptx footer/slide-number placeholders are placeholder-scoped, not
-# part-scoped, and are therefore NOT claimed here rather than guessed at.
+# images). pptx footer/slide-number placeholders are placeholder-SCOPED — they live
+# inside `ppt/slides/slideN.xml`, a fully converted part — so this reader could
+# never see them, and claiming them here would have been a guess. They are counted
+# instead by `pptx_policy_drops`'s `dropped_slide_chrome`, which reads the role off
+# `p:ph/@type` where the schema puts it. That the drop needed a warning at all is
+# the measured point: both halves of the token gate exclude the same shapes, so 59
+# characters of banner left `n_source` and `recall` exactly where they were.
 _HEADER_FOOTER_PART = re.compile(r"^word/(header|footer)\d*\.xml$")
 
 
@@ -1828,6 +2060,87 @@ _PPTX_CHART = re.compile(r"^ppt/charts/chart(?:Ex)?\d+\.xml$")
 _CHROME_PH = ("sldNum", "dt", "ftr")
 
 
+# A relationship Target is a URI reference relative to the part that HOLDS it, and
+# real producers write every one of these forms. Same shape as `_SHEET_TARGET` on
+# the workbook side, and same reason: a form this misses reads as a dangling id, so
+# the deck silently drops back to filename order.
+_REL_PREFIX = re.compile(r"^(?:/ppt/|ppt/|\.\./|\./)+")
+
+
+def _rel_id(el):
+    # type: (object) -> str
+    """The RELATIONSHIP id of an element that also carries a plain ``id``.
+
+    ``p:sldId`` has both, and they mean different things: ``id`` is the slide's own
+    identifier within the deck, ``r:id`` points at the relationship that names its
+    part. ``_attr`` matches on LOCAL name alone, so it returns whichever comes first
+    in document order — which is the slide id, every time. Reading that one resolved
+    no relationship at all, and the deck fell back to filename order with nothing
+    anywhere reporting a problem: the whole of this fix, silently doing nothing.
+
+    A relationship reference is namespace-qualified by definition (the `r:` prefix
+    binds the relationships namespace), so requiring the qualification is what tells
+    the two attributes apart. The workbook side never met this because ``xl:sheet``
+    spells its other attributes ``name`` and ``sheetId``."""
+    for key, value in el.attrib.items():
+        if key.startswith("{") and key.rsplit("}", 1)[-1] == "id":
+            return value
+    return ""
+
+
+def pptx_slide_order(parts):
+    # type: (dict) -> list
+    """Slide part names in the DECK's own order, from ``ppt/presentation.xml``.
+
+    Returns ``[]`` when the presentation cannot say — no part, an unparseable one,
+    no ``p:sldIdLst``, or nothing in it that resolves — and an empty answer is the
+    honest one: the caller falls back to numeric part order, which is what this lane
+    did for every deck before this existed.
+
+    WHY THIS PART IS READ AT ALL. PowerPoint does not renumber slide parts when a
+    user drags a slide; it rewrites ``p:sldIdLst`` and leaves ``slideN.xml`` where it
+    was. Sorting part names therefore reads the order the slides were CREATED in, not
+    the order they are shown in, and the two disagree for any deck anyone has
+    reordered. Measured on the shipped corpus deck: swapping two entries in
+    ``sldIdLst`` left the markdown byte-identical, because this part was not even in
+    ``OOXML_MAIN_PARTS`` and ``p:sldIdLst`` had no reader anywhere in this module.
+
+    Slide-ness is decided in ONE place — ``_SLIDE_PART``, the same predicate the
+    notes binding and the rels lookup use. A target resolving to anything else is
+    ignored rather than half-supported: ordering a part the rest of the lane does not
+    recognise as a slide would put it in the sequence and nowhere else.
+
+    POSTCONDITION, because a caller depends on it: every name returned matches
+    ``_SLIDE_PART`` and is a key of ``parts``. ``pptx_markdown`` reads the slide's
+    PART number straight back out with ``int(_SLIDE_PART.match(name).group(1))``, and
+    a name that did not match would be an ``AttributeError`` on ``None`` in the middle
+    of a batch rather than a graceful degradation."""
+    root = _root(parts.get("ppt/presentation.xml", ""))
+    if root is None:
+        return []
+    rels = {}
+    rels_root = _root(parts.get("ppt/_rels/presentation.xml.rels", ""))
+    if rels_root is not None:
+        for rel in rels_root:
+            if _local(rel.tag) == "Relationship":
+                rels[rel.attrib.get("Id", "")] = rel.attrib.get("Target", "")
+    order = []
+    seen = set()
+    ids = []  # type: list
+    _find_locals(root, ("sldId",), ids)
+    for el in ids:
+        rid = _rel_id(el)
+        if not rid:
+            continue          # a sldId with no r:id names no part; it cannot be placed
+        name = "ppt/" + _REL_PREFIX.sub("", rels.get(rid, ""))
+        # A part listed twice is a malformed deck; publishing the slide twice would
+        # double every one of its tokens against a ground truth that read it once.
+        if _SLIDE_PART.match(name) and name in parts and name not in seen:
+            seen.add(name)
+            order.append(name)
+    return order
+
+
 def _sp_ph_type(sp):
     # type: (object) -> str
     phs = []  # type: list
@@ -1838,6 +2151,31 @@ def _sp_ph_type(sp):
 def _is_chrome_sp(el):
     # type: (object) -> bool
     return _local(el.tag) == "sp" and _sp_ph_type(el) in _CHROME_PH
+
+
+def _pptx_grid_width(tbl):
+    # type: (object) -> int
+    """How many columns this table DECLARES, from its own ``a:tblGrid``.
+
+    DrawingML spells a merge as ATTRIBUTES on ``a:tc``: the origin carries
+    ``gridSpan``/``rowSpan`` and every position it covers is still present, marked
+    ``hMerge``/``vMerge`` and EMPTY. GFM has no colspan, so rendering the covered
+    cell empty is right — but an always-empty TRAILING column is exactly what
+    ``_gfm_table`` trims as styled-but-valueless, and trimming it loses a column the
+    deck states it has. Measured: a two-column table whose header spanned both
+    published as ONE column, at `recall: 1.0` with well-formed GFM and no warning,
+    because the covered cell carries no token for anything else to miss.
+
+    Only this table's OWN grid counts. A table nested in a cell declares a grid too,
+    and its rows are flattened into the owning cell rather than becoming columns."""
+    n = 0
+    for grid in tbl:
+        if _local(grid.tag) != "tblGrid":
+            continue
+        for col in grid:
+            if _local(col.tag) == "gridCol":
+                n += 1
+    return n
 
 
 def _pptx_table_md(tbl):
@@ -1853,13 +2191,284 @@ def _pptx_table_md(tbl):
             cells.append(_md_cell(_esc(_text_of(tc))))
         if cells:
             rows.append(cells)
-    return _gfm_table(rows)
+    return _gfm_table(rows, min_width=_pptx_grid_width(tbl))
 
 
-def _pptx_txbody_paras(container):
-    # type: (object) -> list
-    """(indent_level, text) per paragraph of every txBody under ``container``
-    (or of ``container`` itself when it IS a txBody)."""
+# DrawingML's run properties. A deck spells these as ATTRIBUTES of `a:rPr` — not as
+# child elements the way WordprocessingML does — which is why the deck lane needs its
+# own reader rather than the docx walk with different tag names.
+_DML_OFF = ("", "0", "false", "off", "none", "nostrike")
+
+
+def _dml_marks(rpr):
+    # type: (object) -> tuple
+    """The emphasis one ``a:rPr`` declares, in `_MARK_ORDER`.
+
+    Every OFF spelling a deck really writes is honoured: `b="0"`, `i="false"` and
+    `strike="noStrike"` are NOT emphasis, and emitting markers for them would invent
+    emphasis the slide does not draw — which fails a faithful conversion exactly as
+    surely as dropping the emphasis it does."""
+    if rpr is None:
+        return ()
+    marks = []
+    for attr, mark in (("b", "strong"), ("i", "em"), ("strike", "strike")):
+        if _attr(rpr, attr).lower() not in _DML_OFF:
+            marks.append(mark)
+    return tuple(m for m in _MARK_ORDER if m in marks)
+
+
+def _dml_link(rpr, links):
+    # type: (object, dict) -> str
+    """The external URL one run's ``a:hlinkClick`` points at, or ``""``.
+
+    An INTERNAL jump — `action="ppaction://hlinksldjump"`, or a relationship whose
+    target is another slide part rather than a URL — resolves to nothing here on
+    purpose. `[text]()` is a dead link in the stored bytes, and a slide-to-slide
+    jump has no address a reader outside the deck could follow. The docx lane makes
+    the same call for an internal `w:hyperlink`: keep the text, drop the address."""
+    if rpr is None or not links:
+        return ""
+    for ch in rpr:
+        if _local(ch.tag) not in ("hlinkClick", "hlinkHover"):
+            continue
+        url = links.get(_attr(ch, "id") or "", "")
+        if url.startswith(("http://", "https://", "mailto:")):
+            return url
+    return ""
+
+
+def _collapse_segments(segments):
+    # type: (list) -> list
+    """`_WS.sub(" ", ...)` + `.strip()` over the JOIN, applied per segment.
+
+    The whitespace collapse has to run across segment boundaries or the new reader
+    stops being byte-identical to the flat `_text_of` walk it replaces: two runs
+    reading ``"clock "`` and ``" tree"`` are one space in the render, not two, and a
+    deck splits text at every property boundary. Collapsing each segment on its own
+    would leave the pair as ``"clock  tree"`` and move eight shipped documents."""
+    out = []  # type: list
+    prev_space = True                       # leading whitespace is stripped
+    for marks, url, text in segments:
+        buf = []  # type: list
+        for ch in text:
+            if ch.isspace():
+                if not prev_space:
+                    buf.append(" ")
+                prev_space = True
+            else:
+                buf.append(ch)
+                prev_space = False
+        out.append((marks, url, "".join(buf)))
+    # Trailing: strip the last space anywhere at the end of the segment list.
+    for i in range(len(out) - 1, -1, -1):
+        marks, url, text = out[i]
+        stripped = text.rstrip()
+        if stripped != text:
+            out[i] = (marks, url, stripped)
+        if stripped:
+            break
+    return [seg for seg in out if seg[2]]
+
+
+def _pptx_para_md(p, links):
+    # type: (object, dict) -> str
+    """One DrawingML paragraph as inline markdown: emphasis, links, escaping.
+
+    The RENDERING is the docx lane's — `_render_runs` already owns CommonMark's
+    flanking rules, the coalescing that stops a word split across runs from emitting
+    ``**Dma****Arbiter**``, and the delimiter cases like ``**~~x~~**``. Only the
+    READER is new, because DrawingML states a run's properties as attributes of
+    `a:rPr` and puts a hyperlink INSIDE them rather than around a span of runs.
+
+    A linked run is rendered to its own markdown first and then emitted as one
+    unmarked segment, so emphasis inside a link survives and the link's brackets are
+    never themselves escaped or re-marked."""
+    segments = []  # type: list
+
+    def walk(el, marks, url):
+        for ch in el:
+            loc = _local(ch.tag)
+            if loc in _SKIP_LOCALS or loc == "pPr":
+                continue
+            if loc in ("r", "fld"):
+                rpr = None
+                for sub in ch:
+                    if _local(sub.tag) == "rPr":
+                        rpr = sub
+                        break
+                walk(ch, _dml_marks(rpr) or marks, _dml_link(rpr, links) or url)
+                continue
+            if loc == "rPr":
+                continue
+            if loc == "t":
+                if ch.text:
+                    segments.append((marks, url, ch.text))
+                continue
+            if loc in _BREAK_LOCALS:
+                segments.append((marks, url, " "))
+                continue
+            walk(ch, marks, url)
+
+    walk(p, (), "")
+    segments = _collapse_segments(segments)
+    if not segments:
+        return ""
+    out = []  # type: list
+    i = 0
+    while i < len(segments):
+        url = segments[i][1]
+        j = i
+        while j < len(segments) and segments[j][1] == url:
+            j += 1
+        run = [(m, _esc(t)) for m, _u, t in segments[i:j]]
+        text = _render_runs(run)
+        out.append("[%s](%s)" % (text.strip(), url) if url else text)
+        i = j
+    return "".join(out).strip()
+
+
+# THE BULLET CASCADE. A DrawingML paragraph inherits its bullet from, nearest first:
+# its own `a:pPr`, the shape's `a:txBody/a:lstStyle/a:lvlNpPr`, the slide LAYOUT's
+# matching placeholder `a:lstStyle`, and the slide MASTER's `p:txStyles/p:bodyStyle`.
+# Reading only the first says "no numbering" over a deck whose entire body list is
+# numbered from the master — which is exactly why `ordered_items` was `unmeasured`
+# rather than zero until this resolved the whole chain.
+_BU_LOCALS = ("buAutoNum", "buChar", "buNone")
+_LEVEL_PR = re.compile(r"^lvl([1-9])pPr$")
+
+
+def _bu_of(ppr):
+    # type: (object) -> object
+    """The bullet declaration a `a:pPr`-shaped element makes, or ``None``.
+
+    Returns the element itself so the caller can read `@type`/`@startAt`; `buNone`
+    is returned like any other, because "explicitly no bullet" is a DECISION that
+    must beat an inherited number rather than read as "said nothing"."""
+    if ppr is None:
+        return None
+    for ch in ppr:
+        if _local(ch.tag) in _BU_LOCALS:
+            return ch
+    return None
+
+
+def _lst_style_levels(el):
+    # type: (object) -> dict
+    """``{level: bullet element}`` from an `a:lstStyle`'s `a:lvlNpPr` children.
+
+    `a:lvl1pPr` is outline level 0 — the file numbers levels from one and every
+    other reader here numbers them from zero, and getting that off by one silently
+    applies level 2's bullet to level 1."""
+    out = {}
+    if el is None:
+        return out
+    for ch in el:
+        m = _LEVEL_PR.match(_local(ch.tag))
+        if not m:
+            continue
+        bu = _bu_of(ch)
+        if bu is not None:
+            out[int(m.group(1)) - 1] = bu
+    return out
+
+
+def _first_local(el, want):
+    # type: (object, str) -> object
+    for sub in el.iter():
+        if _local(sub.tag) == want:
+            return sub
+    return None
+
+
+def _pptx_inherited_bullets(parts, slide_part):
+    # type: (dict, str) -> dict
+    """``{(ph type, ph idx): {level: bullet}}`` for one slide's layout and master.
+
+    Walked slide -> layout -> master by RELATIONSHIP, never by filename: a deck with
+    two masters resolves `slideLayout3` to whichever master ITS rels name, and
+    guessing `slideMaster1` would apply another theme's numbering. The master's
+    `p:bodyStyle` is stored under the key `(None, None)` because it applies to every
+    body placeholder whatever its index."""
+    out = {}
+    layout_rels = _rels_all(parts, _rels_of(slide_part))
+    for target in layout_rels.values():
+        name = _pptx_part(target)
+        if not name.startswith("ppt/slideLayouts/"):
+            continue
+        root = _root(parts.get(name, ""))
+        if root is not None:
+            for sp in root.iter():
+                if _local(sp.tag) != "sp":
+                    continue
+                ph = _first_local(sp, "ph")
+                if ph is None:
+                    continue
+                levels = _lst_style_levels(_first_local(sp, "lstStyle"))
+                if levels:
+                    out[(_attr(ph, "type") or "body", _attr(ph, "idx"))] = levels
+        for mtarget in _rels_all(parts, _rels_of(name)).values():
+            mname = _pptx_part(mtarget)
+            if not mname.startswith("ppt/slideMasters/"):
+                continue
+            mroot = _root(parts.get(mname, ""))
+            if mroot is None:
+                continue
+            for styles in mroot.iter():
+                if _local(styles.tag) != "bodyStyle":
+                    continue
+                levels = _lst_style_levels(styles)
+                if levels:
+                    out.setdefault((None, None), levels)
+    return out
+
+
+def _rels_of(part):
+    # type: (str) -> str
+    """The `.rels` part carrying one part's relationships."""
+    head, _sep, tail = part.rpartition("/")
+    return "%s/_rels/%s.rels" % (head, tail)
+
+
+def _rels_all(parts, rels_part):
+    # type: (dict, str) -> dict
+    """``{Id: Target}`` for EVERY relationship, external or not.
+
+    `_rels_targets` keeps only `TargetMode="External"` because its caller wants
+    hyperlinks; a layout and a master are internal parts, so they need the other
+    half of the same file."""
+    root = _root(parts.get(rels_part, ""))
+    out = {}
+    if root is None:
+        return out
+    for rel in root:
+        if _local(rel.tag) != "Relationship":
+            continue
+        rid, target = rel.attrib.get("Id", ""), rel.attrib.get("Target", "")
+        if rid and target:
+            out[rid] = target
+    return out
+
+
+def _pptx_part(target):
+    # type: (str) -> str
+    """A relationship target as a package part name (`../slideLayouts/x.xml` ->
+    `ppt/slideLayouts/x.xml`); "" for an external one."""
+    if not target or "://" in target:
+        return ""
+    return "ppt/" + _REL_HOPS.sub("", target)
+
+
+_REL_HOPS = re.compile(r"^(?:/?ppt/|\.\./|\./)+")
+
+
+def _pptx_txbody_paras(container, links=None, inherited=None):
+    # type: (object, dict, dict) -> list
+    """(indent_level, inline markdown) per paragraph of every txBody under
+    ``container`` (or of ``container`` itself when it IS a txBody).
+
+    The text arrives already inline-escaped and marked; callers apply only the
+    LINE-LEADING escape, because escaping again would eat the markers this reader
+    just emitted."""
     out = []
     if _local(container.tag) == "txBody":
         bodies = [container]
@@ -1867,24 +2476,130 @@ def _pptx_txbody_paras(container):
         bodies = []  # type: list
         _find_locals(container, ("txBody",), bodies)
     for tx in bodies:
+        levels = _lst_style_levels(_first_local(tx, "lstStyle"))
+        ph = _ph_of(tx, container)
         for p in tx:
             if _local(p.tag) != "p":
                 continue
             lvl = 0
+            own = None
             for pr in p:
                 if _local(pr.tag) == "pPr":
-                    try:
-                        lvl = int(_attr(pr, "lvl") or "0")
-                    except ValueError:
-                        lvl = 0
-            t = _text_of(p)
+                    lvl = _num_val(_attr(pr, "lvl"), 0)
+                    own = _bu_of(pr)
+            t = _pptx_para_md(p, links or {})
             if t:
-                out.append((lvl, t))
+                out.append((lvl, t, _resolve_bullet(own, levels, lvl, ph, inherited)))
     return out
 
 
-def _pptx_shape_blocks(el, blocks, title_holder, img=None):
-    # type: (object, list, list, object) -> None
+def _ph_of(tx, container):
+    # type: (object, object) -> tuple
+    """The placeholder a txBody belongs to, as ``(type, idx)``.
+
+    Read from the SHAPE, not the txBody: `p:ph` lives in `p:nvSpPr/p:nvPr`, a
+    sibling of `p:txBody`, which is why the shape has to be passed in."""
+    el = container if _local(container.tag) != "txBody" else None
+    if el is None:
+        return ("body", None)
+    ph = _first_local(el, "ph")
+    if ph is None:
+        return ("body", None)
+    return (_attr(ph, "type") or "body", _attr(ph, "idx"))
+
+
+def _resolve_bullet(own, shape_levels, lvl, ph, inherited):
+    # type: (object, dict, int, tuple, dict) -> object
+    """This paragraph's effective bullet, nearest declaration first.
+
+    Own `a:pPr` beats the shape's `a:lstStyle`, which beats the layout placeholder's,
+    which beats the master's `p:bodyStyle`. `a:buNone` is a DECLARATION and wins at
+    whatever level states it: a paragraph the slide draws plain must not inherit a
+    number from the master."""
+    if own is not None:
+        return own
+    if lvl in shape_levels:
+        return shape_levels[lvl]
+    if inherited:
+        for key in (ph, (ph[0], None), (None, None)):
+            levels = inherited.get(key)
+            if levels and lvl in levels:
+                return levels[lvl]
+    return None
+
+
+def _list_pad(cols):
+    # type: (list) -> str
+    """The column an open list item's continuation lines sit at, "" when none is."""
+    return " " * cols[-1][1] if cols else ""
+
+
+def _pptx_bullet(blocks, cols, lvl, text, bu=None, nums=None):
+    # type: (list, list, int, str, object, list) -> tuple
+    """One body paragraph as a list-item block, indented to a depth that EXISTS.
+
+    A deck's outline level is a free integer, so ``"  " * lvl`` can indent an item
+    for a nesting nothing opened — and CommonMark nests a child only under a parent
+    that is really there. ``_list_indent`` is the containment rule docx grew in P0.1
+    (as a stack-height clamp, which P9.6r had to replace — see its docstring); the
+    deck path never had it at all, and the three things that cost were all measured:
+
+        levels 0 then 2   an item at markdown depth 1, not 2  (harmless, but the
+                          level is gone and nothing said so)
+        levels 0 then 3   six columns under a content column of two is a LAZY
+                          CONTINUATION: the text is absorbed into the item above,
+                          the item stops existing, every token is still present, so
+                          `recall` reads 1.0 and the bullet is simply gone
+        a slide OPENING at level 2  four columns with no ancestor at all is an
+                          indented CODE BLOCK: the `- ` becomes literal text and
+                          the deck has grown a listing it never wrote
+
+    ``cols`` is the ancestor content-column stack. Any other block ends the list, so
+    it is reset from ``blocks`` itself rather than by every call site remembering
+    to — a call site that forgot would indent onto a list that had already closed."""
+    if not blocks or blocks[-1][0] not in ("li", "img"):
+        del cols[:]
+        if nums is not None:
+            del nums[:]
+    marker = "-"
+    if bu is not None and _local(bu.tag) == "buAutoNum":
+        marker = "%d." % _pptx_step(nums, lvl, _num_val(_attr(bu, "startAt"), 1))
+    elif nums is not None:
+        # An UNORDERED item at this level ends the ordered run it interrupts, so the
+        # next numbered item starts again — which is what a renderer shows and what
+        # `ordered_numbers` exists to make visible.
+        _pptx_step(nums, lvl, 1, reset=True)
+    return ("li", _list_indent(cols, lvl, marker) + marker + " "
+            + _esc_block_start_md(text))
+
+
+def _pptx_step(nums, lvl, start, reset=False):
+    # type: (list, int, int, bool) -> int
+    """The ordinal this item shows, and the bookkeeping the next one needs.
+
+    ``nums`` is one counter per outline LEVEL, held as a list so a deeper level
+    restarts whenever a shallower one advances — the reason the first sub-step of
+    step 2 is 1 and not 3. ``reset`` records that an unordered item interrupted the
+    run at this level without consuming an ordinal."""
+    if nums is None:
+        return start
+    # A deck's outline level is a free integer and a negative one is a level 0 item
+    # to every renderer. Without this, `nums[lvl]` indexes from the END of the list
+    # and a `lvl="-1"` paragraph crashes the whole conversion.
+    lvl = max(0, lvl)
+    while len(nums) <= lvl:
+        nums.append(None)
+    del nums[lvl + 1:]
+    if reset:
+        nums[lvl] = None
+        return start
+    nums[lvl] = start if nums[lvl] is None else nums[lvl] + 1
+    return nums[lvl]
+
+
+def _pptx_shape_blocks(el, blocks, title_holder, img=None, cols=None, links=None,
+                       inherited=None, nums=None):
+    # type: (object, list, list, object, list, dict, dict, list) -> None
     """Walk a slide's shape tree in order: title -> holder, body paragraphs ->
     bullets (PowerPoint's default rendering), a:tbl -> GFM, groups recurse.
     A txBody in any other container (connectors, exotic shapes) still renders,
@@ -1892,6 +2607,8 @@ def _pptx_shape_blocks(el, blocks, title_holder, img=None):
     ``{"rels": {rId: media_part}}`` dict) each ``p:pic`` emits an image sentinel
     where it sits; ``None`` (default) leaves pictures unrendered as before."""
     rels = img["rels"] if img is not None else None
+    if cols is None:
+        cols = []
     for ch in el:
         loc = _local(ch.tag)
         if loc in _SKIP_LOCALS:
@@ -1899,18 +2616,19 @@ def _pptx_shape_blocks(el, blocks, title_holder, img=None):
         if loc == "sp":
             if _is_chrome_sp(ch):
                 continue
-            paras = _pptx_txbody_paras(ch)
+            paras = _pptx_txbody_paras(ch, links, inherited)
             if _sp_ph_type(ch) in ("title", "ctrTitle") and not title_holder and paras:
-                title_holder.append(" ".join(_esc(t) for _, t in paras))
+                title_holder.append(" ".join(t for _, t, _b in paras))
             else:
-                for lvl, t in paras:
-                    blocks.append(("li", "  " * lvl + "- " + _esc(t)))
+                for lvl, t, bu in paras:
+                    blocks.append(_pptx_bullet(blocks, cols, lvl, t, bu, nums))
         elif loc == "graphicFrame":
             tbls = []  # type: list
             _find_locals(ch, ("tbl",), tbls)
             for tbl in tbls:
                 table = _pptx_table_md(tbl)
                 if table:
+                    del cols[:]           # a table really does end the list
                     blocks.append(("table", table))
             # A graphicFrame can also carry an embedded-object / slide-zoom / OLE image
             # (its blip). Charts/tables reference a separate part and carry no inline
@@ -1918,15 +2636,16 @@ def _pptx_shape_blocks(el, blocks, title_holder, img=None):
             # modern PowerPoint puts it in the mc:Choice graphicFrame and leaves a <p:pic>
             # in the mc:Fallback we skip -- catching it here keeps that image from vanishing.
             if rels is not None:
-                _emit_image_blocks(_blip_rids(ch), rels, blocks)
+                _emit_image_blocks(_blip_rids(ch), rels, blocks, _list_pad(cols))
         elif loc == "txBody":
-            for lvl, t in _pptx_txbody_paras(ch):
-                blocks.append(("li", "  " * lvl + "- " + _esc(t)))
+            for lvl, t, bu in _pptx_txbody_paras(ch, links, inherited):
+                blocks.append(_pptx_bullet(blocks, cols, lvl, t, bu, nums))
         elif loc == "pic":
             if rels is not None:
-                _emit_image_blocks(_blip_rids(ch), rels, blocks)
+                _emit_image_blocks(_blip_rids(ch), rels, blocks, _list_pad(cols))
         else:
-            _pptx_shape_blocks(ch, blocks, title_holder, img)
+            _pptx_shape_blocks(ch, blocks, title_holder, img, cols, links,
+                               inherited, nums)
 
 
 def _slide_rel_parts(parts, n):
@@ -1964,32 +2683,68 @@ def _pptx_notes_blocks(parts, name, blocks):
         return
     body = []  # type: list
     title_holder = []  # type: list
-    _pptx_shape_blocks(root, body, title_holder)
+    # A note's links live in the NOTE's own rels part, not the slide's: the two parts
+    # number their rIds independently, so reading the slide's here would resolve a
+    # note's rId2 to whatever the slide happens to call rId2.
+    rels = _rels_targets(parts.get(
+        name.replace("ppt/notesSlides/", "ppt/notesSlides/_rels/") + ".rels", ""))
+    # Notes inherit from the notesMaster, not the slideMaster, and this lane does
+    # not read it: a numbered speaker note is rare and getting it from the wrong
+    # master would be worse than not numbering it. The paragraph's own `a:pPr` still
+    # counts, which is where a note that really is numbered declares it.
+    _pptx_shape_blocks(root, body, title_holder, None, None, rels, None, [])
     if not body and not title_holder:
         return
     blocks.append(("h", "### Speaker notes"))
     if title_holder:
-        blocks.append(("p", title_holder[0]))
+        blocks.append(("p", _esc_lead(title_holder[0])))
     blocks.extend(body)
 
 
 def pptx_markdown(parts, emit_images=False):
     # type: (dict, bool) -> str
-    """Deterministic full markdown of a pptx: one ``## Slide N`` section per slide
-    (numeric order) with title, bulleted body text, GFM tables, SmartArt/chart
-    text, and that slide's speaker notes. Diagram/chart parts never referenced by
-    any slide land in a trailing ``## Embedded objects`` section so nothing is
-    orphaned. With ``emit_images`` each slide picture emits a positional
-    ``<!-- ooxml-image:PART -->`` sentinel (default off = byte-identical legacy)."""
-    slides = []
-    for name in parts:
-        m = _SLIDE_PART.match(name)
-        if m:
-            slides.append((int(m.group(1)), name))
+    """Deterministic full markdown of a pptx: one ``## Slide N`` section per slide,
+    with title, bulleted body text, GFM tables, SmartArt/chart text, and that
+    slide's speaker notes.
+
+    ``N`` is the slide's POSITION IN THE DECK, read from ``p:sldIdLst`` via
+    ``pptx_slide_order`` — not the number in its part name, which PowerPoint leaves
+    alone when a slide is dragged. A deck that cannot say (no presentation part, or
+    nothing in it that resolves) falls back to numeric part order, and ``N`` still
+    counts position so the heading means one thing either way.
+
+    A slide part the deck never lists has no position and may not claim one: it
+    publishes after the ordered slides under ``## Slide (unlisted): slideN``,
+    following the ``## Sheet (unlinked): NAME`` precedent on the workbook side.
+    Dropping it instead would take its words out of the markdown while the ground
+    truth still counted them, which fails token recall outright.
+
+    Diagram/chart parts never referenced by any slide land in a trailing
+    ``## Embedded objects`` section so nothing is orphaned. With ``emit_images``
+    each slide picture emits a positional ``<!-- ooxml-image:PART -->`` sentinel
+    (default off = byte-identical legacy)."""
+    numbered = sorted((int(m.group(1)), name) for name, m
+                      in ((x, _SLIDE_PART.match(x)) for x in parts) if m)
+    ordered = pptx_slide_order(parts)
+    if ordered:
+        listed = set(ordered)
+        # (position in the deck, part number, part name). The two numbers are
+        # deliberately separate: the heading counts POSITION, while every satellite
+        # part — this slide's rels, its notes fallback — is addressed by PART number.
+        # Conflating them attaches slide 5's speaker notes to whatever sits fifth.
+        sequence = [(pos, int(_SLIDE_PART.match(nm).group(1)), nm)
+                    for pos, nm in enumerate(ordered, start=1)]
+        # A part the deck never lists: a deleted-but-not-purged slide. It has no
+        # position, so it may not claim one — but its words are in the package and
+        # recall counts them, so dropping it would fail the whole document.
+        sequence += [(None, pn, nm) for pn, nm in numbered if nm not in listed]
+    else:
+        sequence = [(pos, pn, nm)
+                    for pos, (pn, nm) in enumerate(numbered, start=1)]
     blocks = []  # type: list
     used = set()
     used_notes = set()
-    for n, name in sorted(slides):
+    for pos, n, name in sequence:
         root = _root(parts.get(name, ""))
         embedded, rel_notes = _slide_rel_parts(parts, n)
         if root is not None:
@@ -1999,10 +2754,14 @@ def pptx_markdown(parts, emit_images=False):
             if emit_images:
                 img = {"rels": _image_rels(
                     parts.get("ppt/slides/_rels/slide%d.xml.rels" % n, ""), name)}
-            _pptx_shape_blocks(root, body, title_holder, img)
-            heading = "## Slide %d" % n
+            _pptx_shape_blocks(
+                root, body, title_holder, img, None,
+                _rels_targets(parts.get("ppt/slides/_rels/slide%d.xml.rels" % n, "")),
+                _pptx_inherited_bullets(parts, name), [])
+            heading = ("## Slide %d" % pos if pos is not None
+                       else "## Slide (unlisted): slide%d" % n)
             if title_holder:
-                heading += " — " + title_holder[0]
+                heading += " — " + _esc_heading(title_holder[0])
             blocks.append(("h", heading))
             blocks.extend(body)
             for ref in embedded:
@@ -2049,40 +2808,27 @@ def pptx_markdown(parts, emit_images=False):
             comment_items.extend(_comments_items(parts[name]))
     if comment_items:
         blocks.append(("h", "## Comments"))
-        blocks.append(("p", "\n".join("- " + _esc(i) for i in comment_items)))
+        blocks.append(("p", "\n".join("- " + _esc_block_start(i)
+                                      for i in comment_items)))
     md = _join_blocks(blocks)
     return md + "\n" if md else ""
 
 
-def pptx_source_text(parts):
-    # type: (dict) -> str
-    """Exhaustive pptx ground truth: every text run on every slide (chrome
-    placeholders excluded, same policy as the converter), all diagram/chart
-    parts, and the speaker notes."""
-    chunks = []
-    slides = sorted((int(_SLIDE_PART.match(n).group(1)), n)
-                    for n in parts if _SLIDE_PART.match(n))
-    for _, name in slides:
-        root = _root(parts.get(name, ""))
-        if root is not None:
-            chunks.append(_text_of(root, skip=_is_chrome_sp))
-    for name in sorted(parts):
-        if _PPTX_DIAGRAM.match(name):
-            chunks.append(" ".join(_diagram_items(parts[name])))
-        elif _PPTX_CHART.match(name):
-            chunks.append(_chart_text(parts[name]))
-        elif _NOTES_PART.match(name):
-            root = _root(parts[name])
-            if root is not None:
-                chunks.append(_text_of(root, skip=_is_chrome_sp))
-        elif _PPTX_COMMENTS.match(name):
-            chunks.append(" ".join(_comments_items(parts[name])))
-    return _WS.sub(" ", " ".join(c for c in chunks if c)).strip()
+# `pptx_source_text` used to live here, and calling this module's helpers is exactly
+# what made it a second opinion in name only: bugging `_sp_ph_type` took a deck's
+# source token count from 108 to 20 while the gate held at a clean `recall: 1.0`,
+# because the converter and the "independent" ground truth were the same reader
+# twice. It now lives in `_pptx_struct` with its own traversal — see that module's
+# header for the measurement.
 
 
 # --------------------------------------------------------------------------- xlsx
 
-_CELL_REF = re.compile(r"^([A-Z]+)\d+$")
+# `\$?` because a producer may write `$C$2` into a cell's own `r`, and the ref
+# still says which column the value is in. Without it the ref was unparseable,
+# `_sheet_rows` fell back to append order, and the value published under the
+# WRONG column heading — silently, at token recall 1.0.
+_CELL_REF = re.compile(r"^\$?([A-Z]+)\$?\d+$")
 # Sheet part basenames are a CONVENTION, not normative — accept any name under
 # worksheets/ and every spec-legal relative-target form (xl/, /xl/, ../, ./).
 _SHEET_TARGET = re.compile(r"^(?:/xl/|xl/|\.\./|\./)*(worksheets/[^/]+\.xml)$")
@@ -2175,13 +2921,106 @@ def _workbook_sheets(parts):
     return out
 
 
-def _sheet_rows(sheet_xml, shared):
-    # type: (str, list) -> list
-    """All non-empty rows of a worksheet as positioned cell-text lists."""
+def _cell_fonts(styles_xml):
+    # type: (str) -> dict
+    """``{style index: marks tuple}`` for every cell style whose font is emphasised.
+
+    A workbook states emphasis per CELL, not per run: `@s` indexes `cellXfs`, whose
+    `@fontId` indexes `fonts`. All three are POSITIONAL, which is why this resolves
+    the chain rather than reading the font element nearest the cell.
+
+    The marks are kept in `_MARK_ORDER` so `_render_runs` sees the same canonical
+    shape it gets from the other two formats and the output is deterministic."""
+    root = _root(styles_xml)
+    if root is None:
+        return {}
+    fonts = []  # type: list
+    for el in root.iter():
+        if _local(el.tag) != "font":
+            continue
+        marks = set()
+        for ch in el:
+            loc = _local(ch.tag)
+            if loc in ("b", "i", "strike") and _attr(ch, "val") not in _OFF:
+                marks.add({"b": "strong", "i": "em", "strike": "strike"}[loc])
+        fonts.append(tuple(m for m in _MARK_ORDER if m in marks))
+    xfs = None
+    for el in root.iter():
+        if _local(el.tag) == "cellXfs":
+            xfs = el
+            break
+    out = {}
+    if xfs is None:
+        return out
+    index = 0
+    for xf in xfs:
+        if _local(xf.tag) != "xf":
+            continue
+        font_id = _num_val(_attr(xf, "fontId"), 0)
+        if 0 <= font_id < len(fonts) and fonts[font_id]:
+            out[str(index)] = fonts[font_id]
+        index += 1
+    return out
+
+
+def _sheet_links(sheet_xml, rels):
+    # type: (str, dict) -> dict
+    """``{cell ref: external url}`` from the worksheet's ``<hyperlinks>`` block.
+
+    A workbook attaches a link to the CELL, keyed by `@ref`, rather than to a run.
+    Only an external target resolves: an internal `location` is a jump within the
+    same workbook, which has no address a reader outside it could follow, so the
+    render keeps the text and `dropped_cell_links` reports the loss."""
+    root = _root(sheet_xml)
+    out = {}
+    if root is None:
+        return out
+    for el in root.iter():
+        if _local(el.tag) != "hyperlink":
+            continue
+        ref = _attr(el, "ref")
+        url = rels.get(_attr(el, "id") or "", "")
+        if ref and url.startswith(("http://", "https://", "mailto:")):
+            out[ref.split(":")[0]] = url
+    return out
+
+
+def _cell_md(text, marks, url):
+    # type: (str, tuple, str) -> str
+    """One cell's text as inline markdown: escaped, marked, linked.
+
+    An EMPTY cell gains nothing. `****` would be four literal asterisks the workbook
+    never wrote, and a row of them is a GFM delimiter row waiting to happen — the
+    exact shape `_esc_block_start`'s unconditional delimiter guard exists for."""
+    body = _md_cell(_esc(text))
+    if not body:
+        return body
+    if marks:
+        body = _render_runs([(marks, body)])
+    return "[%s](%s)" % (body, url) if url else body
+
+
+def _sheet_rows(sheet_xml, shared, fonts=None, links=None):
+    # type: (str, list, dict, dict) -> list
+    """The worksheet's REGIONS: a list of row-blocks, each a list of positioned
+    cell-text lists.
+
+    A BLANK ROW SEPARATES REGIONS, which is how a spreadsheet says "these are two
+    different tables" and how Excel itself reads a sheet — its own current-region
+    selection stops at one. Dropping the blank row and running the rows together
+    produced a single fused table in which the SECOND region's header line was
+    published as a data row of the first: a power budget whose rows read
+    ``| Corner | Margin |`` and ``| SSG 0.72V 125C | 0.94 |``, so a reader saw a
+    rail drawing 0.94 mW. Both gates passed it — the words were all present and the
+    ground truth dropped the same blank row, so the error cancelled.
+
+    Leading and trailing blanks open no region, and a run of several blank rows is
+    one separator rather than several."""
     root = _root(sheet_xml)
     if root is None:
         return []
-    rows = []
+    blocks = []  # type: list
+    current = []  # type: list
     row_els = []  # type: list
     _find_locals(root, ("row",), row_els)
     for row in row_els:
@@ -2194,10 +3033,18 @@ def _sheet_rows(sheet_xml, shared):
                 col = len(cells)
             while len(cells) <= col:
                 cells.append("")
-            cells[col] = _md_cell(_esc(_cell_value(c, shared)))
+            ref = _attr(c, "r")
+            cells[col] = _cell_md(_cell_value(c, shared),
+                                  (fonts or {}).get(_attr(c, "s"), ()),
+                                  (links or {}).get(ref, ""))
         if any(cells):
-            rows.append(cells)
-    return rows
+            current.append(cells)
+        elif current:
+            blocks.append(current)
+            current = []
+    if current:
+        blocks.append(current)
+    return blocks
 
 
 def xlsx_markdown(parts, emit_images=False):
@@ -2210,31 +3057,46 @@ def xlsx_markdown(parts, emit_images=False):
     Spreadsheet pictures float over the grid rather than sitting in a cell, so they
     are grouped after the tables rather than wedged into a pipe row."""
     shared = _shared_strings(parts.get("xl/sharedStrings.xml", ""))
+    fonts = _cell_fonts(parts.get("xl/styles.xml", ""))
     blocks = []  # type: list
     linked = set()
+
+    def sheet_links(part):
+        """A sheet's links come from the SHEET's own rels part: worksheets number
+        their rIds independently, so the workbook's rels would resolve rId1 to
+        whatever the workbook happens to call rId1."""
+        return _sheet_links(parts.get(part, ""), _rels_targets(parts.get(
+            part.replace("xl/worksheets/", "xl/worksheets/_rels/") + ".rels", "")))
+
     for name, part in _workbook_sheets(parts):
-        blocks.append(("h", "## " + _esc(name)))
+        blocks.append(("h", "## " + _esc_heading(_esc(name))))
         if part is None:
             continue
         linked.add(part)
-        table = _gfm_table(_sheet_rows(parts.get(part, ""), shared))
-        if table:
-            blocks.append(("table", table))
+        for region in _sheet_rows(parts.get(part, ""), shared, fonts,
+                                  sheet_links(part)):
+            table = _gfm_table(region)
+            if table:
+                blocks.append(("table", table))
     # Worksheet parts the workbook/rels resolution did NOT reach still render —
     # a bad rels target can cost naming, never cell content.
     for name in sorted(parts):
         if _XLSX_SHEET_PART.match(name) and name not in linked:
-            table = _gfm_table(_sheet_rows(parts[name], shared))
-            if table:
+            tables = [t for t in (_gfm_table(r) for r in _sheet_rows(
+                parts[name], shared, fonts, sheet_links(name))) if t]
+            if tables:
                 blocks.append(("h", "## Sheet (unlinked): "
                                + _esc(name.rsplit("/", 1)[-1][:-4])))
-                blocks.append(("table", table))
+                for table in tables:
+                    blocks.append(("table", table))
     blocks.extend(_embedded_sections(parts, (
         (_XLSX_DRAWING, "Text boxes",
-         lambda x: _esc(_text_of(_root(x))) if _root(x) is not None else ""),
+         lambda x: (_esc_block_start(_text_of(_root(x)))
+                    if _root(x) is not None else "")),
         (_XLSX_COMMENTS, "Comments",
-         lambda x: "\n".join("- " + _esc(i) for i in _comments_items(x))),
-        (_XLSX_CHART, "Charts", lambda x: _esc(_chart_text(x))))))
+         lambda x: "\n".join("- " + _esc_block_start(i)
+                             for i in _comments_items(x))),
+        (_XLSX_CHART, "Charts", lambda x: _esc_block_start(_chart_text(x))))))
     if emit_images:
         img_blocks = []  # type: list
         for name in sorted(parts):
@@ -2253,42 +3115,13 @@ def xlsx_markdown(parts, emit_images=False):
     return md + "\n" if md else ""
 
 
-def xlsx_source_text(parts):
-    # type: (dict) -> str
-    """Exhaustive xlsx ground truth: every sheet name and every cell value (typed
-    resolution, so shared-string INDICES are never counted as content), plus
-    drawing text boxes, comments, and chart text."""
-    shared = _shared_strings(parts.get("xl/sharedStrings.xml", ""))
-    chunks = []
-    for name, _ in _workbook_sheets(parts):
-        chunks.append(name)
-    # Cell values come from EVERY worksheet part directly — deliberately NOT via
-    # the workbook/rels resolution the converter uses, so a resolution bug on
-    # that side shows up as recall < 1.0 instead of zeroing both sides.
-    for name in sorted(parts):
-        if not _XLSX_SHEET_PART.match(name):
-            continue
-        root = _root(parts[name])
-        if root is None:
-            continue
-        cells = []  # type: list
-        _find_locals(root, ("c",), cells)
-        for c in cells:
-            v = _cell_value(c, shared)
-            if v:
-                chunks.append(v)
-    for name in sorted(parts):
-        if _XLSX_DRAWING.match(name):
-            root = _root(parts[name])
-            if root is not None:
-                chunks.append(_text_of(root))
-        elif _XLSX_COMMENTS.match(name):
-            # per-comment items, matching the converter's bullet segmentation —
-            # a raw whole-part read would glue adjacent comments verbatim
-            chunks.append(" ".join(_comments_items(parts[name])))
-        elif _XLSX_CHART.match(name):
-            chunks.append(_chart_text(parts[name]))
-    return _WS.sub(" ", " ".join(c for c in chunks if c)).strip()
+# `xlsx_source_text` used to live here and call `_cell_value` — the SAME function
+# `xlsx_markdown` asks what a cell says. Its own comment above the sheet loop boasted
+# that reading worksheet parts directly kept a rels bug from "zeroing both sides",
+# which was true about GEOMETRY and false about VALUES: bugging `_cell_value` took
+# the workbook's source token count from 107 to 73 with the gate still reporting
+# `recall: 1.0`. It now lives in `_xlsx_struct` with its own typed resolver — see
+# that module's header for the measurement.
 
 
 # ----------------------------------------------------------------------- dispatch
@@ -2321,7 +3154,7 @@ def _esc_fig(text):
     list/heading/quote markers, exactly like body paragraphs. A diagram callout such
     as ``1. Configure`` would otherwise render as an ordered-list item whose ``1``
     marker a GFM stripper swallows — dropping a real token and breaking recall."""
-    return "\n".join(_esc_lead(_esc(ln)) for ln in text.split("\n"))
+    return "\n".join(_esc_block_start(ln) for ln in text.split("\n"))
 
 
 def _svg_parts_text(parts):

@@ -509,6 +509,10 @@ def build_one(row, soffice, out_root, run_id, token_count=None, token_model=None
                           "routed by source extension", {"ext": row.get("ext", "")}),
                  decision("tokenizer_selected", token_model or "char-estimate/4",
                           "resolved from --tokenizer / config.settings")]
+    # Choices the conversion layer took and only it can see (which order a deck's
+    # slides were published in). They are built there because that is where `parts`
+    # lives, and appended here because this is the stage that owns `decisions[]`.
+    decisions.extend(info.get("decisions") or ())
     if row.get("lane") == oc.ROUTE_LIBREOFFICE:
         decisions.append(decision("preconvert", "soffice", "legacy format converted "
                                   "to its OOXML sibling first",

@@ -1,7 +1,7 @@
 """
 title: Converter-blind structural ground truth for OOXML
 layer: backend
-public_api: no
+public_api: yes
 summary: Reads the same structural facts as backend.validate.md_structure, but out of the source XML by flat query rather than by the converter's recursive descent — the second opinion the fidelity gate compares against.
 """
 # WHY A SEPARATE FILE
@@ -13,10 +13,11 @@ summary: Reads the same structural facts as backend.validate.md_structure, but o
 # not being the converter.
 #
 # It lives in its own module so a helper cannot be shared by accident. The only
-# things it borrows from _ooxml_md are the LEAF primitives (_local, _attr, _root)
-# and the declared content POLICIES (_SKIP_LOCALS and friends) that must apply to
-# both sides or the comparison is not apple-to-apple. Every traversal here is its
-# own.
+# things it borrows are the LEAF primitives (_local, _attr, _root) and the declared
+# content POLICIES (_SKIP_LOCALS and friends) that must apply to both sides or the
+# comparison is not apple-to-apple — and it takes them from `_ooxml_leaf`, not from
+# the converter, so what is shared is a reviewed contract rather than whatever
+# happened to be importable. Every traversal here is its own.
 #
 # The mechanism is deliberately different, not merely a retyped copy: the converter
 # dispatches recursively child by child, while this walks a FLAT element.iter()
@@ -56,10 +57,36 @@ summary: Reads the same structural facts as backend.validate.md_structure, but o
 # from the styles part, and where the converter still disagrees, the gate says so.
 import re
 
-from ._ooxml_md import _attr, _local, _root, _SKIP_LOCALS
+from ._ooxml_leaf import _local, _root, _WS, _SKIP_LOCALS
+# Mechanism shared with the OTHER TWO SOURCE-SIDE TRUTHS and with nothing else — see
+# that module's header for why three readers on one side of a comparison may share
+# and the converter may not. `_add_heading` writes `block_sequence` directly, which
+# is what `_add_block` does, so the two agree by construction rather than by care.
+from ._struct_common import _add_heading, _ancestry, _parent_map, _words
+# Per-format drop counters. `_xlsx_struct` imports nothing from here, so
+# there is no cycle; the dependency runs hub -> format, never back.
+from ._xlsx_struct import xlsx_policy_drops
+from ._pptx_struct import pptx_policy_drops
 
-__all__ = ["docx_source_structure", "policy_drops", "merged_cell_spans",
-           "tracked_changes", "embedded_objects"]
+
+def _attr(el, local):
+    # type: (object, str) -> str
+    """Attribute value by LOCAL attribute name (``r:id``/``w:val`` -> ``id``/``val``).
+
+    Written out in every reader rather than shared, and the six lines are the point.
+    An attribute read is where a cell's ADDRESS comes from, so a shared one is
+    called on both sides of the comparison: measured, a shared `_attr` that lost
+    every `@r` shifted every value into a different column while `token_recall`,
+    `n_source_tokens`, `compared` and the delta list all stayed exactly as they
+    were. Nothing in the report moved. Four copies of five lines buys the one thing
+    the second gate exists for."""
+    for key, value in el.attrib.items():
+        if key.rsplit("}", 1)[-1] == local:
+            return value
+    return ""
+
+__all__ = ["docx_source_text", "docx_source_structure", "policy_drops",
+           "merged_cell_spans", "tracked_changes", "embedded_objects"]
 
 # Word's canonical heading names. Written out again on purpose — a shared regex
 # would mean a bug in it lands identically on both sides and cancels out.
@@ -95,39 +122,12 @@ def _norm(name):
     return (name or "").strip().lower().replace("-", " ")
 
 
-def _parents(root):
-    # type: (object) -> dict
-    """``{id(child): parent}`` for the whole tree.
-
-    ElementTree has no parent pointers, so "is this paragraph inside a table
-    cell?" needs one. Building it costs a single pass and is what lets every fact
-    below be a flat filter instead of a recursive descent."""
-    pmap = {}
-    stack = [root]
-    while stack:
-        el = stack.pop()
-        for ch in el:
-            pmap[id(ch)] = el
-            stack.append(ch)
-    return pmap
-
-
-def _ancestors(el, pmap):
-    # type: (object, dict) -> list
-    out = []
-    cur = pmap.get(id(el))
-    while cur is not None:
-        out.append(cur)
-        cur = pmap.get(id(cur))
-    return out
-
-
 def _skipped(el, pmap):
     # type: (object, dict) -> bool
     """Inside an mc:Fallback / rPh / w:moveFrom subtree the converter never enters."""
     if _local(el.tag) in _SKIP_LOCALS:
         return True
-    for anc in _ancestors(el, pmap):
+    for anc in _ancestry(el, pmap):
         if _local(anc.tag) in _SKIP_LOCALS:
             return True
     return False
@@ -706,7 +706,7 @@ def _run_block(el, pmap):
     ``el`` itself is never the answer, so passing a w:hyperlink returns the block it
     SITS IN, which is where its own one-slot break belongs."""
     key, para = None, None
-    for anc in _ancestors(el, pmap):
+    for anc in _ancestry(el, pmap):
         loc = _local(anc.tag)
         if key is None and loc in ("p", "hyperlink"):
             key = id(anc)
@@ -802,34 +802,29 @@ def _count_marked_spans(container, styles, out, pmap):
 # (`[a-z0-9]+` after lowercasing). Reducing to tokens is what makes the two sides
 # comparable at all: one has escapes, emphasis markers and pipes, the other has raw
 # text, and neither difference is content.
-_WORDS = re.compile(r"[a-z0-9]+")
+def _add_block(out, kind, key):
+    # type: (dict, str, object) -> None
+    """Record that a graded block begins HERE, in document order.
+
+    Every other fact is a total or a per-kind list, and none of them can see a block
+    that moved between sections: relocate a table from under one heading to under
+    another and the histogram, the geometry, the cell contents and the token multiset
+    are all identical. Only the ORDER changed, so only an ordered fact can say so.
+
+    It records nothing the vector does not already state — six kinds, all of them
+    already counted somewhere else — so it cannot disagree with the markdown about a
+    construct neither side models. A prose paragraph is deliberately absent: this
+    module has no opinion on where paragraphs land, and inventing one would fail
+    every faithful conversion that emits an image sentinel or a lifted text box."""
+    out["block_sequence"].append((kind, key))
 
 
-def _words(text):
-    # type: (str) -> tuple
-    return tuple(_WORDS.findall((text or "").lower()))
-
-
-def _add_heading(out, level, text):
-    # type: (dict, int, str) -> None
-    """Record one heading the rendered document shows — in BOTH heading facts.
-
-    ``headings`` is a level histogram and ``heading_path`` is the ordered,
-    text-bearing view of the same events. They are written together, in one place,
-    because the two only mean anything side by side: a histogram cannot see two
-    section titles exchanged (the levels are unchanged, the token multiset is
-    unchanged, and prose ends up reattached to the wrong chapter with every gate
-    green), and a path that drifted out of step with the histogram would be a second
-    opinion about a different document.
-
-    ``min(level, 6)`` because markdown stops at ``######``: a w:outlineLvl of 8 is an
-    h6 in the render, so it has to be an h6 here too or every deep outline would fail.
-    The title is reduced to the same ``[a-z0-9]+`` token notion the cell and list
-    facts use — escaping, emphasis markers and a hyperlink's URL are markup, not
-    content, and comparing them would fail faithful conversions."""
-    level = min(level, 6)
-    out["headings"][level] = out["headings"].get(level, 0) + 1
-    out["heading_path"].append((level, _words(text)))
+def _add_blocks(out, kind, key, count):
+    # type: (dict, str, object, int) -> None
+    """``count`` identical blocks in a row — the synthetic sections append their
+    bullets in bulk, and the sequence needs one entry each."""
+    for _ in range(count):
+        out["block_sequence"].append((kind, key))
 
 
 def _table_shape(tbl, pmap):
@@ -916,6 +911,7 @@ def _section_facts(xml, title, out):
         return
     _add_heading(out, 2, title)
     out["list_items"][0] = out["list_items"].get(0, 0) + len(items)
+    _add_blocks(out, "li", 0, len(items))
     out["bullet_items"] += len(items)
     out["list_item_words"].extend(_words(t) for t in items)
 
@@ -1000,6 +996,7 @@ def _embedded_facts(parts, out):
     if points:
         _add_heading(out, 2, "Diagrams")
         out["list_items"][0] = out["list_items"].get(0, 0) + len(points)
+        _add_blocks(out, "li", 0, len(points))
         out["bullet_items"] += len(points)
         out["list_item_words"].extend(_words(t) for t in points)
     # Charts before Figures, because that is the order they appear in: the chart
@@ -1022,19 +1019,79 @@ def _embedded_facts(parts, out):
 # functions measure, from the source, what the converter is known to flatten or
 # discard — so every one of them can be NAMED with a count.
 
-_SPAN_LOCALS = ("gridSpan", "vMerge", "hMerge", "rowSpan")
 _BODY_PART = re.compile(
     r"^(word/document\.xml|ppt/slides/slide\d+\.xml|xl/worksheets/[^/]+\.xml)$")
+_WML_BODY = re.compile(r"^word/document\.xml$")
+_DML_BODY = re.compile(r"^ppt/slides/slide\d+\.xml$")
 _MERGE_CELL = re.compile(r"^xl/worksheets/[^/]+\.xml$")
+# ``A1:C2``, tolerating the ``$`` absolute markers some producers write into a ref.
+_MERGE_REF = re.compile(r"^\$?([A-Z]+)\$?(\d+):\$?([A-Z]+)\$?(\d+)$")
+
+
+def _col_no(letters):
+    # type: (str) -> int
+    """``A`` -> 0, ``Z`` -> 25, ``AA`` -> 26.
+
+    Base-26 written out here rather than imported from the converter's
+    ``_col_index``: a ground truth that borrows the converter's column arithmetic
+    cannot disagree with it, and disagreeing is the only thing it is for."""
+    n = 0
+    for ch in letters:
+        n = n * 26 + (ord(ch) - 64)
+    return n - 1
+
+
+def _ref_span(ref):
+    # type: (str) -> tuple
+    """``(horizontal, vertical)`` cells absorbed by one ``A1:C2`` merge range.
+
+    A ``w x h`` merged rectangle shows one value where the grid held ``w*h``
+    addressable cells, so ``w*h - 1`` of them are absorbed. They are split the way
+    the WordprocessingML branch splits its own: each of the ``h`` rows loses
+    ``w-1`` cells sideways, and each of the ``h-1`` continuation rows loses its
+    anchor column downwards. ``(w-1)*h + (h-1) == w*h - 1``, so the two directions
+    PARTITION the loss — nothing counted twice, nothing missed."""
+    m = _MERGE_REF.match((ref or "").strip().upper())
+    if not m:
+        return (0, 0)
+    c1, r1 = _col_no(m.group(1)), int(m.group(2))
+    c2, r2 = _col_no(m.group(3)), int(m.group(4))
+    if c2 < c1 or r2 < r1:
+        return (0, 0)
+    return ((c2 - c1) * (r2 - r1 + 1), r2 - r1)
+
+
+def _dml_merged(tc, name):
+    # type: (object, str) -> bool
+    """Is this DrawingML merge ATTRIBUTE set on the cell?"""
+    val = _attr(tc, name)
+    return bool(val) and val not in _OFF
 
 
 def merged_cell_spans(parts):
     # type: (dict) -> dict
-    """``{"horizontal": n, "vertical": n}`` merged cells across every body part.
+    """``{"horizontal": n, "vertical": n}`` cells ABSORBED by merging.
 
-    GFM has no colspan or rowspan, so every one of these is flattened. Counting
-    them from the SOURCE means the number is right whether or not the converter
-    for that format even looks at the attribute — pptx and xlsx currently do not."""
+    GFM has no colspan or rowspan, so every merged region is flattened into plain
+    cells. The number counts cells absorbed — grid positions that stopped being
+    addressable — not merge operations, because the absorbed cell is what a reader
+    loses, and it is what this function has always counted for Word (one
+    ``w:gridSpan w:val="3"`` is one merge and two absorbed cells).
+
+    Counting from the SOURCE is what makes the number right whether or not the
+    converter for that format reads the attribute at all. That promise was made
+    here and not kept, because each markup family spells a merge somewhere
+    different and only one spelling was ever read:
+
+      * WordprocessingML puts it in CHILD ELEMENTS of ``w:tcPr``. Read all along.
+      * DrawingML (pptx) puts it in ATTRIBUTES on ``a:tc``. The element scan matched
+        none of them, so every deck measured ``0 and 0`` — a confident zero over
+        real merges, in the one function whose docstring promised otherwise.
+      * SpreadsheetML puts it in a ``<mergeCell ref="A1:C1"/>`` RANGE, and the ref
+        is the only place the DIRECTION is written. Adding one per element to
+        ``horizontal`` made every workbook merge horizontal by construction: the
+        shipped corpus published "2 horizontal and 0 vertical" for a sheet holding
+        one horizontal (``A1:C1``) and one vertical (``A3:A4``) merge."""
     out = {"horizontal": 0, "vertical": 0}
     for name in sorted(parts):
         if not _BODY_PART.match(name):
@@ -1042,26 +1099,46 @@ def merged_cell_spans(parts):
         root = _root(parts[name])
         if root is None:
             continue
-        for el in root.iter():
-            loc = _local(el.tag)
-            if loc == "gridSpan":
-                try:
-                    out["horizontal"] += max(0, int(_attr(el, "val")) - 1)
-                except ValueError:
-                    pass
-            elif loc == "hMerge" and _attr(el, "val") not in _OFF:
-                out["horizontal"] += 1
-            elif loc == "vMerge" and _attr(el, "val") != "restart":
-                out["vertical"] += 1
-            elif loc == "rowSpan":
-                try:
-                    out["vertical"] += max(0, int(_attr(el, "val")) - 1)
-                except ValueError:
-                    pass
-        if _MERGE_CELL.match(name):
+        if _WML_BODY.match(name):
             for el in root.iter():
-                if _local(el.tag) == "mergeCell":
+                loc = _local(el.tag)
+                if loc == "gridSpan":
+                    try:
+                        out["horizontal"] += max(0, int(_attr(el, "val")) - 1)
+                    except ValueError:
+                        pass
+                elif loc == "hMerge" and _attr(el, "val") not in _OFF:
                     out["horizontal"] += 1
+                elif loc == "vMerge" and _attr(el, "val") != "restart":
+                    out["vertical"] += 1
+                elif loc == "rowSpan":
+                    try:
+                        out["vertical"] += max(0, int(_attr(el, "val")) - 1)
+                    except ValueError:
+                        pass
+        elif _DML_BODY.match(name):
+            # PowerPoint writes the FULL grid: the anchor cell carries gridSpan /
+            # rowSpan and every position it covers is STILL PRESENT as an a:tc
+            # carrying hMerge / vMerge. Reading both views would double every merge,
+            # so the covered cells are counted and the anchor's own span attributes
+            # deliberately are not — a covered cell IS the absorbed cell. A cell
+            # carrying both flags is the corner of a rectangle and belongs to the
+            # horizontal leg, which is what keeps this split identical to the
+            # spreadsheet one below.
+            for el in root.iter():
+                if _local(el.tag) != "tc":
+                    continue
+                if _dml_merged(el, "hMerge"):
+                    out["horizontal"] += 1
+                elif _dml_merged(el, "vMerge"):
+                    out["vertical"] += 1
+        elif _MERGE_CELL.match(name):
+            for el in root.iter():
+                if _local(el.tag) != "mergeCell":
+                    continue
+                h, v = _ref_span(_attr(el, "ref"))
+                out["horizontal"] += h
+                out["vertical"] += v
     return out
 
 
@@ -1085,7 +1162,7 @@ def _numbered_paragraphs(parts):
         return None, []
     styles = _style_map(parts.get("word/styles.xml", ""))
     numbering = _num_formats(parts.get("word/numbering.xml", ""))
-    pmap = _parents(root)
+    pmap = _parent_map(root)
     found = []
     for p in root.iter():
         if _local(p.tag) != "p" or _skipped(p, pmap):
@@ -1133,12 +1210,12 @@ def anchored_text_boxes(parts):
     numbered = set(id(p) for _fmt, p in paragraphs)
     if root is None or not numbered:
         return 0
-    pmap = _parents(root)
+    pmap = _parent_map(root)
     total = 0
     for el in root.iter():
         if _local(el.tag) != "txbxContent" or _skipped(el, pmap):
             continue
-        for anc in _ancestors(el, pmap):
+        for anc in _ancestry(el, pmap):
             if _local(anc.tag) == "p":
                 if id(anc) in numbered:
                     total += 1
@@ -1187,6 +1264,88 @@ def embedded_objects(names):
     return sorted(n for n in (names or ()) if _EMBEDDING.match(n))
 
 
+def _chart_datum_text(xml):
+    # type: (str) -> str
+    """Every label and every cached datum a chart shows.
+
+    A cached ``c:v`` is padded on both sides because, unlike a run, it is never
+    split across siblings: two adjacent numbers with nothing between them would
+    fuse into a token that is in no document."""
+    root = _root(xml)
+    if root is None:
+        return ""
+    chunks = []  # type: list
+
+    def walk(node):
+        for ch in node:
+            loc = _local(ch.tag)
+            if loc in _SKIP_LOCALS:
+                continue
+            if loc in _BLOCK_LOCALS and chunks:
+                chunks.append(" ")
+            if loc == _TEXT_LOCAL and ch.text:
+                chunks.append(ch.text)
+            elif loc == "v" and ch.text:
+                chunks.append(" %s " % ch.text)
+            walk(ch)
+
+    walk(root)
+    return "".join(chunks)
+
+
+def _diagram_point_text(xml):
+    # type: (str) -> str
+    """SmartArt node text, one item per outermost point so two adjacent labels
+    cannot fuse into a token neither of them contains."""
+    root = _root(xml)
+    if root is None:
+        return ""
+    pts = []  # type: list
+    _find_outermost(root, ("pt",), pts)
+    items = [_block_text(p, skip_boxes=False) for p in pts]
+    return " ".join(i for i in items if i)
+
+
+def docx_source_text(parts):
+    # type: (dict) -> str
+    """Exhaustive ground truth for the docx conversion gate: every text run the
+    document holds, regardless of structure.
+
+    WHY IT LIVES HERE AND NOT WITH THE CONVERTER. It used to sit in ``_ooxml_md``
+    and reach for ``_text_of`` — which the converter also calls, through
+    ``_docx_p_text``, to decide what a paragraph says. Both halves of the
+    losslessness comparison therefore ran the same reader, so a bug in it was
+    applied twice and CANCELLED. Measured on the shipped ``kestrel-clock-spec.docx``
+    before this moved: bugging ``_collect_text`` drove ``n_source_tokens`` from 400
+    to **0** while the gate still reported ``token_recall: 1.0`` and ``valid: true``.
+    A denominator of zero is a vacuous pass, and only the ``empty_source`` warning
+    stood between that and a clean bill of health — a net that catches the total
+    collapse and nothing short of it.
+
+    It is built from this module's own walkers, which reach the same words by a
+    different route and already carry a correction the converter's reader does not:
+    ``_block_text`` treats a row and a cell as places the DOCUMENT separates two
+    pieces of text, so two cells cannot weld into a token like ``rotastandby``.
+
+    Text boxes are INCLUDED (``skip_boxes=False``). The structural facts exclude
+    them because the converter lifts a box out of its anchor paragraph and renders
+    it as its own blocks — a statement about where blocks land. The words are in the
+    document either way, so they belong in the denominator; excluding them would let
+    a converter silently drop a whole text box at a perfect score."""
+    chunks = []
+    for name in ("word/document.xml", "word/footnotes.xml", "word/endnotes.xml",
+                 "word/comments.xml"):
+        root = _root(parts.get(name, ""))
+        if root is not None:
+            chunks.append(_block_text(root, skip_boxes=False))
+    for name in sorted(parts):
+        if _DIAGRAM.match(name):
+            chunks.append(_diagram_point_text(parts[name]))
+        elif _CHART.match(name):
+            chunks.append(_chart_datum_text(parts[name]))
+    return _WS.sub(" ", " ".join(c for c in chunks if c)).strip()
+
+
 def docx_source_structure(parts):
     # type: (dict) -> dict
     """The structural facts a faithful conversion of this docx must exhibit.
@@ -1213,16 +1372,21 @@ def docx_source_structure(parts):
     handle on that; saying nothing left the fact ``unmeasured`` and the damage
     invisible."""
     out = {"headings": {}, "heading_path": [], "thematic_breaks": 0,
+           "block_sequence": [],
            "list_items": {}, "ordered_items": 0, "bullet_items": 0,
            "strong": 0, "em": 0, "strike": 0, "code_spans": 0, "code_blocks": 0,
-           "links": 0, "tables": [], "list_item_words": [], "ordered_numbers": []}
+           "links": 0, "tables": [], "list_item_words": [], "ordered_numbers": [],
+           # Not a graded fact (the leading underscore keeps it out of
+           # `_FIDELITY_FACTS`): the count of outline levels the render could not
+           # hold, read back by `policy_drops` so the loss gets a receipt.
+           "_flattened_levels": 0}
     root = _root(parts.get("word/document.xml", ""))
     if root is None:
         return out
     styles = _style_map(parts.get("word/styles.xml", ""))
     numbering = _num_formats(parts.get("word/numbering.xml", ""))
     external = _external(parts.get("word/_rels/document.xml.rels", ""))
-    pmap = _parents(root)
+    pmap = _parent_map(root)
 
     # Tables first: a data table's cells are cell content, so its paragraphs must
     # not also be counted as body headings or list items.
@@ -1235,13 +1399,14 @@ def docx_source_structure(parts):
     # wrapper is scaffolding that gets unwrapped, so the inner table is top level.
     in_data_table = set()
     emits_block = set()   # ids of the tables that become a table block of their own
+    block_shape = {}      # type: dict  # id(tbl) -> (rows, cols), for block_sequence
     for tbl in root.iter():
         if _local(tbl.tag) != "tbl" or _skipped(tbl, pmap):
             continue
         if _is_layout_table(tbl):
             continue
         nested = False
-        for anc in _ancestors(tbl, pmap):
+        for anc in _ancestry(tbl, pmap):
             if _local(anc.tag) == "tbl" and not _is_layout_table(anc):
                 nested = True
                 break
@@ -1251,12 +1416,14 @@ def docx_source_structure(parts):
         if shape:
             out["tables"].append(shape)
             emits_block.add(id(tbl))
+            block_shape[id(tbl)] = (shape["rows"], shape["cols"])
         for el in tbl.iter():
             if el is not tbl:
                 in_data_table.add(id(el))
 
     code_run = False
     counters = {}  # type: dict  # numId -> {level: running number}
+    open_levels = []  # type: list  # source levels of the list items still open
     for node in root.iter():
         loc = _local(node.tag)
         if loc == "tbl":
@@ -1269,6 +1436,7 @@ def docx_source_structure(parts):
             # wrong.
             if id(node) in emits_block:
                 code_run = False
+                _add_block(out, "table", block_shape[id(node)])
             continue
         if loc != "p" or _skipped(node, pmap):
             continue
@@ -1298,6 +1466,7 @@ def docx_source_structure(parts):
             if not code_run:
                 out["code_blocks"] += 1       # a run of code paragraphs is ONE fence
                 code_run = True
+                _add_block(out, "code", 0)
             continue
         code_run = False
         level = _heading_level(props, styles)
@@ -1308,15 +1477,44 @@ def docx_source_structure(parts):
             _add_heading(out, level, _block_text(p))
         elif props["num"] and props["num"] != "0":
             try:
-                depth = int(props["ilvl"] or "0")
+                ilvl = int(props["ilvl"] or "0")
             except ValueError:
-                depth = 0
+                ilvl = 0
+            # THE RENDERED DEPTH, WHICH IS NOT THE DECLARED LEVEL. CommonMark nests a
+            # child item only under a parent that exists, so an item's depth is how
+            # many STRICTLY SHALLOWER ancestors are still open above it. Reading
+            # `w:ilvl` straight off the source demanded a depth no renderer produces:
+            # measured, an ordinary Word runbook with one skipped level (ilvl 0, 2, 0)
+            # published `list_items {0: 2, 1: 1}` against a truth claiming
+            # `{0: 2, 2: 1}`, so the gate FAILED and `build_bundle.py` withheld the
+            # markdown of a document the converter had rendered correctly.
+            #
+            # The stack is of SOURCE levels and any other block ends the list, which
+            # is read back off `block_sequence` so no branch above can forget to say
+            # so. Written out here rather than shared with `_pptx_struct`'s copy for
+            # the reason `_attr` is written out four times: these are the two halves
+            # of two different comparisons, and one reader in both is one reader too
+            # many (quality-plan P9.1b is where the sharable core is argued about).
+            if not out["block_sequence"] or out["block_sequence"][-1][0] != "li":
+                del open_levels[:]
+            ilvl = max(0, ilvl)
+            while open_levels and open_levels[-1] >= ilvl:
+                open_levels.pop()
+            depth = len(open_levels)
+            open_levels.append(ilvl)
             out["list_items"][depth] = out["list_items"].get(depth, 0) + 1
+            _add_block(out, "li", depth)
+            if depth != ilvl:
+                out["_flattened_levels"] += 1
             # Ordered item CONTENT: a procedure whose steps were swapped has the
             # same depth histogram and the same token multiset as the real one.
             out["list_item_words"].append(_words(_block_text(p)))
             fmt, start = numbering.get((props["num"], props["ilvl"] or "0"),
                                        ("bullet", 1))
+            # The counters are keyed on the DECLARED level, not the rendered depth,
+            # because that is what the converter counts within — Word restarts a
+            # sub-list per `w:ilvl`, and two peers at a skipped level share one
+            # counter and print 1, 2 exactly as the renderer shows them.
             if fmt == "bullet":
                 out["bullet_items"] += 1
             else:
@@ -1326,7 +1524,7 @@ def docx_source_structure(parts):
                 # a screenshot has the same item count, the same depths and the same
                 # tokens as the whole one, and renders 1,2,1,2 instead of 1,2,3,4.
                 out["ordered_numbers"].append(
-                    _step(counters, props["num"], depth, start))
+                    _step(counters, props["num"], ilvl, start))
 
     _count_marked_spans(root, styles, out, pmap)
 
@@ -1345,6 +1543,26 @@ def docx_source_structure(parts):
     return out
 
 
+def _vertical_note(parts):
+    # type: (dict) -> str
+    """What actually became of the vertically absorbed cells — which is not the
+    same sentence for every format, and saying it was is how this warning came to
+    promise a spreadsheet reader something no spreadsheet reader gets.
+
+    Word's converter FORWARD-FILLS a ``w:vMerge`` continuation, so each row really
+    does stay self-contained for row-wise chunking. Neither the deck nor the
+    workbook converter reads its merge markup at all: a covered ``a:tc`` renders as
+    its own (empty) cell, and ``_sheet_rows`` never looks at ``<mergeCells>``, so
+    the continuation rows come out blank. Promising the fill there described a
+    behaviour the reader could not find in the file in front of them."""
+    for name in parts:
+        if _WML_BODY.match(name):
+            return ("a vertical span is repeated down its rows so each row stays "
+                    "self-contained")
+    return ("a vertical span keeps its text in the top-most row and leaves the "
+            "continuation rows blank, exactly as the source holds them")
+
+
 def policy_drops(parts, member_names=()):
     # type: (dict, object) -> list
     """Every deliberate flattening or drop this lane performs, as named warnings.
@@ -1353,15 +1571,34 @@ def policy_drops(parts, member_names=()):
     COUNTS behind it — because "some spans were flattened" is a shrug and "3
     horizontal, 1 vertical" is a fact somebody can act on."""
     found = []
+    # Per-format drops come from the module that owns that format. `policy_drops`
+    # stays the single entry point — `scripts/office_convert.py` calls it once and
+    # gets every named drop — but it does not pretend to know how a workbook spells
+    # a hidden row.
+    found.extend(xlsx_policy_drops(parts))
+    found.extend(pptx_policy_drops(parts))
+    flattened = docx_source_structure(parts).get("_flattened_levels", 0)
+    if flattened:
+        found.append({
+            "code": "flattened_list_levels",
+            "detail": "%d list item(s) render one level in from the `w:ilvl` the "
+                      "document declares: CommonMark nests a child item only under a "
+                      "parent that EXISTS, so a level with nothing above it at the "
+                      "level between cannot be written at all. Every word is kept "
+                      "and the declared depth is not. Nothing else can see this — "
+                      "indentation is not a token, so recall reads 1.0 over it, and "
+                      "the structure gate grades the depth a RENDERER really shows, "
+                      "which is the only depth markdown has" % flattened,
+            "count": flattened})
     spans = merged_cell_spans(parts)
     if spans["horizontal"] or spans["vertical"]:
         found.append({
             "code": "flattened_table_spans",
-            "detail": "GFM has no colspan/rowspan: %d horizontal and %d vertical "
-                      "merge(s) were flattened into plain cells (a horizontal span "
-                      "keeps its text in the left-most column; a vertical span is "
-                      "repeated down its rows so each row stays self-contained)"
-                      % (spans["horizontal"], spans["vertical"]),
+            "detail": "GFM has no colspan/rowspan: %d cell(s) absorbed horizontally "
+                      "and %d vertically were flattened back into plain cells (a "
+                      "horizontal span keeps its text in the left-most column; %s)"
+                      % (spans["horizontal"], spans["vertical"],
+                         _vertical_note(parts)),
             "horizontal": spans["horizontal"],
             "vertical": spans["vertical"]})
     revs = tracked_changes(parts)

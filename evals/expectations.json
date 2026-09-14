@@ -6,6 +6,7 @@
   "losslessness_method": "ooxml-ground-truth",
   "losslessness_gate": "pass",
   "token_recall_min": 1.0,
+  "n_source_tokens_min": 400,
   "coverage_gate": "pass",
   "has_toc": true,
   "toc_lines_min": 9,
@@ -58,6 +59,7 @@
     "url": "https://nimbus-semi.example/kestrel/pdk-release-notes"
    }
   ],
+  "structure_fidelity_compared_min": 11,
   "structure_fidelity_gate": "pass",
   "_note_emphasis": "The source bolds only the second half of the identifier (a plain run 'Dma' followed by a bold run 'ArbiterUnit'), which is how Word actually stores partial-word formatting. Faithful output is therefore 'Dma**ArbiterUnit**'. The tradeoff is deliberate and recorded in docs/quality-plan.md: the emphasis is real information the document carries, and markdown_to_text strips the markers before tokenizing, so the identifier is intact in the text layer the index and the KB consume. What is lost is a raw grep of document.md for the unsplit identifier."
  },
@@ -67,6 +69,7 @@
   "status": "ok",
   "losslessness_gate": "pass",
   "token_recall_min": 1.0,
+  "n_source_tokens_min": 26,
   "coverage_gate": "pass",
   "has_toc": false,
   "images_gate": "pass",
@@ -76,7 +79,41 @@
    "Power the board from the bench supply"
   ],
   "savings_ratio_min": 10.0,
+  "structure_fidelity_compared_min": 3,
   "structure_fidelity_gate": "pass"
+ },
+ "office/kestrel-adversarial.xlsx": {
+  "kind": "bundle",
+  "lane": "office",
+  "status": "ok",
+  "losslessness_gate": "pass",
+  "token_recall_min": 1.0,
+  "n_source_tokens_min": 51,
+  "coverage_gate": "pass",
+  "images_gate": "pass",
+  "images_referenced": 0,
+  "structure_fidelity_gate": "pass",
+  "structure_fidelity_compared_min": 6,
+  "warning_codes": [
+   "dropped_cell_formulas",
+   "unformatted_cell_values",
+   "hidden_content_published",
+   "empty_cell_formulas"
+  ],
+  "md_contains": [
+   "## Milestones",
+   "## Rails",
+   "## Scratch",
+   "| RTL freeze | 46027 | 0.815 |",
+   "|  |  | 0.990 |",
+   "| Total | 316.25 |",
+   "| Worst |  |"
+  ],
+  "md_not_contains": [
+   "SUM(B2:B3)",
+   "2026-01-05"
+  ],
+  "_note": "The workbook written to make every xlsx policy drop GRADEABLE on a real document. Each md_contains line is a measured loss the gate lets through as policy and a warning names: 46027 is 2026-01-05 held as an Excel serial (unformatted_cell_values); the sparse row renders as |  |  | 0.990 | because the value's ADDRESS is C and nothing counts <c> elements to place it; | Total | 316.25 | publishes a cached result whose =SUM(B2:B3) is gone (dropped_cell_formulas); | Worst |  | is a formula whose cached value was never written, so BOTH halves of the token gate read empty and recall is a vacuous 1.0 over a total that vanished -- the warning is the only receipt. '## Scratch' is a hidden sheet published as a peer of the real ones (hidden_content_published). md_not_contains pins the two losses as losses: neither the expression nor the formatted date is anywhere in the body."
  },
  "office/kestrel-registers.xlsx": {
   "kind": "bundle",
@@ -84,6 +121,7 @@
   "status": "ok",
   "losslessness_gate": "pass",
   "token_recall_min": 1.0,
+  "n_source_tokens_min": 107,
   "coverage_gate": "pass",
   "images_gate": "pass",
   "images_referenced": 0,
@@ -98,7 +136,12 @@
    "FALSE",
    "Reserved for bring-up notes."
   ],
-  "structure_fidelity_gate": "unmeasured"
+  "warning_codes": [
+   "dropped_cell_formulas"
+  ],
+  "structure_fidelity_gate": "pass",
+  "structure_fidelity_compared_min": 4,
+  "_note": "P9.4 flipped this from 'unmeasured'. `compared` is pinned because the gate word alone is not a measurement: the workbook exhibits headings, heading_path, tables and block_sequence. strong/em/strike/links stay in structure_fidelity.unmeasured -- the ground truth OMITS them rather than stating zero, because a zero would certify a drop the converter really makes, and dropped_cell_emphasis counts it instead."
  },
  "office/kestrel-overview.pptx": {
   "kind": "bundle",
@@ -106,6 +149,7 @@
   "status": "ok",
   "losslessness_gate": "pass",
   "token_recall_min": 1.0,
+  "n_source_tokens_min": 108,
   "coverage_gate": "pass",
   "images_gate": "pass",
   "md_contains": [
@@ -117,7 +161,8 @@
    "week nine",
    "- sensor front end"
   ],
-  "structure_fidelity_gate": "unmeasured"
+  "structure_fidelity_gate": "pass",
+  "structure_fidelity_compared_min": 7
  },
  "office/kestrel-dataflow.pptx": {
   "kind": "bundle",
@@ -125,6 +170,7 @@
   "status": "ok",
   "losslessness_gate": "pass",
   "token_recall_min": 1.0,
+  "n_source_tokens_min": 13,
   "coverage_gate": "pass",
   "md_contains": [
    "## Slide 1",
@@ -133,7 +179,78 @@
    "- push",
    "- pop"
   ],
-  "structure_fidelity_gate": "unmeasured"
+  "structure_fidelity_gate": "pass",
+  "structure_fidelity_compared_min": 6
+ },
+ "office/kestrel-reordered.pptx": {
+  "kind": "bundle",
+  "lane": "office",
+  "status": "ok",
+  "losslessness_gate": "pass",
+  "token_recall_min": 1.0,
+  "n_source_tokens_min": 150,
+  "coverage_gate": "pass",
+  "images_gate": "pass",
+  "_note": "The deck's p:sldIdLst says 1,5,3,4,2 and its slide PARTS are unrenumbered -- what PowerPoint writes every time a user drags a slide. Sorting part names therefore publishes the order the slides were DRAFTED in. The TOKEN gate cannot see that -- it compares multisets, so the wrong order and the right one both measure recall 1.0 / n_source 135 -- and until P9.6 nothing else could either. Now structure_fidelity grades it: injecting the exact bug (the slide order read off the unqualified id attribute) moves block_sequence, heading_path and list_item_words, and the gate fails while recall stays at 1.0. The heading pins below are the second, human-readable half of that check.",
+  "md_contains": [
+   "## Slide 1 — Kestrel bring-up sequence",
+   "## Slide 2 — Rollout plan",
+   "## Slide 3 — Silicon back",
+   "## Slide 4 — Board bring-up",
+   "## Slide 5 — Open questions",
+   "- Step two of five in the bring-up sequence",
+   "## Slide 2 — Rollout plan\n\n- Step two of five in the bring-up sequence\n- Tape-in freeze at milestone three\n- Bring-up boards arrive two weeks later\n\n### Speaker notes\n\n2\\. Timing for the rollout slide\n\n- These notes belong to the rollout slide, which is part five and position two.",
+   "- 1\\. Reset, 2. clocks, 3. fabric traffic",
+   "- \\+ 5% timing margin held across the clock tree"
+  ],
+  "md_not_contains": [
+   "## Slide 2 — Open questions",
+   "## Slide 5 — Rollout plan",
+   "- 1. Reset, 2. clocks, 3. fabric traffic",
+   "- + 5% timing margin held across the clock tree"
+  ],
+  "structure_fidelity_gate": "pass",
+  "structure_fidelity_compared_min": 6
+ },
+ "office/kestrel-adversarial.pptx": {
+  "kind": "bundle",
+  "lane": "office",
+  "status": "ok",
+  "losslessness_gate": "pass",
+  "token_recall_min": 1.0,
+  "n_source_tokens_min": 132,
+  "coverage_gate": "pass",
+  "images_gate": "pass",
+  "_note": "Every deck-lane fix P9.6 depends on is defended HERE and nowhere else: with only the three older decks, deleting the table grid floor, the list-nesting clamp or the picture indent left all twelve corpus documents byte-identical and the eval fully green. Measured against this deck, each deletion fails the structure gate while token recall stays at exactly 1.0 -- the grid floor on tables+block_sequence, the clamp on four facts, the picture indent on list_items+block_sequence. The seven warning codes below are the other half: six of the seven name a loss no gate can see, because the text is excluded from the recall denominator too or was never in it.",
+  "warning_codes": [
+   "dropped_slide_chrome",
+   "dropped_shape_links",
+   "dropped_shape_alt_text",
+   "flattened_bullet_formatting",
+   "flattened_list_levels",
+   "hidden_content_published",
+   "flattened_table_spans"
+  ],
+  "md_contains": [
+   "## Slide 1 — Kestrel adversarial deck",
+   "| Corner | Owner |  |\n| --- | --- | --- |\n| Bring-up corners | fabric team |  |",
+   "1. Reset the clock tree",
+   "2. Release fabric traffic\n   - Skipped two levels: no sub-step exists above this",
+   "- Sign-off needs **both** the *timing* and the power run; the ~~week six~~ date is cancelled",
+   "[the fabric spec](https://nimbus.example/kestrel/fabric-spec)",
+   "- Coverage closure is tracked per milestone\n\n  ![",
+   "  - The plot above is the last six weekly regressions",
+   "## Slide 5 — Backup pricing",
+   "## Slide (unlisted): slide6 — Cut from the deck",
+   "## Comments",
+   "## Figures"
+  ],
+  "md_not_contains": [
+   "Nimbus Semiconductor Confidential",
+   "17 July 2026"
+  ],
+  "structure_fidelity_gate": "pass",
+  "structure_fidelity_compared_min": 13
  },
  "legacy/kestrel-clock-spec.doc": {
   "kind": "bundle",
@@ -141,6 +258,7 @@
   "status": "ok",
   "losslessness_gate": "pass",
   "token_recall_min": 1.0,
+  "n_source_tokens_min": 400,
   "coverage_gate": "pass",
   "has_toc": true,
   "warning_codes": [
@@ -158,6 +276,7 @@
    }
   ],
   "_note_links": "hyperlink measured to survive the soffice doc round-trip verbatim (text+url character-identical; also true for odt/rtf, probed on .doc as the binary representative). Observed on LibreOffice 6.4.7.2 — if a future soffice normalizes URLs (trailing slash, percent-encoding), this probe names the behavior change; adjust deliberately, never silently.",
+  "structure_fidelity_compared_min": 11,
   "structure_fidelity_gate": "pass",
   "_note_fidelity": "pass, not unmeasured: the LibreOffice pre-convert lands on .docx, and the gate follows the EFFECTIVE extension. So a binary .doc is graded structurally too — and the probe proves the round-trip through soffice preserves heading levels, list nesting and table geometry, not merely the words."
  },
@@ -167,6 +286,7 @@
   "status": "ok",
   "losslessness_gate": "pass",
   "token_recall_min": 1.0,
+  "n_source_tokens_min": 400,
   "coverage_gate": "pass",
   "has_toc": true,
   "warning_codes": [
@@ -176,6 +296,7 @@
    "# 1 Introduction",
    "ClkGateCtrl_enable_sync"
   ],
+  "structure_fidelity_compared_min": 11,
   "structure_fidelity_gate": "pass"
  },
  "legacy/kestrel-clock-spec.odt": {
@@ -184,6 +305,7 @@
   "status": "ok",
   "losslessness_gate": "pass",
   "token_recall_min": 1.0,
+  "n_source_tokens_min": 400,
   "coverage_gate": "pass",
   "has_toc": true,
   "warning_codes": [
@@ -194,6 +316,7 @@
    "ClkGateCtrl_enable_sync",
    "#### 2.1.1.1 Timing budget"
   ],
+  "structure_fidelity_compared_min": 11,
   "structure_fidelity_gate": "pass"
  },
  "legacy/kestrel-registers.xls": {
@@ -202,6 +325,7 @@
   "status": "ok",
   "losslessness_gate": "pass",
   "token_recall_min": 1.0,
+  "n_source_tokens_min": 104,
   "coverage_gate": "pass",
   "warning_codes": [
    "libreoffice_preconvert"
@@ -212,7 +336,9 @@
    "Kestrel power budget (mW)",
    "412.5"
   ],
-  "structure_fidelity_gate": "unmeasured"
+  "structure_fidelity_gate": "pass",
+  "structure_fidelity_compared_min": 4,
+  "_note": "Also flipped by P9.4, and the reach of the pass is narrower than it looks. Both halves of the gate read the package LibreOffice produced, so anything the pre-convert already destroyed is destroyed in the source the ground truth reads and the truth agrees with it. `pass` here means 'faithful from the converted package onward', never 'nothing was lost' -- which is why report.json declares blind_to: pre_conversion_structure on this lane. Measured cost of that round trip on this document: the boolean Gated column arrives as 1/0 instead of TRUE/FALSE and Scale loses its 1.0 notation."
  },
  "legacy/kestrel-overview.ppt": {
   "kind": "bundle",
@@ -220,6 +346,7 @@
   "status": "ok",
   "losslessness_gate": "pass",
   "token_recall_min": 1.0,
+  "n_source_tokens_min": 108,
   "coverage_gate": "pass",
   "warning_codes": [
    "libreoffice_preconvert"
@@ -229,7 +356,9 @@
    "week nine",
    "display read"
   ],
-  "structure_fidelity_gate": "unmeasured"
+  "structure_fidelity_gate": "pass",
+  "structure_fidelity_compared_min": 7,
+  "_note": "The LibreOffice lane's honest caveat, pinned. Both halves of the structure gate read the package soffice PRODUCED, so whatever the round trip already destroyed is destroyed in the ground truth too and the truth agrees with it: measured, soffice writes NO p:ph declarations at all, so every slide title is demoted to a body bullet and every outline level flattened to 0 -- and the gate passes over it. `pass` here means 'faithful from the converted package onward', never 'nothing was lost', which is why the report carries pre_conversion_structure in blind_to."
  },
  "pdf/kestrel-clock-spec.pdf": {
   "kind": "bundle",
@@ -370,6 +499,8 @@
   "losslessness_method": "ooxml-ground-truth",
   "losslessness_gate": "pass",
   "token_recall_min": 1.0,
+  "n_source_tokens_min": 483,
+  "structure_fidelity_compared_min": 15,
   "structure_fidelity_gate": "pass",
   "coverage_gate": "pass",
   "has_toc": false,
@@ -395,6 +526,7 @@
    "snake_case_helper",
    "`kubectl get pods -n payments`",
    "DO NOT REBOOT THE PRIMARY NODE",
+   "- The **Dma**Arbiter register and its ***read***<!---->*only* alias share one reset domain.",
    "~~",
    "```",
    "3. Run the migration, then re-enable writes.",

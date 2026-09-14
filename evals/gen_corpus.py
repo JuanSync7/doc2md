@@ -744,6 +744,28 @@ def build_adversarial_docx(path):
                  + w_run("[3]")
                  + w_run("(page 12)")
                  + w_run(" for the drain timing.")))
+    # (19) Two run adjacencies markdown cannot write without help, and the only
+    # fixture that defends the P9.9 fixes. `**Dma**Arbiter` is emphasis ending
+    # MID-WORD: the markdown-side `_words` read ("dma", "arbiter") where the source
+    # truth correctly reads ("dmaarbiter",), so `list_item_words` disagreed and the
+    # document refused to publish at `token_recall: 1.0`. `***read***` against
+    # `*only*` is a delimiter run of FOUR asterisks, which CommonMark pairs as ONE em
+    # span — and the text layer mis-pairs it too, so that one took recall to 0.0.
+    # Both are entirely ordinary Word; neither existed anywhere in this corpus, so
+    # deleting either fix left all fifteen documents byte-identical and the eval green.
+    # A LIST ITEM, not a paragraph, and that is load-bearing: `list_item_words` is
+    # the only fact that grades text word by word, so the mid-word case is invisible
+    # to the gate anywhere else. Measured — with this paragraph as a paragraph,
+    # deleting the `_words` fix left the document passing.
+    b.append(w_p(w_run("The ")
+                 + fmt_run("Dma", "<w:b/>")
+                 + w_run("Arbiter register and its ")
+                 + fmt_run("read", "<w:b/><w:i/>")
+                 + fmt_run("only", "<w:i/>")
+                 + w_run(" alias share one reset domain."),
+                 # The BULLET instance, not the numbered one: joining the procedure
+                 # renumbered every step after it and moved three pinned lines.
+                 num=(1, 0)))
     # (18) A pasted README fragment and a typed divider, both PLAIN body paragraphs.
     # Emitted raw the first becomes a real H2 the document never had, and the second
     # renders away to a horizontal rule — and because a rule carries no tokens and no
@@ -1081,6 +1103,148 @@ def build_registers_xlsx(path):
     ])
 
 
+
+def build_adversarial_xlsx(path):
+    # type: (str) -> None
+    """The workbook written to break a naive converter — and, since P9.4, to make
+    every workbook policy drop GRADEABLE on a real document rather than only in
+    unit fixtures.
+
+    Each shape here earned its place by being invisible before the second gate
+    existed:
+
+      * a **sparse** row whose only value sits at C, so the table is three columns
+        wide and a reader that counted `<c>` elements would publish it at A;
+      * a formula **with** a cached result (the expression is dropped) and one
+        **without** (both sides read empty, so token recall is a vacuous 1.0 over a
+        total that vanished) — the second is the symmetric blindness a warning is
+        the only handle on;
+      * a date held as an Excel **serial** under `yyyy-mm-dd` and a ratio under
+        `0.00%`, which publish as `46027` and `0.815` where a reader sees
+        `2026-01-05` and `81.50%`;
+      * a **bold** header row and a **struck-through** cancelled row, neither of
+        which the converter emits — `structure_fidelity` omits `strong`/`strike`
+        for a workbook rather than stating them zero, and this is the other half of
+        that honesty;
+      * a **hidden** sheet and a **hidden** row, published as ordinary content;
+      * a blank **spacer** row between two unrelated blocks, which the renderer
+        drops so the blocks fuse into one table.
+    """
+    def cell(ref, value, ctype="n", style=None):
+        st = ' s="%d"' % style if style is not None else ""
+        if ctype == "inline":
+            return ('<c r="%s"%s t="inlineStr"><is><t xml:space="preserve">%s</t>'
+                    '</is></c>' % (ref, st, xesc(value)))
+        return '<c r="%s"%s><v>%s</v></c>' % (ref, st, xesc(value))
+
+    def row(n, cells, hidden=False):
+        return ('<row r="%d"%s>%s</row>'
+                % (n, ' hidden="1"' if hidden else "", "".join(cells)))
+
+    # Style table: 0 General, 1 bold, 2 struck through, 3 date, 4 percent.
+    styles = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+        '<styleSheet %s>'
+        '<numFmts count="1"><numFmt numFmtId="164" formatCode="yyyy\\-mm\\-dd"/>'
+        '</numFmts>'
+        '<fonts count="3"><font><sz val="10"/><name val="Liberation Sans"/></font>'
+        '<font><b/><sz val="10"/><name val="Liberation Sans"/></font>'
+        '<font><strike/><sz val="10"/><name val="Liberation Sans"/></font></fonts>'
+        '<fills count="2"><fill><patternFill patternType="none"/></fill>'
+        '<fill><patternFill patternType="gray125"/></fill></fills>'
+        '<borders count="1"><border/></borders>'
+        '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0"/></cellStyleXfs>'
+        '<cellXfs count="5">'
+        '<xf numFmtId="0" fontId="0" xfId="0"/>'
+        '<xf numFmtId="0" fontId="1" xfId="0"/>'
+        '<xf numFmtId="0" fontId="2" xfId="0"/>'
+        '<xf numFmtId="164" fontId="0" xfId="0"/>'
+        '<xf numFmtId="10" fontId="0" xfId="0"/>'
+        '</cellXfs></styleSheet>' % _SS)
+
+    # Sheet 1: Milestones — bold header, date serials, a percent, a struck-through
+    # cancelled row, and a sparse row whose value sits at C alone.
+    rows1 = [
+        row(1, [cell("A1", "Milestone", "inline", 1),
+                cell("B1", "Due", "inline", 1),
+                cell("C1", "Utilisation", "inline", 1)]),
+        row(2, [cell("A2", "RTL freeze", "inline"),
+                cell("B2", "46027", "n", 3), cell("C2", "0.815", "n", 4)]),
+        row(3, [cell("A3", "Tapeout", "inline"),
+                cell("B3", "46113", "n", 3), cell("C3", "0.935", "n", 4)]),
+        row(4, [cell("A4", "Second silicon", "inline", 2),
+                cell("B4", "46196", "n", 3), cell("C4", "0.500", "n", 4)]),
+        # Sparse: the only value on this row is in the THIRD column.
+        row(5, [cell("C5", "0.990", "n", 4)]),
+    ]
+    sheet1 = _sheet("".join(rows1))
+
+    # Sheet 2: Rails — two unrelated blocks separated by a blank spacer row, a
+    # formula WITH a cached result, and one WITHOUT.
+    rows2 = [
+        row(1, [cell("A1", "Rail", "inline", 1), cell("B1", "Milliwatts", "inline", 1)]),
+        row(2, [cell("A2", "VDD_CORE", "inline"), cell("B2", "182.5")]),
+        row(3, [cell("A3", "VDD_IO", "inline"), cell("B3", "133.75")]),
+        row(4, [cell("A4", "Total", "inline"),
+                '<c r="B4"><f>SUM(B2:B3)</f><v>316.25</v></c>']),
+        row(5, []),                                   # the spacer
+        row(6, [cell("A6", "Corner", "inline", 1), cell("B6", "Margin", "inline", 1)]),
+        row(7, [cell("A7", "SSG 0.72V 125C", "inline"), cell("B7", "0.94")]),
+        # A formula whose cached result was never written: BOTH sides read empty,
+        # so recall is a vacuous 1.0 and the warning is the only receipt.
+        row(8, [cell("A8", "Worst", "inline"), '<c r="B8"><f>MIN(B7:B7)</f></c>']),
+    ]
+    sheet2 = _sheet("".join(rows2))
+
+    # Sheet 3: hidden, with a hidden row inside it.
+    rows3 = [
+        row(1, [cell("A1", "scratch pad", "inline")]),
+        row(2, [cell("A2", "do not ship this line", "inline")], hidden=True),
+    ]
+    sheet3 = _sheet("".join(rows3))
+
+    workbook = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+        '<workbook %s %s><sheets>'
+        '<sheet name="Milestones" sheetId="1" r:id="rId1"/>'
+        '<sheet name="Rails" sheetId="2" r:id="rId2"/>'
+        '<sheet name="Scratch" sheetId="3" r:id="rId3" state="hidden"/>'
+        '</sheets></workbook>' % (_SS, _R))
+    wb_rels = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/'
+        'relationships">'
+        + "".join('<Relationship Id="rId%d" Type="http://schemas.openxmlformats'
+                  '.org/officeDocument/2006/relationships/worksheet" '
+                  'Target="worksheets/sheet%d.xml"/>' % (i, i)
+                  for i in (1, 2, 3))
+        + '<Relationship Id="rId5" Type="http://schemas.openxmlformats.org/'
+          'officeDocument/2006/relationships/styles" Target="styles.xml"/>'
+          '</Relationships>')
+    sp = "application/vnd.openxmlformats-officedocument.spreadsheetml"
+    ct = content_types(
+        [("/xl/workbook.xml", sp + ".sheet.main+xml"),
+         ("/xl/worksheets/sheet1.xml", sp + ".worksheet+xml"),
+         ("/xl/worksheets/sheet2.xml", sp + ".worksheet+xml"),
+         ("/xl/worksheets/sheet3.xml", sp + ".worksheet+xml"),
+         ("/xl/styles.xml", sp + ".styles+xml"),
+         ("/docProps/core.xml",
+          "application/vnd.openxmlformats-package.core-properties+xml"),
+         ("/docProps/app.xml",
+          "application/vnd.openxmlformats-officedocument.extended-properties+xml")])
+    write_zip(path, [
+        ("[Content_Types].xml", ct),
+        ("_rels/.rels", PKG_RELS % "xl/workbook.xml"),
+        ("xl/workbook.xml", workbook),
+        ("xl/_rels/workbook.xml.rels", wb_rels),
+        ("xl/worksheets/sheet1.xml", sheet1),
+        ("xl/worksheets/sheet2.xml", sheet2),
+        ("xl/worksheets/sheet3.xml", sheet3),
+        ("xl/styles.xml", styles),
+        ("docProps/core.xml", core_xml("Kestrel schedule and rails", "adversarial")),
+        ("docProps/app.xml", APP_XML),
+    ])
+
 # ----------------------------------------------------------------- pptx pieces
 
 _P = 'xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"'
@@ -1208,11 +1372,26 @@ def _dataflow_shapes():
     return shapes
 
 
-def _pptx_package(path, slides, notes, title, subject):
-    # type: (str, list, dict, str, str) -> None
-    """Assemble a pptx: ``slides`` is a list of slide XML strings (1-based
-    order), ``notes`` maps slide number -> notes text."""
+def _pptx_package(path, slides, notes, title, subject, order=None,
+                  slide_rels=None, extra_parts=None, defaults=()):
+    # type: (str, list, dict, str, str, list, dict, list, tuple) -> None
+    """Assemble a pptx: ``slides`` is a list of slide XML strings written to
+    ``ppt/slides/slideN.xml`` in list position, ``notes`` maps slide PART number ->
+    notes text.
+
+    ``order`` is the deck's presentation order as a list of 1-based PART numbers,
+    defaulting to ``1..n``. It writes ``p:sldIdLst`` and NOTHING else — which is
+    exactly what PowerPoint does when a user drags a slide: the id list is rewritten
+    and the parts stay where they were. A generator that renumbered the parts too
+    would produce a deck no reader could get wrong, and prove nothing."""
     n = len(slides)
+    order = list(order) if order else list(range(1, n + 1))
+    # A permutation of a SUBSET: every listed part exists and is listed once, but a
+    # part may be left out entirely. That is a deleted-but-not-purged slide — the
+    # deck stops showing it and the bytes stay in the package — and it is the one
+    # case where position and part number stop being interchangeable at all.
+    assert len(set(order)) == len(order), "a slide cannot be listed twice"
+    assert set(order) <= set(range(1, n + 1)), "order names a slide that is not there"
     pp = "application/vnd.openxmlformats-officedocument.presentationml"
     overrides = [("/ppt/presentation.xml", pp + ".presentation.main+xml"),
                  ("/ppt/slideMasters/slideMaster1.xml", pp + ".slideMaster+xml"),
@@ -1238,8 +1417,10 @@ def _pptx_package(path, slides, notes, title, subject):
         '<p:sldSz cx="9144000" cy="6858000"/>'
         '<p:notesSz cx="6858000" cy="9144000"/></p:presentation>'
         % (_P, _A, _R,
-           "".join('<p:sldId id="%d" r:id="rId%d"/>' % (256 + i, 2 + i)
-                   for i in range(n))))
+           # rId(k+1) is slide k, fixed by pres_rels below; the ORDER is which
+           # rIds are listed and in what sequence, nothing more.
+           "".join('<p:sldId id="%d" r:id="rId%d"/>' % (256 + i, 1 + part)
+                   for i, part in enumerate(order))))
     pres_rels = (
         '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
         '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/'
@@ -1284,8 +1465,13 @@ def _pptx_package(path, slides, notes, title, subject):
         'openxmlformats.org/officeDocument/2006/relationships/slideMaster" '
         'Target="../slideMasters/slideMaster1.xml"/></Relationships>')
 
+    for name, _data in (extra_parts or []):
+        if name.endswith(".xml"):
+            kind = (pp + ".comments+xml") if "/comments/" in name else None
+            if kind:
+                overrides.append(("/" + name, kind))
     entries = [
-        ("[Content_Types].xml", content_types(overrides)),
+        ("[Content_Types].xml", content_types(overrides, defaults)),
         ("_rels/.rels", PKG_RELS % "ppt/presentation.xml"),
         ("ppt/presentation.xml", pres),
         ("ppt/_rels/presentation.xml.rels", pres_rels),
@@ -1301,16 +1487,33 @@ def _pptx_package(path, slides, notes, title, subject):
             extra = ('<Relationship Id="rId2" Type="http://schemas.'
                      'openxmlformats.org/officeDocument/2006/relationships/'
                      'notesSlide" Target="../notesSlides/notesSlide%d.xml"/>' % i)
+        extra += (slide_rels or {}).get(i, "")
         entries.append(("ppt/slides/slide%d.xml" % i, slide_xml))
         entries.append(("ppt/slides/_rels/slide%d.xml.rels" % i, _slide_rels(extra)))
     for i in sorted(notes):
+        # A notes value may be a (title, body) pair. The TITLE placeholder matters:
+        # it is the one pptx emitter that puts source text at column 0 with nothing
+        # in front of it, so it is the only one where a leading `15.` or `## ` opens
+        # a block at the top level — and no fixture exercised it until this one.
+        entry = notes[i]
+        shapes = ""
+        body_id = 2
+        if isinstance(entry, tuple):
+            # Only a deck that ASKS for a notes title gets one, and only then does the
+            # body shape's id move — a fixture generator that renumbered unconditionally
+            # rewrote `kestrel-overview.pptx` by one attribute, silently, because the
+            # id is not rendered and no output moved with it.
+            shapes += _sp(2, "NotesTitle", [(0, entry[0])], ph="title")
+            entry = entry[1]
+            body_id = 3
+        shapes += _sp(body_id, "Notes", [(0, entry)], ph="body")
         notes_xml = (
             '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
             '<p:notes %s %s %s><p:cSld><p:spTree>%s%s</p:spTree></p:cSld>'
             '<p:clrMapOvr><a:masterClrMapping/></p:clrMapOvr></p:notes>'
-            % (_P, _A, _R, _EMPTY_TREE,
-               _sp(2, "Notes", [(0, notes[i])], ph="body")))
+            % (_P, _A, _R, _EMPTY_TREE, shapes))
         entries.append(("ppt/notesSlides/notesSlide%d.xml" % i, notes_xml))
+    entries += list(extra_parts or [])
     entries += [("docProps/core.xml", core_xml(title, subject)),
                 ("docProps/app.xml", APP_XML)]
     write_zip(path, entries)
@@ -1354,6 +1557,302 @@ def build_overview_pptx(path):
     notes = {5: ("Remind the audience that the timeline assumes silicon back "
                  "in week nine.")}
     _pptx_package(path, slides, notes, "Kestrel platform overview", "overview")
+
+
+def build_reordered_pptx(path):
+    # type: (str) -> None
+    """A deck someone REORDERED, which is the only kind that can catch the defect.
+
+    PowerPoint does not renumber slide parts on a drag: it rewrites `p:sldIdLst` and
+    leaves `ppt/slides/slideN.xml` where it was. So this deck's parts are numbered in
+    the order the slides were DRAFTED and its `sldIdLst` says 1, 5, 3, 4, 2 — the
+    order they are shown in. A converter that sorts part names publishes the draft
+    order under headings claiming the presented one, and no gate can see it: token
+    recall compares MULTISETS, so order is invisible to it by construction, and pptx
+    `structure_fidelity` is `unmeasured` until P9.6.
+
+    The content is written so the error is legible to a HUMAN too, which is the only
+    other reader there is: each slide names its own step number, so a deck published
+    in part order reads "step 1, step 5, step 2, step 3, step 4" down the page.
+
+    The speaker notes hang off part 5, which is position 2. That is the trap this
+    fixture also exists to hold shut: position and part number are now two different
+    numbers, and everything addressing a satellite part — the slide's own rels, the
+    `notesSlideN.xml` fallback — must keep using the PART number. Conflate them and
+    the notes attach to whatever sits second."""
+    def bullets(sid, title, items, step):
+        return (_sp(sid, "Title", [(0, title)], ph="title",
+                    pos=(457200, 274638, 8229600, 1143000))
+                + _sp(sid + 1, "Body",
+                      [(0, "Step %s of five in the bring-up sequence" % step)]
+                      + [(0, t) for t in items],
+                      ph="body", pos=(457200, 1600200, 8229600, 4525963)))
+    slides = [
+        # part 1 -> position 1
+        _slide(_sp(2, "Title", [(0, "Kestrel bring-up sequence")], ph="ctrTitle",
+                   pos=(457200, 1828800, 8229600, 1371600))
+               + _sp(3, "Subtitle",
+                     [(0, "Nimbus Semiconductor programme review, autumn 2026")],
+                     ph="subTitle", pos=(457200, 3429000, 8229600, 914400))),
+        # part 2 -> position 5
+        _slide(bullets(4, "Open questions",
+                       ["Who owns the thermal budget after tape-out",
+                        "Whether the beta SDK ships with the boards"], "five")),
+        # part 3 -> position 3
+        _slide(bullets(6, "Silicon back",
+                       ["First wafers reach the lab in week nine",
+                        "Scan and boundary tests run before any bring-up"], "three")),
+        # part 4 -> position 4
+        # Two bullets whose SOURCE TEXT opens a markdown block, written the way a
+        # presenter really would. Without `_esc_block_start` the first becomes a
+        # nested ordered list whose marker `markdown_to_text` swallows, and the
+        # second a nested bullet list — and until they were here, deleting that
+        # helper outright left every corpus document byte-identical and the eval
+        # fully green. The escape was protected by unit tests alone.
+        _slide(bullets(8, "Board bring-up",
+                       ["Clock tree and reset sequencing come first",
+                        "1. Reset, 2. clocks, 3. fabric traffic",
+                        "+ 5% timing margin held across the clock tree",
+                        "Fabric traffic generators follow once reset holds"], "four")),
+        # part 5 -> position 2
+        _slide(bullets(10, "Rollout plan",
+                       ["Tape-in freeze at milestone three",
+                        "Bring-up boards arrive two weeks later"], "two")),
+    ]
+    # The notes TITLE opens with an ordered marker on purpose: emitted bare it is a
+    # markdown list marker, and the whole line is swallowed. It measured
+    # `recall: 0.990, valid: False` before `_esc_lead` reached this emitter — a
+    # FAITHFUL deck refusing to publish, which is the loud half of defect 3.
+    notes = {5: ("2. Timing for the rollout slide",
+                 "These notes belong to the rollout slide, which is part five and "
+                 "position two.")}
+    _pptx_package(path, slides, notes, "Kestrel bring-up sequence", "reordered",
+                  order=[1, 5, 3, 4, 2])
+
+
+def _adv_sp(sid, name, paras, ph=None, pos=None):
+    """A shape whose paragraphs carry their OWN bullet declarations and run marks.
+
+    ``paras`` is a list of ``(level, bullet_xml, runs)`` where ``runs`` is a list of
+    ``(rpr_xml, text)``. `_sp` above cannot express either, and both are exactly what
+    this fixture exists to hold."""
+    nvpr = "<p:nvPr>%s</p:nvPr>" % ('<p:ph type="%s"/>' % ph if ph else "")
+    if ph == "body":
+        nvpr = '<p:nvPr><p:ph type="body" idx="1"/></p:nvPr>'
+    sppr = ""
+    if pos:
+        sppr = ('<a:xfrm><a:off x="%d" y="%d"/><a:ext cx="%d" cy="%d"/></a:xfrm>'
+                '<a:prstGeom prst="rect"><a:avLst/></a:prstGeom>' % pos)
+    body = []
+    for lvl, bullet, runs in paras:
+        ppr = ""
+        if lvl or bullet:
+            ppr = '<a:pPr%s>%s</a:pPr>' % (' lvl="%d"' % lvl if lvl else "", bullet)
+            if not bullet:
+                ppr = '<a:pPr lvl="%d"/>' % lvl
+        body.append('<a:p>%s%s</a:p>'
+                    % (ppr, "".join('<a:r>%s<a:t>%s</a:t></a:r>' % (rpr, xesc(t))
+                                    for rpr, t in runs)))
+    return ('<p:sp><p:nvSpPr><p:cNvPr id="%d" name="%s"/><p:cNvSpPr/>%s</p:nvSpPr>'
+            '<p:spPr>%s</p:spPr><p:txBody><a:bodyPr/>%s</p:txBody></p:sp>'
+            % (sid, xesc(name), nvpr, sppr, "".join(body)))
+
+
+def _adv_table(sid, rows, cols, pos):
+    """A DrawingML table that really MERGES. PowerPoint writes the FULL grid: the
+    anchor cell carries ``gridSpan``/``rowSpan`` and every position it covers is
+    still present, carrying ``hMerge``/``vMerge`` and empty. ``rows`` is a list of
+    rows, each a list of ``(text, tc_attributes)``."""
+    grid = "".join('<a:gridCol w="%d"/>' % (pos[2] // cols) for _ in range(cols))
+    trs = ""
+    for row in rows:
+        trs += ('<a:tr h="370840">%s</a:tr>'
+                % "".join('<a:tc%s><a:txBody><a:bodyPr/><a:p><a:r><a:t>%s</a:t>'
+                          '</a:r></a:p></a:txBody><a:tcPr/></a:tc>'
+                          % (at, xesc(t)) for t, at in row))
+    return ('<p:graphicFrame><p:nvGraphicFramePr><p:cNvPr id="%d" name="Table"/>'
+            '<p:cNvGraphicFramePr/><p:nvPr/></p:nvGraphicFramePr>'
+            '<p:xfrm><a:off x="%d" y="%d"/><a:ext cx="%d" cy="%d"/></p:xfrm>'
+            '<a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/'
+            'drawingml/2006/table"><a:tbl><a:tblPr firstRow="1"/>'
+            '<a:tblGrid>%s</a:tblGrid>%s</a:tbl></a:graphicData></a:graphic>'
+            '</p:graphicFrame>'
+            % (sid, pos[0], pos[1], pos[2], pos[3], grid, trs))
+
+
+def build_adversarial_pptx(path):
+    # type: (str) -> None
+    """The deck written to break a naive converter — and, since P9.6, to make every
+    deck policy drop and every deck-lane escape GRADEABLE on real bytes.
+
+    It exists because of a measurement, not a hunch. With only the three decks the
+    corpus already had, DELETING the fixes this slice depends on left every corpus
+    document byte-identical and the whole eval green: no deck held a merged table
+    cell, a skipped outline level, a picture inside a list, a footer, a bold run, a
+    hyperlink, alt text, an auto-numbered paragraph, a hidden slide or a comment.
+    Every shape below earned its place by being invisible before it was here:
+
+      * a **footer**, a **date** and a **slide number** — excluded by policy on BOTH
+        sides, so the text leaves the recall denominator too and no gate can move;
+      * an **auto-numbered** paragraph, a **custom bullet** and one with **no
+        bullet**, all three of which publish as a plain `-`. The first is why this
+        deck's ground truth omits `ordered_items` instead of stating it zero;
+      * an outline level **skipped** — markdown nests a child only under a parent
+        that exists, so a level is genuinely lost and the count says so;
+      * a table whose **last column is merged away**, which looks exactly like a
+        styled-empty trailing column: without the declared `a:tblGrid` as a floor,
+        the table publishes one column narrower than the deck states;
+      * a **picture between a bullet and its sub-bullet**, which at column 0 closes
+        the list and flattens every item below it;
+      * **bold**, **italic** and **struck-through** runs, a **hyperlink** and
+        **alt text**, none of which the deck lane emits — the four facts the report
+        names as `unmeasured`, each with a counted warning as its receipt;
+      * a **hidden** slide, published as a peer of the ones the deck shows;
+      * a **comment**, and an embedded **SVG**, so the `## Comments` and
+        `## Figures` sections are graded on a deck as well as on a document.
+    """
+    hlink = ('<a:rPr><a:hlinkClick xmlns:r="http://schemas.openxmlformats.org/'
+             'officeDocument/2006/relationships" r:id="rId10"/></a:rPr>')
+    jump = ('<a:rPr><a:hlinkClick xmlns:r="http://schemas.openxmlformats.org/'
+            'officeDocument/2006/relationships" r:id="rId12"/></a:rPr>')
+    slides = [
+        # 1 -- title, plus the three page-furniture placeholders
+        _slide(_sp(2, "Title", [(0, "Kestrel adversarial deck")], ph="ctrTitle",
+                   pos=(457200, 1828800, 8229600, 1371600))
+               + _sp(3, "Subtitle", [(0, "Nimbus Semiconductor, every trap in one "
+                                         "place")], ph="subTitle",
+                     pos=(457200, 3429000, 8229600, 914400))
+               + _sp(4, "Footer", [(0, "Nimbus Semiconductor Confidential")],
+                     ph="ftr", pos=(457200, 6248400, 3000000, 365125))
+               + _sp(5, "Date", [(0, "17 July 2026")], ph="dt",
+                     pos=(3657600, 6248400, 2000000, 365125))
+               + _sp(6, "SlideNumber", [(0, "1")], ph="sldNum",
+                     pos=(5943600, 6248400, 1000000, 365125))),
+        # 2 -- the bullet cascade, a skipped level, and run emphasis
+        _slide(_sp(2, "Title", [(0, "Bring-up sequence")], ph="title",
+                   pos=(457200, 274638, 8229600, 1143000))
+               + _adv_sp(3, "Body", [
+                   (0, '<a:buNone/>',
+                    [("", "Run these in order on the B0 stepping")]),
+                   (0, '<a:buAutoNum type="arabicPeriod"/>',
+                    [("", "Reset the clock tree")]),
+                   (0, '<a:buAutoNum type="arabicPeriod"/>',
+                    [("", "Release fabric traffic")]),
+                   # THREE levels below its parent, not two, and the number is the
+                   # whole point. At two the unclamped indent (four columns) still
+                   # reads as a nested item, so a deck built that way cannot tell a
+                   # converter with the clamp from one without. At three it is six
+                   # columns under a content column of two — a LAZY CONTINUATION,
+                   # which absorbs the bullet into the item above it and leaves every
+                   # token present, so `recall` stays 1.0 and the item is simply gone.
+                   (3, "", [("", "Skipped two levels: no sub-step exists above this")]),
+                   (0, '<a:buChar char="\u00bb"/>',
+                    [("", "Sign-off needs "),
+                     ('<a:rPr b="1"/>', "both"),
+                     ("", " the "),
+                     ('<a:rPr i="1"/>', "timing"),
+                     ("", " and the power run; the "),
+                     ('<a:rPr strike="sngStrike"/>', "week six"),
+                     ("", " date is cancelled")]),
+                 ], ph="body", pos=(457200, 1600200, 8229600, 4525963))),
+        # 3 -- a merged table and a hyperlink
+        _slide(_sp(2, "Title", [(0, "Corner margins")], ph="title",
+                   pos=(457200, 274638, 8229600, 1143000))
+               # THREE declared columns, and the third has no direct occupant in
+               # any row: whoever built it made a Corner / Owner / Sign-off table
+               # and then merged Owner into Sign-off on every row, which is what a
+               # person does when one team signs for both. The grid still says
+               # three. Inferring the width from the cells that carry text says
+               # TWO — a span-covered trailing column looks exactly like a
+               # styled-but-empty one — so without `a:tblGrid` as a floor the deck
+               # publishes a table one column narrower than it states, at
+               # `recall: 1.0` with well-formed GFM and no warning.
+               + _adv_table(4, [
+                   [("Corner", ""), ("Owner", ' gridSpan="2"'), ("", ' hMerge="1"')],
+                   [("Bring-up corners", ' rowSpan="2"'),
+                    ("fabric team", ' gridSpan="2"'), ("", ' hMerge="1"')],
+                   [("", ' vMerge="1"'), ("dma team", ' gridSpan="2"'),
+                    ("", ' hMerge="1"')],
+                 ], 3, (457200, 1600200, 8229600, 2438400))
+               + _adv_sp(6, "Note", [
+                   (0, "", [("", "Full numbers live in "),
+                            (hlink, "the fabric spec"),
+                            ("", ", not on "),
+                            # An INTERNAL jump on an existing run, so the deck
+                            # carries both kinds of link. An external url is emitted
+                            # as a real `[text](url)` and is graded by the `links`
+                            # fact; a slide-to-slide jump still loses its destination
+                            # and is the only thing `dropped_shape_links` reports
+                            # now. Without one here that code would have no corpus
+                            # fixture at all.
+                            (jump, "this slide")])],
+                         pos=(457200, 4400000, 8229600, 800000))),
+        # 4 -- a picture between a bullet and its sub-bullet, with alt text
+        _slide(_sp(2, "Title", [(0, "Coverage trend")], ph="title",
+                   pos=(457200, 274638, 8229600, 1143000))
+               + _adv_sp(3, "Lead", [
+                   (0, "", [("", "Coverage closure is tracked per milestone")])],
+                         ph="body", pos=(457200, 1600200, 8229600, 700000))
+               + '<p:pic><p:nvPicPr><p:cNvPr id="4" name="Coverage plot" '
+                 'descr="Coverage percentage against milestone, six regressions"/>'
+                 '<p:cNvPicPr/><p:nvPr/></p:nvPicPr><p:blipFill>'
+                 '<a:blip xmlns:r="http://schemas.openxmlformats.org/officeDocument'
+                 '/2006/relationships" r:embed="rId11"/><a:stretch><a:fillRect/>'
+                 '</a:stretch></p:blipFill><p:spPr><a:xfrm>'
+                 '<a:off x="457200" y="2400000"/><a:ext cx="2400300" cy="2400300"/>'
+                 '</a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom>'
+                 '</p:spPr></p:pic>'
+               + _adv_sp(5, "Detail", [
+                   (1, "", [("", "The plot above is the last six weekly regressions")])],
+                         pos=(457200, 5000000, 8229600, 700000))),
+        # 5 -- a slide the deck does not show
+        _slide(_sp(2, "Title", [(0, "Backup pricing")], ph="title",
+                   pos=(457200, 274638, 8229600, 1143000))
+               + _sp(3, "Body", [(0, "Only shown if the customer asks for it")],
+                     ph="body", pos=(457200, 1600200, 8229600, 4525963))),
+        # 6 -- a slide part the deck never lists: deleted, not purged
+        _slide(_sp(2, "Title", [(0, "Cut from the deck")], ph="title",
+                   pos=(457200, 274638, 8229600, 1143000))
+               + _sp(3, "Body", [(0, "Its words are still in the package")],
+                     ph="body", pos=(457200, 1600200, 8229600, 4525963))),
+    ]
+    # `show="0"` on part 5: the deck skips it and the markdown publishes it as a
+    # peer of the slides the deck shows. Written here rather than through `_slide`
+    # so no other fixture's bytes can move.
+    slides[4] = slides[4].replace("<p:sld ", '<p:sld show="0" ', 1)
+
+    comments = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+        '<p188:cmLst xmlns:p188="http://schemas.microsoft.com/office/powerpoint/'
+        '2018/8/main" %s><p188:cm id="{00000001-0000-0000-0000-000000000001}">'
+        '<p188:txBody><a:bodyPr/><a:p><a:r><a:t>Check the SSG number against the '
+        'signed-off corner list before this goes out.</a:t></a:r></a:p>'
+        '</p188:txBody></p188:cm></p188:cmLst>' % _A)
+    svg = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+           '<svg xmlns="http://www.w3.org/2000/svg" width="240" height="120" '
+           'viewBox="0 0 240 120"><rect x="8" y="8" width="96" height="40" '
+           'fill="none" stroke="#404040"/><text x="16" y="34">sensor front end'
+           '</text><text x="16" y="96">dsp core</text></svg>')
+    rels = {
+        3: ('<Relationship Id="rId10" Type="http://schemas.openxmlformats.org/'
+            'officeDocument/2006/relationships/hyperlink" '
+            'Target="https://nimbus.example/kestrel/fabric-spec" '
+            'TargetMode="External"/>'
+            '<Relationship Id="rId12" Type="http://schemas.openxmlformats.org/'
+            'officeDocument/2006/relationships/slide" Target="slide5.xml"/>'),
+        4: ('<Relationship Id="rId11" Type="http://schemas.openxmlformats.org/'
+            'officeDocument/2006/relationships/image" '
+            'Target="../media/cov-plot.png"/>'),
+    }
+    _pptx_package(path, slides, {},
+                  "Kestrel adversarial deck", "adversarial",
+                  order=[1, 2, 3, 4, 5],
+                  slide_rels=rels,
+                  extra_parts=[("ppt/comments/modernComment_1.xml", comments),
+                               ("ppt/media/cov-plot.png",
+                                png_bytes(100, 100, _px_grid)),
+                               ("ppt/media/dataflow.svg", svg)],
+                  defaults=(("png", "image/png"), ("svg", "image/svg+xml")))
 
 
 def build_dataflow_pptx(path):
@@ -1536,8 +2035,18 @@ HANDBUILT = [
     ("office/kestrel-clock-spec.docx", build_spec_docx),
     ("office/kestrel-readme.docx", build_minimal_docx),
     ("office/kestrel-registers.xlsx", build_registers_xlsx),
+    ("office/kestrel-adversarial.xlsx", build_adversarial_xlsx),
     ("office/kestrel-overview.pptx", build_overview_pptx),
     ("office/kestrel-dataflow.pptx", build_dataflow_pptx),
+    # A deck whose `p:sldIdLst` and whose slide part names disagree — the shape
+    # PowerPoint produces every time a user drags a slide, and the only shape that
+    # can tell "read the deck's order" from "sort the filenames".
+    ("office/kestrel-reordered.pptx", build_reordered_pptx),
+    # Deliberately NOT in DERIVED_OFFICE: soffice normalises away most of what this
+    # deck exists to hold (it writes no placeholders at all, flattens every outline
+    # level and renumbers the slide parts), so a derived sibling would prove nothing
+    # and the eval would pin a LibreOffice behaviour rather than a doc2md one.
+    ("office/kestrel-adversarial.pptx", build_adversarial_pptx),
     # The document written to break a naive converter: identifiers markdown
     # mangles, a three-level procedure, mixed ordered/bullet nesting, code
     # runs, merged cells, tracked changes and a shouted callout that is not a
