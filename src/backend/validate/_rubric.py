@@ -114,19 +114,29 @@ def gfm_anchor(title):
     return re.sub(r"[-\s]+", "-", text).strip("-")
 
 
-def _adversarial(view):
-    # type: (dict) -> dict
+def _adversarial(view, ext=".docx"):
+    # type: (dict, str) -> dict
+    """The adversarial fixture for one FORMAT.
+
+    The extension is required, not decorative. This used to return the first
+    relpath containing the marker, which was unambiguous only while exactly one
+    adversarial fixture existed. A second one (the workbook P9.4 added, to make the
+    xlsx policy drops gradeable on a real document) made "the adversarial fixture"
+    mean whichever the walk reached first — and the rows below probe format-SPECIFIC
+    shapes: an identifier markdown would mangle, an ALL-CAPS body sentence. Handing
+    those a workbook fails them for the honest reason that a workbook has neither,
+    which is a false FAIL and reads exactly like a regression."""
     for bundle in view.get("bundles", []):
         relpath = bundle.get("report", {}).get("source_relpath", "")
-        if ADVERSARIAL_MARKER in relpath:
+        if ADVERSARIAL_MARKER in relpath and relpath.endswith(ext):
             return bundle
     return {}
 
 
-def _missing_fixture():
-    # type: () -> tuple
-    return (FAIL, "the corpus under grade contains no *%s* fixture, so this "
-                  "condition cannot be demonstrated" % ADVERSARIAL_MARKER)
+def _missing_fixture(ext=".docx"):
+    # type: (str) -> tuple
+    return (FAIL, "the corpus under grade contains no *%s*%s fixture, so this "
+                  "condition cannot be demonstrated" % (ADVERSARIAL_MARKER, ext))
 
 
 def _nothing_to_grade(what):
@@ -283,32 +293,96 @@ def _gfm_tables(markdown):
 
 # ------------------------------------------------- A. document.md — the body
 
+# The office formats that HAVE a converter-blind structural ground truth. A format
+# named here must be graded when the corpus contains one; a format not named here may
+# report `unmeasured` without failing the row. Adding a name is what makes A1 start
+# demanding coverage, so it is a deliberate edit rather than a count.
+_GRADED_FORMATS = ("docx", "xlsx", "pptx")
+
+# The LibreOffice lane converts a legacy or ODF input to its OOXML sibling BEFORE
+# either gate runs, so those inputs are graded by that sibling's ground truth — and
+# measured, they are: `.odp` reports `gate: pass, compared: 7` and `.ods`
+# `pass, compared: 4`, both carrying `pre_conversion_structure` in `blind_to`. A row
+# that bucketed by the SOURCE extension would file them under a format it does not
+# recognise and quietly stop demanding coverage of them. Spelled out rather than
+# imported from `scripts/office_convert._LO_TARGET`: `validate` must not grow an edge
+# to `scripts`, and a rubric that imported the code it grades would only be checking
+# that a module agrees with itself.
+_EFFECTIVE_FORMAT = {"doc": "docx", "odt": "docx", "rtf": "docx",
+                     "ppt": "pptx", "odp": "pptx",
+                     "xls": "xlsx", "ods": "xlsx"}
+
+
 def _a1_structure_gate(view):
     # type: (dict) -> tuple
-    """Every office bundle is either structurally proven or openly unmeasured.
+    """Every office bundle is either structurally proven or openly unmeasured — and
+    the report is PER FORMAT, because one number hid a whole lane.
 
-    ``unmeasured`` is not a failure — pptx and xlsx have no second implementation
-    yet — but it is not a pass either, so the count is always reported. A gap you
-    can see is a gap somebody can close; a gap folded into a green tick is not."""
+    The row used to divide one count by another: `pass on 3 of 3 office bundles
+    (0 unmeasured)` was printed while every deck and every workbook in the real
+    corpus was unmeasured, because the graded corpus was three `.docx` files. Its
+    safety valve (FAIL when EVERY bundle is unmeasured) was honest code that could
+    never execute. Widening the corpus fixed the count; it did not fix the shape.
+    A per-format tally is what makes a lane that quietly stops being graded visible:
+    a format with a ground truth that reports `unmeasured` on a real bundle FAILS
+    here, and a format without one is named as absent rather than folded into a
+    total. The tally is keyed on the SOURCE extension, so a corpus reads back the way
+    an operator thinks of it; whether that extension HAS a ground truth is decided on
+    the effective one, because the LibreOffice lane converts before either gate
+    runs."""
     bundles = _office(view)
     if not bundles:
         return (FAIL, "no office bundles in the corpus under grade")
-    bad, unmeasured = [], 0
+    bad = []
+    tally = {}                      # fmt -> [passing, unmeasured]
     for b in bundles:
-        gate = (b.get("report", {}).get("structure_fidelity") or {}).get("gate")
+        rep = b.get("report", {})
+        fmt = (rep.get("source_format") or rep.get("source_relpath", "")
+               ).rsplit(".", 1)[-1].lower().lstrip(".")
+        slot = tally.setdefault(fmt, [0, 0])
+        gate = (rep.get("structure_fidelity") or {}).get("gate")
         if gate == "unmeasured":
-            unmeasured += 1
-        elif gate != PASS:
+            slot[1] += 1
+        elif gate == PASS:
+            slot[0] += 1
+        else:
             bad.append("%s=%s" % (b.get("doc_id", "?")[:8], gate or "<absent>"))
     if bad:
         return (FAIL, "structure_fidelity not passing on %d/%d office bundles: %s"
                 % (len(bad), len(bundles), ", ".join(bad[:6])))
-    if unmeasured == len(bundles):
+    def _graded(fmt):
+        return _EFFECTIVE_FORMAT.get(fmt, fmt) in _GRADED_FORMATS
+
+    blind = sorted(f for f in tally if _graded(f) and tally[f][1])
+    if blind:
+        return (FAIL, "a format with a ground truth reported 'unmeasured' on a real "
+                      "bundle: %s — either the dispatch stopped reaching it or the "
+                      "truth stopped supplying facts"
+                % ", ".join("%s (%d)" % (f, tally[f][1]) for f in blind))
+    graded = sum(t[0] for t in tally.values())
+    if not graded:
         return (FAIL, "all %d office bundles report structure_fidelity "
-                      "'unmeasured' — nothing was actually graded" % unmeasured)
-    return (PASS, "structure_fidelity.gate == pass on %d of %d office bundles "
-                  "(%d unmeasured: a format with no ground truth yet)"
-            % (len(bundles) - unmeasured, len(bundles), unmeasured))
+                      "'unmeasured' — nothing was actually graded" % len(bundles))
+    # PRESENT, not merely passing. The row could see a graded format that reported
+    # `unmeasured` and could NOT see one that had stopped being built at all:
+    # measured, renaming `gen_corpus.build_overview_pptx` and
+    # `build_adversarial_pptx` made the corpus silently docx+xlsx and this row went
+    # back to printing the "N of N, 0 unmeasured" it was rewritten to kill, with
+    # `OVERALL A` and exit 0. A row that grades coverage has to demand the coverage.
+    covered = set(_EFFECTIVE_FORMAT.get(f, f) for f in tally)
+    uncovered = sorted(f for f in _GRADED_FORMATS if f not in covered)
+    if uncovered:
+        return (FAIL, "the corpus under grade contains no %s bundle, so this row "
+                      "cannot say whether that lane is still graded — a format that "
+                      "stops being BUILT reads exactly like a format with nothing "
+                      "wrong" % ", ".join(uncovered))
+    shown = ", ".join("%s %d/%d" % (f, tally[f][0], tally[f][0] + tally[f][1])
+                      for f in sorted(tally))
+    absent = sorted(f for f in tally if not _graded(f))
+    tail = (" (%s: no ground truth for that format yet)" % ", ".join(absent)) \
+        if absent else ""
+    return (PASS, "structure_fidelity.gate == pass on %d of %d office bundles, by "
+                  "format: %s%s" % (graded, len(bundles), shown, tail))
 
 
 def _a3_verbatim(view):
@@ -948,19 +1022,32 @@ ROWS = [
            )),
     _artifact("A", "A3", "identifiers survive verbatim in the stored bytes",
               _a3_verbatim),
+    # "EVERY deliberate drop" is a claim about all three graded formats, and for
+    # three slices the evidence was a docx. The per-format demonstration is what
+    # makes the condition and the evidence the same sentence.
     _suite("A", "A4", "every deliberate drop emits a named warning carrying a count",
            "tests/unit/backend/test_warning_vocabulary.py", (
                "test_every_documented_warning_code_has_an_emitter",
                "test_every_emitted_warning_code_is_documented",
                "test_a_deliberate_drop_carries_the_size_of_the_loss",
+               "test_every_format_s_drops_carry_the_size_of_the_loss",
                "test_a_document_that_loses_nothing_reports_nothing",
            )),
     # The eval harness is not pytest, so the row names the FIXTURE it is graded
     # on. "The adversarial fixture is pinned" is a claim about one expectation:
     # eighteen other green fixtures do not make it true, and the row must fail if
     # that expectation is ever dropped from evals/expectations.json.
+    #
+    # The condition was plural and the selector was singular for two slices after
+    # the deck and the workbook acquired adversarial fixtures of their own, so
+    # deleting either expectation left `OVERALL A`, exit 0 — the newest lane the
+    # least defended, which is backwards. One fixture per graded format, held to
+    # `_GRADED_FORMATS` and to what gen_corpus really builds by
+    # tests/unit/backend/test_validate_rubric.py.
     _suite("A", "A5", "adversarial fixtures are pinned in the eval corpus",
-           "evals/run_eval.py", ("office/kestrel-adversarial.docx",)),
+           "evals/run_eval.py", ("office/kestrel-adversarial.docx",
+                                 "office/kestrel-adversarial.xlsx",
+                                 "office/kestrel-adversarial.pptx")),
     # B. report.json
     _artifact("B", "B1", "run{} records argv, resolved config with sources, code, host",
               _b1_run_block),
