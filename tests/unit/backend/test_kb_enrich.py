@@ -687,7 +687,31 @@ def test_the_abstract_floor_takes_prose_and_nothing_else():
     # Bounded, and cut at a sentence rather than mid-word.
     short = abstract_floor(BODY, OUTLINE, max_chars=60)
     assert len(short) <= 60 and short.endswith(".")
+    # An outline handed in beside an EMPTY body cannot have come from it, so there
+    # is nothing to summarise and the section-name fallback must not fire.
     assert abstract_floor("", OUTLINE) == ""
+
+
+def test_a_document_with_no_prose_at_all_still_gets_a_floor():
+    """A workbook converts to headings and pipe tables and nothing else, so the
+    lede scan finds no paragraph. That returned the empty string, and every
+    spreadsheet in the corpus shipped with NO abstract — invisible to the rubric
+    for as long as the documents under grade were all prose-bearing `.docx`.
+
+    The fallback names the document's own sections: measured evidence, in the
+    document's own words, nothing characterised or inferred. A poorer summary than
+    a lede, and a real one."""
+    from backend.sections import document_outline
+    body = ("## Milestones\n\n| Milestone | Due |\n| --- | --- |\n| RTL freeze | 46027 |\n"
+            "\n## Rails\n\n| Rail | mW |\n| --- | --- |\n| VDD_CORE | 182.5 |\n")
+    outline = document_outline(body)["outline"]
+    assert abstract_floor(body, outline) == "Sections: Milestones, Rails."
+
+    # Prose still wins wherever there is any: the fallback is a floor under the
+    # lede, never a replacement for it.
+    mixed = "## Overview\n\nThe arbiter serves both queues.\n\n| a |\n| --- |\n| 1 |\n"
+    assert abstract_floor(mixed, document_outline(mixed)["outline"]) == (
+        "The arbiter serves both queues.")
 
 
 def test_every_harvested_link_is_categorised_and_carries_the_section_it_sits_in():

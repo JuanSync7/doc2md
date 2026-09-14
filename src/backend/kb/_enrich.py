@@ -812,12 +812,36 @@ def abstract_floor(body_md, outline=None, max_chars=320):
 
     Markdown is stripped through the shared `markdown_to_text`, so a lede full of
     links and emphasis reads as sentences instead of syntax.
+
+    A DOCUMENT WITH NO PROSE AT ALL still gets a floor, and it took a wider graded
+    corpus to notice that one did not. A workbook converts to headings and pipe
+    tables and nothing else, so `_lede_lines` finds no paragraph and this returned
+    the empty string — every spreadsheet in the corpus shipped with no abstract, and
+    the rubric could not see it because the documents under grade were all
+    prose-bearing `.docx`. The fallback names the document's own SECTIONS: measured
+    evidence, in the document's own words, nothing characterised or inferred. It is
+    a poorer summary than a lede and it is a real one, which is the difference
+    between a floor and a blank.
     """
     lines = _lede_lines(body_md, outline)
-    if not lines:
+    if lines:
+        text = _WS.sub(" ", markdown_to_text(" ".join(lines))).strip()
+        return _truncate_sentence(text, max_chars) if text else ""
+    if not (body_md or "").strip():
+        # No body, no summary. An outline handed in beside an empty body cannot have
+        # come from it — a stale tree, or a failed conversion whose tree outlived its
+        # markdown — and summarising THAT would put section names on a page that has
+        # none. The existing prose test asserted this invariant and caught the
+        # fallback inventing an abstract for an empty document.
         return ""
-    text = _WS.sub(" ", markdown_to_text(" ".join(lines))).strip()
-    return _truncate_sentence(text, max_chars) if text else ""
+    titles = []
+    for node in _outline_nodes(outline):
+        title = _WS.sub(" ", (node.get("title") or "")).strip()
+        if title and title not in titles:
+            titles.append(title)
+    if not titles:
+        return ""
+    return _truncate_sentence("Sections: " + ", ".join(titles) + ".", max_chars)
 
 
 def link_category(url):
