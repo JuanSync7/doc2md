@@ -687,11 +687,37 @@ def _outline_nodes(outline):
     return out
 
 
+def _title_for_metadata(title):
+    # type: (str) -> str
+    """A heading title as a READER should see it — prose, not markdown.
+
+    The outline keeps a title VERBATIM by design: structure.json publishes what the
+    render says, markers and all. The METADATA path is the other case. `title`,
+    `abstract` and `slug` are consumed as STRINGS — printed on a page, embedded,
+    indexed, put in a URL — and none of those consumers parse markdown.
+
+    `slugify` is the sharpest of the three, because it turns every non-slug character
+    into a hyphen, so a marker becomes a WORD BOUNDARY the heading does not have. On a
+    heading `***read***<!---->*only* registers` the document's own url form came out
+    `read-only-registers` while its heading fragment said `readonly-registers` — one
+    heading, two spellings. The `<!---->` there is the span separator `_render_runs`
+    writes between two adjacent emphasis runs whose delimiters would otherwise fuse,
+    and it is punctuation this converter INVENTED: it stands for nothing the source
+    document contains. But removing only the comment still left the asterisks inventing
+    the same boundary, so the honest fix is the one function whose whole contract is
+    "preserve the prose tokens, drop the syntax".
+
+    Measured over the shipped corpus: no heading in any of the nine office documents
+    carries a marker, so this moves no published byte today. It decides what happens
+    when one does."""
+    return _WS.sub(" ", markdown_to_text(title or "")).strip()
+
+
 def _first_heading(body_md, outline=None):
     # type: (str, list) -> str
     """The document's own opening heading — from the outline when there is one."""
     for node in _outline_nodes(outline):
-        title = (node.get("title") or "").strip()
+        title = _title_for_metadata(node.get("title"))
         if title:
             return title
     for line in (body_md or "").split("\n"):
@@ -836,7 +862,7 @@ def abstract_floor(body_md, outline=None, max_chars=320):
         return ""
     titles = []
     for node in _outline_nodes(outline):
-        title = _WS.sub(" ", (node.get("title") or "")).strip()
+        title = _title_for_metadata(node.get("title"))
         if title and title not in titles:
             titles.append(title)
     if not titles:
