@@ -69,6 +69,26 @@ for the architecture and rationale.
 - `ooxml_markdown` / `ooxml_source_text` (+ the per-format `docx_*`/`pptx_*`/
   `xlsx_*`) — the deterministic OOXML→markdown converters and their independent
   exhaustive ground truth (`scripts/office_convert.py` is the zip I/O + gate).
+- `docx_source_structure` / `xlsx_source_structure` / `pptx_source_structure` —
+  the second ground truth, answering the other question. Token recall asks *is
+  every word still here*; these state the STRUCTURAL facts a faithful conversion
+  must exhibit, and `backend.validate.structure_fidelity_report` grades the
+  emitted markdown against them. Each lives in its format's own `_*_struct`
+  module with its own readers: **a helper shared with the converter is called on
+  both sides of the comparison, so a bug in it cancels and the gate goes green
+  over real damage.** Two modules may be shared and each argues its roster in its
+  own header: `_ooxml_leaf` (four XML-syntax primitives, shared with the converter
+  too) and `_struct_common` (parent maps, ancestry, the token notion, the heading
+  record — mechanism shared among these three SOURCE-side truths and with **nothing
+  else**, because all three sit on one side of the comparison while the converter
+  and `backend.validate._mdstructure` sit on the other). Both boundaries are
+  enforced by an `ast` read of the real import statements, not by a comment; the
+  fact VECTORS are deliberately not shared, because a stated zero is each format's
+  own falsifiable claim rather than mechanism.
+- `policy_drops` / `furniture_drops` — every deliberate flattening or drop, as
+  named warnings carrying the size of the loss. `policy_drops` is the single entry
+  point and delegates to the per-format readers; a drop nobody counted reads
+  exactly like a bug.
 
 > The **validators** — `validate_markdown` and the lossless `conversion_report`
 > gate — live in the sibling package [`backend.validate`](../validate/README.md),

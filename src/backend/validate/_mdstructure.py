@@ -74,7 +74,13 @@ _PUNCT = set("!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~\x00")
 # hyperlink as `[text](url)`, and the URL is markup, not cell content — comparing
 # it against a source that never held it would fail every table with a link in it.
 _WORDS = re.compile(r"[a-z0-9]+")
-_INLINE_LINK = re.compile(r"!?\[([^\]]*)\]\([^)]*\)")
+# `(?<!\\)` for the same reason `_BR` below carries it, and it was missing here: the
+# converter ESCAPES a bracket when the document's own text contains one, so a cell
+# or list item whose literal text is `[t](u)` is emitted `\[t\](u)` and every
+# renderer shows the brackets. Reducing that to its "link text" dropped the `u` —
+# a token the document really holds — and failed a faithful conversion of any cell
+# that merely LOOKS like a link.
+_INLINE_LINK = re.compile(r"!?(?<!\\)\[([^\]]*)\]\([^)]*\)")
 # THE ONE PROJECT-SPECIFIC RULE IN THIS OTHERWISE CONVERTER-BLIND READER, and it is
 # a statement about RENDERING, not about the converter's intent: a GFM cell cannot
 # hold a newline, so a multi-paragraph table cell is written `a<br>b`, and every
@@ -86,12 +92,56 @@ _INLINE_LINK = re.compile(r"!?\[([^\]]*)\]\([^)]*\)")
 # tag, and that IS prose the source side carries. Deliberately NOT generalised to
 # `<[^>]*>` — an HTML comment sentinel or a `<stderr>` in prose is content.
 _BR = re.compile(r"(?<!\\)<br\s*/?>", re.I)
+# The SECOND project-specific rule, and deliberately the narrowest one that works: an
+# EMPTY html comment only. `_render_runs` writes `<!---->` between two adjacent
+# emphasis spans whose delimiter runs would otherwise merge, and it writes it exactly
+# where the two are adjacent with NO whitespace — between two halves of one word. A
+# source that holds the single run pair `alpha` + `beta` says `alphabeta`; leaving the
+# separator in said `alpha`, `beta` and failed a faithful conversion on
+# `list_item_words`.
+#
+# Not widened to every comment, for the reason the note above `_BR` already gives: a
+# content-bearing comment is CONTENT to this reader. Removed to NOTHING rather than to
+# a space, because it never stands where a space belongs.
+_EMPTY_COMMENT = re.compile(r"(?<!\\)<!---*->")
+# THE THIRD, and the one that was costing real documents. `_WORDS` is `[a-z0-9]+`, so
+# every other character SEPARATES — right for punctuation the document wrote, wrong
+# for a marker the CONVERTER wrote. Bolding part of a word (`**Dma**Arbiter`, the most
+# ordinary thing in a datasheet) made this side read ("dma", "arbiter") where the
+# source truth correctly reads ("dmaarbiter",), so `list_item_words` disagreed and the
+# document refused to publish at `token_recall: 1.0`.
+#
+# Safe for exactly one reason, and it is a property of the converter's ESCAPING rather
+# than of its intent: `*`, `~` and a backtick are escaped whenever the document's own
+# text contains one, so an unescaped run of them in emitted markdown is always a
+# marker. `_` is NOT here — this converter never emits it as a marker, and leaves it
+# unescaped inside an identifier (`CLK_100M`), so stripping it would JOIN two tokens
+# the source separates.
+_MARKER_RUN = re.compile(r"(?<!\\)[*~`]+")
+# A code span is emitted VERBATIM — that is what it is for — so an asterisk inside one
+# is the document's own and must keep separating. Matched here so the marker strip can
+# step around it rather than through it.
+_CODE_SPAN = re.compile(r"(?<!\\)(`+)(.+?)\1", re.S)
+
+
+def _strip_markers(text):
+    # type: (str) -> str
+    """Drop the converter's marker runs, leaving code-span CONTENT untouched."""
+    out = []  # type: list
+    pos = 0
+    for m in _CODE_SPAN.finditer(text):
+        out.append(_MARKER_RUN.sub("", text[pos:m.start()]))
+        out.append(m.group(2))
+        pos = m.end()
+    out.append(_MARKER_RUN.sub("", text[pos:]))
+    return "".join(out)
 
 
 def _words(text):
     # type: (str) -> tuple
     text = _INLINE_LINK.sub(r"\1", text or "")
-    return tuple(_WORDS.findall(_BR.sub(" ", text).lower()))
+    text = _EMPTY_COMMENT.sub("", _BR.sub(" ", text))
+    return tuple(_WORDS.findall(_strip_markers(text).lower()))
 
 
 def _expand(line):
@@ -355,6 +405,18 @@ def md_structure(markdown):
     """
     counter = {"strong": 0, "em": 0, "strike": 0, "code_spans": 0,
                "links": 0, "images": 0}
+    # The ORDER the graded blocks appear in, one entry per block. Every other fact
+    # here is a total or a per-kind list, and neither can see a block that moved
+    # between sections: relocate a table from under one heading to under another and
+    # the histogram, the geometry, the cell contents and the token multiset are all
+    # untouched. `block_sequence` is the interleaving those facts are missing, and it
+    # is built ONLY from blocks the fact vector already states, so it predicts
+    # nothing new — it says where what is already counted actually sits.
+    block_sequence = []  # type: list
+
+    def add_block(kind, key):
+        block_sequence.append((kind, key))
+
     headings = {}
     list_items = {}
     ordered_items = bullet_items = code_blocks = block_quotes = 0
@@ -383,6 +445,12 @@ def md_structure(markdown):
     in_icode = False                              # inside an indented code block
     in_quote = False                              # inside a block quote
     i = 0
+    # A list item's first line, re-queued to be read again at its content column
+    # (see the splice below). It holds at most one line at a time — each is consumed
+    # by the very next iteration — and it is a stack rather than an insert into
+    # `lines` so the cost stays O(1): splicing into the list moved every remaining
+    # line on every list item, which measured 30us/item against 18 at 80k items.
+    pending = []  # type: list
 
     def flush_table():
         # Resolve the open paragraph: a header + delimiter row makes it a table.
@@ -398,6 +466,7 @@ def md_structure(markdown):
             # all unchanged, while the table now says something else entirely.
             tables.append({"rows": 1 + len(body), "cols": cols,
                            "has_header": True, "cells": cells})
+            add_block("table", (1 + len(body), cols))
             for row in [para[0]] + body:
                 for cell in _split_row(row):
                     _scan_inline(cell, counter)
@@ -406,9 +475,12 @@ def md_structure(markdown):
                 _scan_inline(row, counter)
         del para[:]
 
-    while i < len(lines):
-        raw = lines[i]
-        i += 1
+    while pending or i < len(lines):
+        if pending:
+            raw = pending.pop()
+        else:
+            raw = lines[i]
+            i += 1
         stripped = raw.strip()
         indent = _indent_of(raw)
         content = raw[indent:]
@@ -476,6 +548,7 @@ def md_structure(markdown):
                 continue
             if not in_icode:
                 code_blocks += 1                  # an indented code block
+                add_block("code", 0)
                 in_icode = True
                 close_lists(len(stack))
             continue
@@ -486,6 +559,7 @@ def md_structure(markdown):
             if not in_quote:
                 block_quotes += 1
                 in_quote = True
+                add_block("quote", 0)
             _scan_inline(_BLOCKQUOTE.sub("", content), counter)
             continue
         in_quote = False
@@ -496,6 +570,7 @@ def md_structure(markdown):
             fence = fm.group(1)
             fence_base = base                     # the column its close is judged from
             code_blocks += 1
+            add_block("code", 0)
             continue
 
         # A setext underline turns the open paragraph into a heading. It has to
@@ -515,6 +590,7 @@ def md_structure(markdown):
                 level = 1 if content[0] == "=" else 2
                 headings[level] = headings.get(level, 0) + 1
                 heading_path.append((level, _words(" ".join(para))))
+                add_block("h", level)
                 close_lists(len(stack))           # `-` alone reads as a bullet above
                 for row in para:
                     _scan_inline(row, counter)
@@ -527,6 +603,7 @@ def md_structure(markdown):
             level = len(atx.group(1))
             headings[level] = headings.get(level, 0) + 1
             heading_path.append((level, _words(atx.group(2) or "")))
+            add_block("h", level)
             _scan_inline(atx.group(2) or "", counter)
             continue
 
@@ -537,6 +614,7 @@ def md_structure(markdown):
             # carries no tokens, so recall is blind to it; counting it is the only
             # way the fidelity gate can see that substitution happen.
             thematic_breaks += 1
+            add_block("hr", 0)
             continue
 
         if bm or om:
@@ -556,6 +634,7 @@ def md_structure(markdown):
             width = 1 if wide else len(spaces)
             depth = len(stack)
             list_items[depth] = list_items.get(depth, 0) + 1
+            add_block("li", depth)
             # Ordered item CONTENT: a procedure whose steps were swapped has the
             # same depth histogram and the same token multiset as the real one.
             list_item_words.append(_words(rest))
@@ -581,8 +660,33 @@ def md_structure(markdown):
                 code_blocks += 1                  # the item opens with code
                 in_icode = True
             elif rest.strip():
-                para.append(rest)
-                para_depth = len(stack)
+                # An item's FIRST line is a LINE, at the item's content column —
+                # not a paragraph by fiat. After `- `, CommonMark opens a heading, a
+                # nested list, a quote, a fence or a thematic break exactly as it
+                # would at column 0, and treating that text as prose made this
+                # reader disagree with a real parser about five constructs at once:
+                #
+                #     markdown          marko            this reader (before)
+                #     `- 15. step`      ul,li,ol,li      one bullet, no ordered item
+                #     `- ## Rollout`    ul,li,h2         one bullet, no heading
+                #     `- > quote`       ul,li,blockquote one bullet, no quote
+                #     `- + item`        ul,li,ul,li      one bullet, not two
+                #     `- [r]: dest`     ul,li            one bullet -- and the LINE
+                #                                        is gone from the render
+                #
+                # It saw the same constructs perfectly on a CONTINUATION line
+                # (`- item` / `  ## H2` counts the heading), so the gap was the
+                # marker's own line and nothing else. That is precisely where a
+                # converter puts source text, which is what made an unescaped
+                # bullet reading `- - -` a loss BOTH gates certified.
+                #
+                # Re-dispatching the rest through this same loop, indented to the
+                # column it really occupies, is what makes the item's first line
+                # obey the same rules as every other line. `rest` is always shorter
+                # than `content` by at least the marker, so this terminates — and
+                # `pending` is a one-slot stack rather than a splice into `lines`,
+                # so it terminates in LINEAR time.
+                pending.append(" " * stack[-1].col + rest)
             continue
 
         if "|" not in content:
@@ -603,6 +707,7 @@ def md_structure(markdown):
         "block_quotes": block_quotes,
         "tables": tables,
         "list_item_words": list_item_words,
+        "block_sequence": block_sequence,
         "max_list_depth": (max(list_items) + 1) if list_items else 0,
     }
     result.update(counter)

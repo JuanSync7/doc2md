@@ -18,7 +18,20 @@ import re
 __all__ = ["markdown_to_text", "collapse_table_padding"]
 
 # (?<!\\): a converter-escaped literal "\<!-- ... -->" is prose, not a comment.
-_COMMENT = re.compile(r"(?<!\\)<!--.*?-->", re.S)
+# `(?!-*->)` keeps this off the EMPTY form below: the two are handled at different
+# STAGES, and a pattern that matched both would consume the separator here — before
+# the emphasis it exists to keep apart has been unwrapped.
+_COMMENT = re.compile(r"(?<!\\)<!--(?!-*->).*?-->", re.S)
+# An EMPTY comment is a different thing from a comment carrying a sentinel, and the
+# difference is a whole token. `_render_runs` writes `<!---->` between two adjacent
+# emphasis spans whose delimiter runs would otherwise merge — and it writes it
+# exactly where the two spans are adjacent with NO whitespace, which is to say
+# between two halves of one word. The source run pair `alpha` + `beta` is the single
+# token `alphabeta`; substituting a space there split it in two and took token recall
+# to 0.0 on a faithful document. A sentinel comment keeps the space, because it
+# stands between BLOCKS and removing it would weld the last word of one to the first
+# of the next.
+_EMPTY_COMMENT = re.compile(r"(?<!\\)<!---*->")
 # The ONE inline HTML tag this project emits: _docx_cell_text joins a multi-paragraph
 # table cell with <br>, because a GFM cell cannot hold a newline. Left alone it
 # reaches the text layer as the literal token "br" — harmless to the recall gate,
@@ -38,7 +51,15 @@ _TABLE_SEP = re.compile(r"^\s*\|?[\s:|-]*-[\s:|-]*\|?\s*$")
 _ATX = re.compile(r"^\s*#{1,6}\s+")
 _ATX_CLOSE = re.compile(r"\s+#+\s*$")
 _BLOCKQUOTE = re.compile(r"^\s*>+\s?")
-_LIST = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+")
+# `\d{1,9}` is CommonMark's own cap on an ordered marker, and this reader must
+# obey it because a marker it strips is a marker a RENDERER would not: an
+# unbounded `\d+` ate the leading number of `1234567890. bill of materials`,
+# which every parser renders as an ordinary paragraph. That deletion is on the
+# MARKDOWN side of the token gate, so it did not corrupt the output — it made a
+# FAITHFUL document fail to publish, at recall 0.833 with the number reported
+# missing. `_mdstructure._ORDERED` and `_ooxml_md._LEAD_LIST_NUM` carry the same
+# cap; all three read a marker, and a change to one is a change to all three.
+_LIST = re.compile(r"^\s*(?:[-*+]|\d{1,9}[.)])\s+")
 _TABLE_ROW = re.compile(r"^\s*\|")
 
 _IMG = re.compile(r"!\[([^\]]*)\]\([^)]*\)")
@@ -114,6 +135,14 @@ def _inline(text):
     text = _STRIKE.sub(lambda m: m.group(1), text)
     text = _ITALIC_STAR.sub(lambda m: m.group(1), text)
     text = _ITALIC_US.sub(lambda m: m.group(1), text)
+    # AFTER the emphasis, and the order is the whole point. `<!---->` is written
+    # BETWEEN two adjacent spans precisely so their delimiter runs cannot merge;
+    # removing it first puts `***alpha****beta*` back together and the patterns above
+    # mis-pair it again, leaving a literal `*beta*` in the text layer. It is stripped
+    # to NOTHING rather than to a space because it only ever stands where the two
+    # spans are adjacent with no whitespace — between two halves of one word, whose
+    # source is the single token `alphabeta`.
+    text = _EMPTY_COMMENT.sub("", text)
     text = _CODE_SLOT.sub(lambda m: stash[int(m.group(1))], text)
     return _PLACEHOLDER.sub(lambda m: chr(int(m.group(1), 16)), text)
 
@@ -232,7 +261,14 @@ def markdown_to_text(md):
         if is_heading:
             line = _ATX.sub("", line)
             line = _ATX_CLOSE.sub("", line)
-        line = _LIST.sub("", line)
+        # A HEADING's content is not a list. Running the list stripper over it as
+        # well read `## 1. Overview` as a heading containing an ordered item and
+        # deleted the `1` — so a workbook with a sheet named `1. Overview`, or a
+        # document with a numbered heading, published nothing and failed the token
+        # gate at recall 0.500. No renderer reads it that way; the strippers are a
+        # sequence of block rules, and a line belongs to exactly one block.
+        if not is_heading:
+            line = _LIST.sub("", line)
         is_row = bool(_TABLE_ROW.match(raw))
         if is_row:
             line = _split_cells(line)

@@ -505,3 +505,194 @@ def test_a_tilde_line_inside_a_backtick_fence_does_not_unmask_the_rest():
 ])
 def test_gfm_anchor(title, want):
     assert gfm_anchor(title) == want
+
+
+# ------------------------------- A1 reports per FORMAT, because one count hid a lane
+
+def _office_bundle(relpath, gate):
+    return {"doc_id": relpath, "report": {
+        "lane": "office", "source_relpath": relpath,
+        "source_format": "." + relpath.rsplit(".", 1)[-1],
+        "structure_fidelity": {"gate": gate}}}
+
+
+def _a1(bundles):
+    from backend.validate._rubric import _a1_structure_gate
+    return _a1_structure_gate({"bundles": bundles})
+
+
+def test_a1_names_the_formats_it_graded():
+    verdict, why = _a1([_office_bundle("a.docx", "pass"),
+                        _office_bundle("b.xlsx", "pass"),
+                        _office_bundle("c.pptx", "pass")])
+    assert verdict == PASS
+    for fmt in ("docx 1/1", "xlsx 1/1", "pptx 1/1"):
+        assert fmt in why, why
+
+
+def test_a1_fails_when_a_format_that_has_a_ground_truth_reports_unmeasured():
+    """The shape the old row could not see. It divided one count by another, so a
+    deck lane that had quietly stopped being dispatched still read `pass on 2 of 3
+    (1 unmeasured)` — a green tick with a whole format behind it."""
+    verdict, why = _a1([_office_bundle("a.docx", "pass"),
+                        _office_bundle("b.xlsx", "pass"),
+                        _office_bundle("c.pptx", "unmeasured")])
+    assert verdict == FAIL
+    assert "pptx" in why
+
+
+def test_a1_does_not_demand_a_format_that_has_no_ground_truth_yet():
+    """`unmeasured` is not a failure for a format nobody has written a second reader
+    for — it is the honest report — but it must be NAMED rather than folded into a
+    total that reads like coverage.
+
+    No such office format exists TODAY, and that is worth writing down rather than
+    leaving as a gap in the test: every extension the office lane accepts either is
+    OOXML or is converted to an OOXML sibling before either gate runs, so all of them
+    are graded. `.odp` was the obvious candidate for this test and it is wrong —
+    measured, an `.odp` reports `gate: pass, compared: 7`. The branch is the row's
+    stated contract for the next format somebody adds, so it is exercised with an
+    extension the lane does not have."""
+    verdict, why = _a1([_office_bundle("a.docx", "pass"),
+                        _office_bundle("b.xlsx", "pass"),
+                        _office_bundle("c.pptx", "pass"),
+                        _office_bundle("d.pages", "unmeasured")])
+    assert verdict == PASS
+    assert "pages" in why and "no ground truth" in why
+
+
+def test_a1_still_fails_when_nothing_at_all_was_graded():
+    verdict, _why = _a1([_office_bundle("a.odp", "unmeasured")])
+    assert verdict == FAIL
+
+
+def test_a1_knows_a_legacy_input_is_graded_through_its_ooxml_sibling():
+    """`.ppt` is converted to `.pptx` before either gate runs, so it IS graded — and
+    measured, `.odp` reports `pass, compared: 7`. Bucketing on the source extension
+    alone filed it under a format the row does not recognise, which would have
+    stopped it demanding coverage of the whole LibreOffice lane."""
+    verdict, why = _a1([_office_bundle("a.docx", "pass"),
+                        _office_bundle("b.ppt", "unmeasured")])
+    assert verdict == FAIL
+    assert "ppt" in why
+
+
+def test_a1_reports_a_legacy_input_under_its_own_extension():
+    verdict, why = _a1([_office_bundle("a.docx", "pass"),
+                        _office_bundle("b.xlsx", "pass"),
+                        _office_bundle("c.ppt", "pass")])
+    assert verdict == PASS
+    assert "ppt 1/1" in why and "docx 1/1" in why
+    assert "pptx" not in why, "a .ppt IS the deck lane's coverage; do not ask twice"
+
+
+def test_a1_fails_when_a_graded_format_is_absent_from_the_corpus():
+    """The half the row could not see. It caught a deck reporting `unmeasured` and
+    was blind to a deck that had stopped being built: renaming the corpus generator's
+    two deck builders made the corpus silently docx+xlsx, and the row printed the
+    same "N of N, 0 unmeasured" it was rewritten to kill — `OVERALL A`, exit 0."""
+    verdict, why = _a1([_office_bundle("a.docx", "pass"),
+                        _office_bundle("b.xlsx", "pass")])
+    assert verdict == FAIL
+    assert "pptx" in why
+
+
+# ------------------------------------------- the SELECTORS, which nothing graded
+
+# A `_suite` row's selector is the difference between "the condition this row
+# asserts is demonstrated" and "that file is green". Nothing checked the selectors
+# themselves, so the rubric could grade an A off a name that no longer exists (the
+# runner sees no outcome for it, and `_row_verdict` has to decide what silence
+# means) or off a demonstration narrower than the condition. Measured before these
+# were written: A5 asserted "adversarial fixture**s** are pinned" while naming one
+# of the three the corpus builds, so deleting the deck's or the workbook's
+# expectation from evals/expectations.json left `OVERALL A`, exit 0.
+
+import ast as _ast
+import os as _os
+
+_REPO = _os.path.dirname(_os.path.dirname(_os.path.dirname(
+    _os.path.dirname(_os.path.abspath(__file__)))))
+
+_SUITE_ROWS = [r for r in RUBRIC_ROWS if r.kind == "suite"]
+
+
+def test_there_are_suite_rows_to_guard():
+    """The two guards below are parametrised over `_SUITE_ROWS`, and pytest reports
+    a parametrisation over an empty list as zero tests collected, not as a failure.
+    A rubric that lost its suite rows would take both guards green with it."""
+    assert len(_SUITE_ROWS) >= 10, _SUITE_ROWS
+
+
+def _defs(path):
+    """Every function name the file defines, by reading it rather than importing it."""
+    with open(path) as fh:
+        tree = _ast.parse(fh.read())
+    return set(n.name for n in _ast.walk(tree) if isinstance(n, _ast.FunctionDef))
+
+
+@pytest.mark.parametrize("row", _SUITE_ROWS, ids=[r.rid for r in _SUITE_ROWS])
+def test_every_suite_row_names_a_target_that_exists(row):
+    assert _os.path.exists(_os.path.join(_REPO, row.target)), (
+        "%s names %s, which is not in the repo" % (row.rid, row.target))
+
+
+@pytest.mark.parametrize(
+    "row", [r for r in _SUITE_ROWS if not r.target.endswith("run_eval.py")],
+    ids=[r.rid for r in _SUITE_ROWS if not r.target.endswith("run_eval.py")])
+def test_every_named_demonstration_is_a_test_that_exists(row):
+    """A renamed test does not fail here today; it fails at GRADE time, in a
+    subprocess, as a row whose evidence is a name nobody recognises. Renaming a test
+    is a routine refactor, so the rubric has to be part of that refactor."""
+    have = _defs(_os.path.join(_REPO, row.target))
+    missing = [s for s in row.selector if s not in have]
+    assert not missing, (
+        "%s names tests that %s no longer defines: %s — rename the selector with "
+        "the test, or the row grades on silence" % (row.rid, row.target, missing))
+
+
+def _adversarial_builders():
+    """The adversarial fixtures the corpus generator really builds, by extension."""
+    have = _defs(_os.path.join(_REPO, "evals", "gen_corpus.py"))
+    return sorted(n.split("build_adversarial_")[1]
+                  for n in have if n.startswith("build_adversarial_"))
+
+
+def test_a5_pins_every_adversarial_fixture_the_corpus_builds():
+    """A5's condition is plural and its selector was singular. An adversarial
+    fixture that is built but not pinned is a fixture whose expectation can be
+    deleted — the fixture keeps being generated, the eval keeps passing over it
+    with nothing asserted, and the row that exists to notice says A."""
+    row = [r for r in RUBRIC_ROWS if r.rid == "A5"][0]
+    pinned = set(s.rsplit(".", 1)[-1] for s in row.selector)
+    built = _adversarial_builders()
+    # Without this the guard is vacuous in exactly the case that matters: move or
+    # rename gen_corpus's builders and `built` is empty, `missing` is empty, green.
+    assert built, "evals/gen_corpus.py defines no build_adversarial_* at all"
+    missing = [e for e in built if e not in pinned]
+    assert not missing, (
+        "gen_corpus builds an adversarial %s that A5 does not pin; add "
+        "office/kestrel-adversarial.<ext> to its selector" % missing)
+
+
+def test_a5_pins_an_adversarial_fixture_for_every_graded_format():
+    """The other direction. A format joins `_GRADED_FORMATS` when it acquires a
+    second implementation to grade it against; the fixture written to break a naive
+    converter for that format is what keeps the grading honest, so the two lists
+    move together or the newest lane is the least defended."""
+    from backend.validate._rubric import _GRADED_FORMATS
+    row = [r for r in RUBRIC_ROWS if r.rid == "A5"][0]
+    pinned = set(s.rsplit(".", 1)[-1] for s in row.selector)
+    missing = [f for f in _GRADED_FORMATS if f not in pinned]
+    assert not missing, (
+        "these formats are graded but have no pinned adversarial fixture: %s"
+        % missing)
+
+
+def test_a4_grades_its_condition_on_every_format_not_only_on_docx():
+    """A4 says "EVERY deliberate drop emits a named warning carrying a count". The
+    per-format demonstration landed in P9.6 and the row went on naming only the
+    docx one, so the condition was word-for-word about all three formats and the
+    evidence was about one."""
+    row = [r for r in RUBRIC_ROWS if r.rid == "A4"][0]
+    assert "test_every_format_s_drops_carry_the_size_of_the_loss" in row.selector

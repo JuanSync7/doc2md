@@ -74,6 +74,14 @@ _WS = re.compile(r"\s+")
 # distinct without needing a disambiguating suffix.
 _ANCHOR_DROP = re.compile(r'[^\w\s-]', re.UNICODE)
 _ANCHOR_SEP = re.compile(r'[-\s]+', re.UNICODE)
+# An HTML COMMENT contributes no character to the heading a reader sees, and its
+# dashes are `-` — a character this rule KEEPS. `_render_runs` writes `<!---->`
+# between two emphasis spans whose delimiters would fuse (P9.9), so a heading can
+# hold one: `***read***<!---->*only*` slugged `read-only` while the rendered heading
+# is `readonly`, and a reader copying the fragment off the page landed nowhere. All
+# three copies of this rule had the same defect, which is why agreement between them
+# is necessary and not sufficient.
+_ANCHOR_COMMENT = re.compile(r"<!--.*?-->", re.S)
 
 
 def gfm_anchor(title):
@@ -84,7 +92,8 @@ def gfm_anchor(title):
     (underscores and non-ASCII letters survive — dropping them reported live links
     as dead), then collapse whitespace-and-hyphen runs to a single hyphen and trim.
     """
-    s = _ANCHOR_DROP.sub('', (title or "").strip().lower())
+    s = _ANCHOR_COMMENT.sub('', (title or "").strip().lower())
+    s = _ANCHOR_DROP.sub('', s)
     return _ANCHOR_SEP.sub('-', s).strip('-')
 
 

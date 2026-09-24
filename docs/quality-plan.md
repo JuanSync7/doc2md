@@ -128,11 +128,11 @@ by a predicate reading the graded corpus).
 
 | # | Kind | Condition | Verified by |
 |---|---|---|---|
-| A1 | artifact | A second hard gate, `structure_fidelity`, grades **fifteen** facts against a converter-blind OOXML ground truth: `headings` (by level), `heading_path` (each heading's title tokens, with its level, in order), `list_items` (by nesting depth), `ordered_items`, `bullet_items`, `ordered_numbers` (the number a renderer **prints**, in order), `strong`, `em`, `strike`, `code_spans`, `code_blocks`, `links`, `tables` (rows × cols **and every cell's content**), `list_item_words` (every list item's text, in order), and `thematic_breaks`. The office lane fails on any mismatch; a format with no second implementation reports `unmeasured`, never `pass`; a fact the ground truth does not supply is named in `structure_fidelity.unmeasured` rather than silently skipped | `_rubric._a1_structure_gate` via `scripts/grade_output.py` — `report.json.structure_fidelity.gate == "pass"` corpus-wide. The closed list is `backend.validate._mdcheck._FIDELITY_FACTS`; **do not restate its length here without re-counting it**, which is how this row came to say "twelve" |
+| A1 | artifact | A second hard gate, `structure_fidelity`, grades **sixteen** facts against a converter-blind OOXML ground truth: `headings` (by level), `heading_path` (each heading's title tokens, with its level, in order), `list_items` (by nesting depth), `ordered_items`, `bullet_items`, `ordered_numbers` (the number a renderer **prints**, in order), `strong`, `em`, `strike`, `code_spans`, `code_blocks`, `links`, `tables` (rows × cols **and every cell's content**), `list_item_words` (every list item's text, in order), `thematic_breaks`, and `block_sequence` (the order the graded blocks appear in). The office lane fails on any mismatch; a format with no second implementation reports `unmeasured`, never `pass`; a fact the ground truth does not supply is named in `structure_fidelity.unmeasured` rather than silently skipped | `_rubric._a1_structure_gate` via `scripts/grade_output.py` — `report.json.structure_fidelity.gate == "pass"`, reported **per format** (`docx 3/3, pptx 2/2, xlsx 2/2`): one corpus-wide count let a whole lane sit at `unmeasured` behind a green tick, so a format that HAS a ground truth and reports `unmeasured` on a real bundle now fails the row. The closed list is `backend.validate._mdcheck._FIDELITY_FACTS`; **do not restate its length here without re-counting it**, which is how this row came to say "twelve" |
 | A2 | suite | Body text round-trips: markdown → text equals source text **as a sequence**, not only as a multiset | `tests/unit/backend/test_validate_roundtrip.py` (`test_swapping_two_body_paragraphs_passes_the_multiset_gate_but_fails_the_sequence` + 3 more) |
 | A3 | artifact | No unconditional escaping: a character is escaped only when it could actually be syntax. `DB_MAX_CONN_LIMIT`, `--dry_run=true`, `[payments]`, `snake_case_helper` survive verbatim in the stored bytes | `_rubric._a3_verbatim`, asserting `backend.validate._rubric.ADVERSARIAL_PROBES` against the adversarial fixture |
-| A4 | suite | Every deliberate drop emits a named warning code carrying a **count** | `tests/unit/backend/test_warning_vocabulary.py` (`test_every_documented_warning_code_has_an_emitter`, `test_every_emitted_warning_code_is_documented`, …) — closed in both directions |
-| A5 | suite | Adversarial fixtures exist for each of the above and are pinned in the eval corpus | `evals/run_eval.py`, graded on the **fixture** `office/kestrel-adversarial.docx` — not on the eval exiting 0, because eighteen green siblings do not make a claim about that one true. The whole eval census is printed in the row's evidence |
+| A4 | suite | Every deliberate drop emits a named warning code carrying a **count** | `tests/unit/backend/test_warning_vocabulary.py` (`test_every_documented_warning_code_has_an_emitter`, `test_every_emitted_warning_code_is_documented`, `test_every_format_s_drops_carry_the_size_of_the_loss`, …) — closed in both directions, and graded per FORMAT rather than on a docx standing in for all three |
+| A5 | suite | Adversarial fixtures exist for each of the above and are pinned in the eval corpus | `evals/run_eval.py`, graded on the **fixtures** `office/kestrel-adversarial.docx`, `.xlsx` and `.pptx` — one per graded format, not on the eval exiting 0, because eighteen green siblings do not make a claim about any one of them true. Held to `_GRADED_FORMATS` and to the `build_adversarial_*` the corpus really builds by `tests/unit/backend/test_validate_rubric.py`, so a new graded format cannot arrive undefended. The whole eval census is printed in the row's evidence |
 
 ### B. `report.json` — reporting and provenance
 
@@ -1116,6 +1116,1173 @@ Recorded because a refuted claim that quietly disappears is how a plan drifts.
 
 ---
 
+## P9 — The other two thirds of the office lane
+
+`structure_fidelity` is a hard gate on `.docx`/`.doc`/`.odt`/`.rtf` and reports
+`unmeasured` on `.pptx`/`.ppt`/`.xlsx`/`.xls` — **5 of the 11 office bundles**, and
+`.odp`/`.ods` route to the same two converters with no fixture at all. P9 writes the
+second implementation those formats have never had.
+
+The gap persisted for a measurable reason, and it is the first thing to fix.
+`scripts/grade_output.py`'s `build_corpus()` builds **three documents, all `.docx`**,
+so rubric row `A1` reports `pass on 3 of 3 office bundles (0 unmeasured)` while five
+real bundles are unmeasured. The row's own safety valve — FAIL when *every* bundle is
+unmeasured, and always print the count — is honest code that never executes, because
+the only documents that could trip it are never built. **The instrument that measures
+quality cannot see the formats with the gap.**
+
+### What the missing gate was hiding
+
+Not just absent coverage. Six defects, each reproduced on this checkout:
+
+| | defect | evidence |
+|---|---|---|
+| 1 | `merged_cell_spans` measured a **confident zero** on every deck and a wrong **direction** on every workbook | DrawingML spells the four span markers as `a:tc` ATTRIBUTES, not elements; `<mergeCell>` was counted as horizontal without ever parsing `@ref`. The corpus published "2 horizontal and 0 vertical" for a sheet holding one of each. **Fixed — P9.0** |
+| 2 | The `flattened_table_spans` detail promised a forward-fill that only Word gets | `_sheet_rows` never reads `<mergeCells>` and `_pptx_table_md` renders a covered `a:tc` as its own empty cell, so both leave continuation rows blank. **Fixed — P9.0** |
+| 3 | A slide bullet can **delete itself** | The pptx path escapes with `_esc(t)`, never `_esc_lead(t)`. A bullet reading `- - -` emits `- - - -`, which CommonMark reads as a thematic break: `bullet_items` 16 → 15, `thematic_breaks: 1`, `recall=1.0`, `warnings=[]`. The exact bug `_esc_lead` exists to prevent, live in the deck lane. **Fixed — P9.5**, and it was never only the deck: eight emission sites across all three formats put source text where a block can open |
+| 4 | **Slide order is the filename**, not the deck's order | `ppt/presentation.xml` is not in `OOXML_MAIN_PARTS["pptx"]` and `p:sldIdLst` — the normative ordering record — has zero references in the converter. The xlsx lane, in the same module, *does* read `xl/workbook.xml` for sheet order. **Fixed — P9.5** |
+| 5 | The token gate's "second opinion" is **not independent about cell values** | `xlsx_source_text` and `xlsx_markdown` both call `_cell_value`. Measured: injecting a bug into it leaves `recall=1.0, valid=True` while `n_source_tokens` silently drops 107 → 73; a one-sided control gives `recall=0.40, valid=False`. NimbusH1's mechanism, inside the module built to prevent it |
+| 6 | `=SUM(C3:C5)` is **deleted and not counted** | In the shipped `kestrel-registers.xlsx`. Absent from the markdown, absent from the recall denominator, absent from the warnings. Unlike the header/footer case there is no receipt at all: a reader cannot tell a computed total from a typed one |
+
+### The architecture, settled
+
+**`_FIDELITY_FACTS` grows by exactly one format-neutral name — `block_sequence` —
+and never by a format-specific one.** Add `slide_path` or `cell_addresses` and every
+docx report permanently carries `unmeasured: [facts belonging to another format]`,
+inverting that field's meaning from *"be suspicious"* to *"ignore this line"*. One
+vocabulary, three ground truths; what differs per format is which facts a truth can
+honestly supply.
+
+`block_sequence` is `[(kind, key), ...]` over `h`/`li`/`table`/`code`/`quote`/`hr` —
+the interleaving of blocks each truth already states, so it predicts nothing new and
+is `emit_images`-stable (verified: identical across all five corpus office files in
+both modes). It earns its place twice: a workbook with every table detached from its
+sheet heading scores `gate=pass compared=3 deltas=[]` against a fully-populated
+15-fact truth and `fail` with it, and it exposed a pre-existing **docx** hole —
+moving a paragraph under a different heading in `kestrel-clock-spec.docx` passes
+today with `compared: 10, deltas: []`.
+
+Three report fields make a deck's verdict readable without opening the source:
+`facts` (the denominator, inline, so an archived report survives the list widening),
+`unmeasured` (a fact this vector has that this truth did not supply — closed by
+writing code), and `blind_to` (structure this format carries that **no name in the
+closed list can express** — closed only by widening the list, or never).
+
+**The independence rule**, stated at the top of every new module: *a helper may be
+shared iff it is called on exactly one side of the comparison it feeds.* A one-sided
+bug makes a faithful document fail loudly; a two-sided bug cancels and the gate goes
+green over real damage. That is what makes defect 5 a prerequisite rather than a
+follow-up.
+
+### Two corrections that shaped the slices
+
+Recorded because both were caught late and both changed the work.
+
+- **The pipeline is self-paired.** `bundle_inputs` derives the markdown, the source
+  text and the source structure from the *same* file, so damaging a source document
+  and observing `gate: pass` demonstrates nothing — a faithful conversion of a damaged
+  source *should* pass. The correct idiom is **converter-fault injection**: monkeypatch
+  a converter helper, convert the *pristine* source, assert token recall is still 1.0
+  while the structure gate fails with a named delta. `tests/unit/backend/test_structure_fidelity.py`
+  already does this 17 times. Every P9 slice must ship a red-direction test per
+  supplied fact per format; a done-condition that only shows `gate: pass` proves the
+  gate ran, not that it can fail.
+- **The legacy lane would turn an honest gap into a false green.** `.ppt`/`.xls`
+  reach the gate as their soffice targets, and the round-trip has *already* destroyed
+  the structure: `legacy/kestrel-overview.ppt` renders `## Slide 2` with the title
+  demoted to a bullet and every sub-bullet flattened to depth 0, against the native
+  deck's `## Slide 2 — Why a new interconnect` and `list_items {0:14, 1:2}`. A ground
+  truth reading the soffice output reads the loss and agrees with it — measured
+  `gate: pass, compared: 6`. Today that bundle honestly says `unmeasured`; flipping it
+  to `pass` is the cardinal sin. The lane keeps `unmeasured`, or declares
+  `blind_to: ["pre_conversion_structure"]`, and `decisions[]` already carries
+  `lane_selected.chose == "libreoffice"` as the free discriminator.
+
+### The slices
+
+- [x] **P9.0 — Fix what is already wrong, before building on it.**
+      `merged_cell_spans` reads all three spellings — `w:tcPr` child elements, `a:tc`
+      attributes, and the `<mergeCell ref>` range — and counts **cells absorbed**, the
+      unit Word always counted, with the two directions partitioning the loss so a
+      `w × h` rectangle contributes exactly `w*h - 1`. The `flattened_table_spans`
+      detail names the per-format vertical behaviour instead of promising Word's
+      forward-fill to everyone. `merged_cell_spans`/`tracked_changes`/`embedded_objects`
+      re-exported from the package, which their `__all__` had claimed since P8.
+      *Done: 12 new tests, `1463 → 1475` passed; the corpus workbooks move `h=2 v=0`
+      → `h=2 v=1` and both spreadsheet routes now agree; docx numbers unchanged
+      (`h=6 v=1`, `h=3 v=1`); grader 34/34 A; eval 19/0/3.*
+- [x] **P9.1a — The import boundary, and something that enforces it.**
+      `_ooxml_leaf.py` holds the four namespace-blind primitives (`_local`, `_attr`,
+      `_root`, `_WS`) plus `_BREAK_LOCALS`/`_SKIP_LOCALS`, and imports nothing from
+      the package — which is what will let `_ooxml_md` import a per-format token
+      truth in P9.2 without closing a cycle through its module-scope `_SOURCES`
+      table. `_ooxml_struct` now imports from there and **no longer imports the
+      converter at all**. The admission rule is written out at the top of the leaf
+      module: *a helper may be shared iff it is called on exactly one side of the
+      comparison it feeds*, with `_SKIP_LOCALS` argued as the one deliberate
+      exception (a declaration of SCOPE, not a reading of content — nothing inside a
+      skipped subtree is on either side of the gate).
+      Every prior statement of this boundary was a comment, and a comment does not
+      fail a build: `tests/unit/backend/test_ingest_ooxml_leaf.py` reads the real
+      import statements with `ast` and is parametrised over `(module, forbidden)`,
+      one row per truth, so a new converter helper fails in the module that reached
+      for it and the message names the symbol. Verified in **both** directions —
+      re-introducing `from ._ooxml_md import _collect_text` turns it red.
+      *Done: 13 new tests, `1475 → 1488` passed; all 11 corpus bodies byte-identical
+      and no verdict moved; grader 34/34 A; eval 19/0/3.*
+- [x] **P9.1b — `_struct_common.py`.** The `_mdcheck` half landed with P9.3 as
+      planned (`_measured()`, `facts`, `blind_to`). This is the other half, and the
+      interesting part of it was deciding what may NOT be shared.
+
+      **The licence, stated narrowly.** The admission rule is unchanged — *a helper
+      may be shared iff it is called on exactly one side of the comparison it feeds*
+      — and the three structural truths all read the SOURCE, so they are three
+      readers on ONE side. The other side is `_ooxml_md`, which writes the markdown,
+      and `backend.validate._mdstructure`, which reads it back the way a CommonMark
+      renderer would. So `_struct_common` gets a NARROWER licence than `_ooxml_leaf`:
+      the leaf's four primitives are irreducible and the converter may share them;
+      these know what a paragraph IS, and the converter may not. Both headers now
+      cross-reference the other, so "which module does this helper belong in" has a
+      written answer.
+
+      Extracted, all verified byte-identical beforehand by comparing the real
+      function bodies with `ast` rather than by eye: `_parent_map` (three copies,
+      identical), `_ancestry` (two, identical), `_WORDS`/`_words` (three, identical),
+      `_add_heading` (three, near-identical — unified on `min(level, 6)`, which is
+      justification (ii), a statement about what markdown can hold, and a no-op for
+      the deck and the workbook, which only ever pass 2 and 3), and `_some` (two,
+      identical).
+
+      **What the measurement refused to extract, which is the point of the slice.**
+      `_attr` is byte-identical in all three truths *and in the converter*: an
+      attribute read is where a cell's ADDRESS comes from, so one copy is called on
+      both sides — measured, a shared `_attr` that lost every `@r` shifted every
+      value into a different column while `token_recall`, `n_source_tokens`,
+      `compared` and the delta list all stayed exactly as they were. `_rel_id` is
+      identical in `_ooxml_md` and `_pptx_struct`, which is a converter and the truth
+      that grades it. And the FACT VECTOR — which this plan named as a candidate —
+      is refused outright: the empty containers are mechanism, but a stated
+      `thematic_breaks: 0` is a falsifiable claim that this FORMAT has no construct
+      rendering as a rule, argued separately in each of the three docstrings. A
+      shared seed would let one format's argued zero become another's unargued
+      certification, which is precisely how a truth inherits the converter's blind
+      spot on the axis it exists to police — in six lines nobody would re-read.
+
+      **The extraction is proven safe in both directions, not asserted.** Structural:
+      an `ast` read of the real import statements says `_struct_common` imports
+      nothing from the package, and that neither `_ooxml_md` nor `_mdstructure`
+      reaches it. Behavioural: bugging the shared tokeniser fails a faithful document
+      on all three formats, and the counter-experiment — the same bug on the markdown
+      side too — makes `heading_path` go **silent** rather than merely change, which
+      is the cancellation priced. All 38 truth outputs over the 9 shipped office
+      documents (structure vectors, policy drops, markdown and source-text hashes,
+      workbooks in both `emit_images` modes) are byte-identical to the pre-slice
+      baseline.
+
+      **What the review added.** The direct-import guard has a blind spot: `_ooxml_md`
+      already imports all three truth modules at module scope — it must, since each
+      owns its format's TOKEN truth — so `_struct_common` is transitively reachable
+      from the converter's import graph. Traced, there is no execution path today:
+      `*_source_text` never touches `_add_heading`, `_words`, `_parent_map` or
+      `_ancestry`, which only the `*_source_structure` walks call. But "today it does
+      not call it" is exactly the kind of fact a refactor quietly falsifies, so the
+      reachable SURFACE is pinned instead — a closed whitelist saying the converter
+      may take `docx_source_text` / `pptx_source_text` / `xlsx_source_text` from those
+      modules and nothing else. Verified red: adding `docx_source_structure` to that
+      import fails with the symbol named. A new entry there is not automatically
+      wrong, it is automatically a gate change, and the list is where the argument
+      goes.
+
+      *Three things the loop caught in my own work, recorded because each was a
+      false green:* the import guard read only RELATIVE imports, so the import that
+      would actually break the gate —
+      `from backend.ingest._struct_common import _words` in `_mdstructure`, which
+      lives in another package and must be absolute — sailed straight past it; found
+      by writing that import and watching the suite stay green. The fault injection
+      patched only `_struct_common._words`, which reaches the calls made from inside
+      that module (where `_words` is still a global) but NOT the truths' own calls,
+      which bind at import time: `fail, ['heading_path']` instead of
+      `fail, ['heading_path', 'list_item_words', 'tables']`. Red for a real but
+      smaller reason than the docstring claimed — the same trap P9.6 hit from the
+      other side, and the rule either way is that the injection target must match how
+      the caller resolves the name. And the import line I wrote pulled in five names
+      the modules did not use; `_xlsx_struct` had never had an ancestor predicate at
+      all.
+
+      *Done: 1848 → 1873 passed, 115 skipped on both 3.6.8 rings; 3.12 ring 20
+      failures, the unchanged caption/figure environment gap; rubric **34/34 A**;
+      eval 22 pass, 0 fail, 3 skip; the three truths 4098 → 3952 lines against 159
+      in the shared module, most of it the argument for the licence.*
+- [x] **P9.2a — Token-gate independence for the deck and workbook lanes.** THE
+      PREREQUISITE (defect 5), and the fault injection widened it before it was
+      written. Measured on the shipped corpus, **every** helper shared between a
+      converter and its own ground truth cancelled, while a one-sided control was
+      caught every time:
+
+      | injected bug | shared by | recall | `n_source` |
+      |---|---|---|---|
+      | `_cell_value` | xlsx converter + truth | **1.0** | 107 → 73 |
+      | `_sp_ph_type` | pptx converter + truth | **1.0** | 108 → **20** |
+      | `_shared_strings` | xlsx converter + truth | **1.0** | 107 → 106 |
+      | `_text_of` | docx notes/comments + truth | **1.0** | 9 → 8 |
+      | `_md_cell` (control) | converter only | **0.40–0.90** | unchanged |
+
+      `pptx_source_text` and `xlsx_source_text` now live in `_pptx_struct.py` and
+      `_xlsx_struct.py` with their own traversals: a flat `root.iter()` stream with
+      an ancestor predicate over a parent map, against the converter's recursive
+      descent. The deck truth derives a shape's chrome role from where the schema
+      declares it (`p:ph` reached through `p:nvPr`) rather than asking the
+      converter's predicate; the workbook truth has its own typed cell resolver
+      (naming `e` and `str`, which the converter's fall-through handled by accident),
+      its own shared-string table and its own tab reader filtered on the parent being
+      `<sheets>`. `<f>` is deliberately still unread — the converter publishes the
+      cached result, so putting the expression in the denominator would fail every
+      workbook holding a formula. That loss is P9.4's `dropped_cell_formulas`.
+      *Done: output byte-identical on all three corpus documents from a
+      reimplementation that shares nothing (`e70bb4e2…`, `d3ba401b…`, `ccc6ad53…`);
+      the three cancelling bugs now read `0.19`, `0.40`, `0.99` with `valid: false`;
+      41 new tests, `1488 → 1531` passed on both the normal and the yaml-blocked
+      ring under 3.6.8; eval 19/0/3; grader 34/34 A.*
+- [x] **P9.2c — A ratchet on the denominator, because recall is one-directional.**
+      Writing P9.2a's guard exposed a hole neither review found: recall asks *"of the
+      words the source has, how many survived?"*, so a bug that deletes from the
+      **ground truth** shrinks the question instead of failing it. Bugging the deck
+      truth's own chrome predicate gives `token_recall: 1.0, valid: true` with
+      `n_source_tokens` at 20 of 108. Nothing in the project could see that — the
+      rubric gates `n_source_tokens` only at `== 0`, which catches the total collapse
+      and nothing short of it, and `expectations.json` had no key for it.
+      `n_source_tokens_min` is now a pinnable expectation, floored per document from
+      the measured value on all 11 office bundles. Verified in both directions: the
+      corpus passes, and raising one floor to 999 fails that row alone.
+- [x] **P9.2b — The same fix for docx, and a correction to how it was described.**
+      The first write-up of this slice claimed `_collect_text` was shared with the
+      converter "through `_docx_p_text`" and cited a 400 → 0 collapse as the
+      cancellation. Both halves were wrong, and checking rather than assuming is
+      what found it: `_docx_p_text` reads runs directly and never calls
+      `_collect_text`, so bugging it left the **markdown untouched** and only
+      emptied the ground truth — a *vacuous* denominator, which is P9.2c's problem,
+      not a cancellation.
+
+      The real docx sharing was narrower and genuine. `_text_of` renders the
+      footnote, endnote and comment sections on the converter side, and
+      `docx_source_text` called `_text_of` for those same parts — so one word going
+      unread went unread on **both** sides. Demonstrated exactly, with a footnote
+      reading *"measured on silicon in week nine"* and a reader that silently drops
+      one word of it:
+
+      | | markdown keeps the word | recall | `n_source` | verdict |
+      |---|---|---|---|---|
+      | truth sharing `_text_of` | **no** | **1.0** | 8 | `valid: true` |
+      | truth with its own walker | **no** | 0.889 | 9 | `valid: false` |
+
+      `docx_source_text` now lives in `_ooxml_struct` beside the structural facts,
+      built from that module's own `_block_text` — which already carries a
+      correction the converter's reader does not: a row and a cell are places the
+      DOCUMENT separates two pieces of text, so two cells cannot weld into a token
+      like `rotastandby`. Text boxes are included (`skip_boxes=False`): the
+      structural facts exclude them because the converter lifts a box out of its
+      anchor paragraph, which is a claim about where blocks land, but the words are
+      in the document either way and belong in the denominator.
+      *Done: byte-identical output on all three docx fixtures (`96ea2e2a…`,
+      `31bf58a6…`, `6d4e64f5…`) from a reader that shares nothing with the
+      converter. All three formats' token truths now live with their own format.*
+- [x] **P9.3 — `block_sequence`, and the fields that make a verdict readable.**
+      The first widening of `_FIDELITY_FACTS` since it was closed, so the admission
+      test is now written out above it: a new name must be derivable independently by
+      **both** sides, be format-NEUTRAL (a fact only one format supplies would sit in
+      every other format's `unmeasured` list for ever, inverting that field from "be
+      suspicious" into "ignore this line"), and catch damage no existing fact can
+      express. `block_sequence` was admitted on all three.
+
+      It records `(kind, key)` per graded block in document order over six kinds —
+      `h`/`li`/`table`/`code`/`quote`/`hr` — and states **nothing new**: every kind is
+      already counted somewhere else, so it says where what is already counted
+      actually sits. A prose paragraph is deliberately not a kind, because neither
+      side has an opinion on where paragraphs land and predicting them would fail
+      every faithful conversion that emits an image sentinel or lifts a text box.
+
+      What it catches, demonstrated: move a register table out from under its own
+      heading and file it under the errata. `headings`, `heading_path`, `tables`
+      (geometry *and* every cell), `list_items`, `list_item_words`,
+      `ordered_numbers`, `thematic_breaks`, `code_blocks`, `strong`/`em`/`strike`,
+      `links` are **all identical**, the token multiset is identical, and
+      `token_recall` is 1.0. `block_sequence` is the only delta. Before it, the gate
+      passed a document telling the reader that the enable field resets to 0 *in the
+      errata*.
+
+      Also landed: `facts` (the denominator, inline, so an archived report does not
+      need the reader to know how long the list was on the day it was written),
+      `blind_to` passthrough, and `_measured()` — a source dict carrying only a
+      `_blind_to` declaration supplied no graded fact, and reading it as truthy would
+      publish `compared: 0` beside `gate: "pass"`.
+      *Done: both implementations AGREE on `block_sequence` for all three docx
+      fixtures in both `emit_images` modes (21, 1 and 25 blocks, reached by
+      recursive descent on one side and a flat scan on the other). `compared` 10 →
+      11 on the clock spec, and 2 → 3 on a one-heading memo — the first fact with
+      evidence on every document that has any block at all. Seven existing tests
+      updated truthfully: five deltas now name `block_sequence` as a second,
+      independent witness to damage they already caught. 1533 → 1537 passed on both
+      rings; eval 19/0/3; grader 34/34 A.*
+- [x] **P9.4 — xlsx. The first format brought under the second gate.**
+      `xlsx_source_structure(parts, emit_images)`, the dispatch (was
+      `if ext == "docx"`), `xlsx_policy_drops`, and a new
+      `office/kestrel-adversarial.xlsx` so every drop is graded on real bytes.
+
+      **The gate is a gate**, proved by converter-fault injection over the shipped
+      workbook rather than by editing the input (the pipeline is self-paired, so a
+      faithful conversion of a damaged source *should* pass):
+
+      | injected converter bug | token gate | structure gate |
+      |---|---|---|
+      | cells lose their address | **1.0, valid** | fail `tables` |
+      | two registers swap reset values | **1.0, valid** | fail `tables` |
+      | tabs published in the wrong order | **1.0, valid** | fail `heading_path, tables, block_sequence` |
+      | tabs lose their names | 0.97, invalid | fail `heading_path` |
+      | last row of every sheet dropped | 0.80, invalid | fail `tables, block_sequence` |
+
+      **Three of the five are invisible to token recall** — every word present, only
+      the arrangement changed — and all three shipped `status: ok` before this slice.
+
+      **Two pre-existing defects surfaced on the way in.** `xl/styles.xml` was never
+      in `OOXML_MAIN_PARTS["xlsx"]` (`word/styles.xml` had been in the docx list from
+      the start), so the workbook's bold header, struck-through rows and date serials
+      were not merely un-emitted — the warnings that name them could not fire at all.
+      And `abstract_floor` returned `""` for any document with no prose, so **every
+      spreadsheet shipped with no abstract**, invisible for as long as the graded
+      documents were all prose-bearing `.docx`; it now falls back to the document's
+      own section names.
+
+      **The instrument could not see the format.** `grade_output.py`'s `build_corpus`
+      built three documents, all `.docx` — which is why row `A1` read *"pass on 3 of
+      3 office bundles (0 unmeasured)"* while five real bundles were unmeasured. The
+      row's safety valve (FAIL when *every* bundle is unmeasured) was honest code
+      that could never execute. Widened to five, which immediately failed three rows:
+      `_adversarial(view)` matched any relpath containing "adversarial" and so became
+      ambiguous the moment a second such fixture existed (now format-scoped), and
+      `D1` was the abstract gap above.
+
+      *Done: 1537 → 1599 passed on both rings under 3.6.8; eval 19 → 20 pass, 0 fail;
+      rubric 34/34 **A** on a corpus that now contains workbooks; `kb_lint` 0 errors,
+      0 warnings.*
+- [x] **P9.4r — What the review found, including in the fixes.** A four-lens
+      adversarial review of the above, every finding then re-run by a skeptic whose
+      job was to refute it. Recorded because the two most serious were introduced by
+      P9.4 itself, one of them by a fix made mid-review.
+
+      **Cancellations — the cardinal sin, two of them measured:**
+      - **A blank separator row fused two tables.** Both sides dropped it
+        identically, so the delta cancelled. The shipped fixture published
+        `| Corner | Margin |` and `| SSG 0.72V 125C | 0.94 |` *inside* the power
+        budget — a reader saw a rail drawing 0.94 mW — at `gate: pass, recall: 1.0`.
+        Fixed on **both** sides: a blank row separates REGIONS, which is a fact about
+        the source (it is how a spreadsheet says "two tables", and Excel's own
+        current-region selection stops at one), not a converter preference. The truth
+        also had to start **enumerating rows** rather than grouping cells by their
+        owner — an empty `<row/>` holds no cells, so it was invisible to it and the
+        split landed on the converter side alone.
+      - **`_attr` was shared by all four readers.** An attribute read is where a
+        cell's address comes from, so one copy sits on both sides: losing every `@r`
+        shifted every value into a different column while `token_recall`,
+        `n_source_tokens`, `compared` and the delta list stayed **exactly** as they
+        were. Nothing in the report moved. Now written out in each reader (five lines
+        × 4), and a bug on either side fails the gate. The leaf module's claim that
+        its contents "cannot cancel" was **false as written** and is replaced by the
+        narrower true one, naming which separate one-sided guard covers each residual.
+
+      **A false FAIL I introduced, then a worse fix:** `<c r="$C$2">` disagreed
+      between the readers, and I "fixed" it by making the ground truth strict to
+      match the converter. That is the anti-pattern this module exists to prevent —
+      it encoded a converter LIMITATION as a document fact — and the measured cost
+      was a green gate over misplaced data: 182.5 published under the `Notes`
+      heading while the row below published the same quantity under `mW`. The right
+      fix was to teach the **converter** the ref, which is what landed.
+
+      **A regression against HEAD:** `_xlsx_struct._walk_text` had no paragraph
+      boundary, so two comments in one part welded (`"divider ratio"` +
+      `"signed off"` → `ratiosigned`) and a faithful conversion reported
+      `recall: 0.8, status: failed`. The sibling written in the same slice
+      (`_pptx_struct`) always had the boundary. Its tests used exactly one comment
+      and a substring assertion, and neither corpus workbook has a comments part.
+
+      **A silent structural loss, pre-existing and now closed:** a truncated
+      `word/styles.xml` took **nine headings** out of the markdown at
+      `recall: 1.0, gate: pass, status: ok`, no warning — both sides read the part
+      through the same `_root` and collapsed identically. `_CONTENT_PARTS` excluded
+      styles on the reasoning that "their loss is graceful, not silent text loss",
+      which was true under a token-only gate and stopped being true when
+      `structure_fidelity` began deriving heading levels from that part. Both
+      formats' styles parts are now content parts.
+
+      **Reporting corrections.** `dropped_cell_formulas` said "the cached RESULT is
+      published" about cells that publish **nothing** — split out as
+      `empty_cell_formulas`, the one class token recall is structurally unable to
+      see. `dropped_cell_emphasis` told a workbook with only a bold header that "a
+      struck-through row means CANCELLED" — now per-mark counts, with that clause
+      only when the strike count is non-zero. `hidden_content_published` counted a
+      hidden sheet's own rows again (one region read as 41) and claimed "the text is
+      kept in full" about rows that publish nothing; it now names the sheets.
+      `unformatted_cell_values` was silent on thousands separators and currency.
+      A destroyed cell hyperlink had **no receipt at all** while two places claimed
+      one existed — `dropped_cell_links` now quotes the destination. And three
+      `_BLIND_TO` entries were deleted for saying something false: `used_range` is
+      measured by `tables`, `cell_emphasis` belongs to `unmeasured` by that field's
+      own definition, and `paragraph_position` is vacuous for a format with no
+      paragraphs.
+
+      **One number every passing bundle now pins.** `structure_fidelity_compared_min`
+      was pinned only on the format it was written for, so a docx ground truth that
+      quietly stopped supplying facts would still have read `pass`. Floored per
+      document on all nine passing office bundles, and verified to bite.
+- [x] **P9.5 — pptx converter prerequisite.** Defects 3 and 4, and neither turned
+      out to be pptx-only or converter-only.
+
+      **Defect 3 was eight sites across three formats, not one.** `_esc` neutralises
+      INLINE syntax; `_esc_lead` neutralises the constructs that open a BLOCK, and it
+      was reaching the docx heading and paragraph paths and the chart caption and
+      nothing else. A list item's content column is a block start exactly as column 0
+      is — after `- `, CommonMark opens a heading, a nested list, a quote, a fence or
+      a thematic break just as it would at the left margin. Measured on the shipped
+      deck with one bullet's text replaced by `- - -`:
+
+      | | `bullet_items` | `thematic_breaks` | recall | gate |
+      |---|---|---|---|---|
+      | pristine | 16 | 0 | 1.0 | pass |
+      | poisoned | **15** | **1** | 1.0 | pass |
+
+      The bullet came out as `- - - -` and **deleted itself**, with both gates green:
+      a thematic break carries no token for recall to miss. The docx list-item path
+      had the identical hole (`bullet_items` 7 → 6 on the corpus specification), so
+      the fix is one named helper, `_esc_block_start`, at every site that puts source
+      text where a block can open: both pptx bullet emitters, the speaker-notes title,
+      deck and workbook comments, SmartArt items, docx footnotes/endnotes/comments and
+      the docx list item.
+
+      **What the escape rule itself was still missing**, each measured against
+      marko 2.2.3 rather than against this project's own reader:
+      - `_LEAD_LIST_NUM` and `_LEAD_MARK` both required a SPACE after the marker, so
+        a bullet whose entire text was `15.`, `10)`, `1.`, `1)` or `+` was left bare —
+        and CommonMark reads `- 15.` as a bullet holding an EMPTY ordered list, so
+        those characters are **gone from the render** at `recall: 1.0`. (`-` alone was
+        saved incidentally by `_LEAD_RULE` and `*` alone by `_esc`, which is why `+`
+        was the one marker nothing covered.)
+      - An ATX heading may end with a **closing sequence** of hashes, which the
+        renderer eats: `# Drain procedure #` published as "Drain procedure", at
+        `recall: 1.0` with the heading still counted at the same level. Three sites —
+        docx headings, xlsx sheet names, pptx slide titles.
+      - A **pair** of lines can open a block no single line can. `svg_text` joins a
+        figure's labels with newlines, so three labels reading `| Path | Cycles |`,
+        `| --- | --- |`, `| display read | 40 |` published a real two-column TABLE the
+        drawing never had — `tables: [{rows: 2, cols: 2, has_header: true}]`.
+      - `_embedded_sections` decided whether a value was a pre-formatted bullet list
+        by asking whether it **started with `- `**. A text box whose whole content was
+        `- - -` was taken for a list, passed through unescaped and published as a
+        thematic break. Each renderer now escapes its own text, because only it knows
+        what it built.
+
+      **The instrument was blind where it mattered.** `md_structure` saw every one of
+      these constructs on a CONTINUATION line and none of them on the marker's own
+      line, so it read `- ## Rollout` as a plain bullet and `- 15. step` as no ordered
+      list at all — disagreeing with a real parser on five constructs at once. That is
+      exactly where a converter puts source text, so the escape fix would have been
+      **unfalsifiable**: the red-direction test the P9 rules demand had no fact to
+      assert on. An item's first line is now re-dispatched through the same scanner at
+      the column it really occupies, and nine cases were added to the differential
+      corpus — each verified to fail without the fix.
+
+      **Defect 4: the deck's order, and the trap under it.** `pptx_slide_order` reads
+      `p:sldIdLst` through `ppt/_rels/presentation.xml.rels`; `ppt/presentation.xml`
+      and that rels part join `OOXML_MAIN_PARTS["pptx"]`. A literal mirror of the
+      xlsx lane **silently does nothing**: `p:sldId` carries both a plain `id` (the
+      deck-local slide id) and `r:id`, and `_attr` matches on LOCAL name, so it hands
+      back the slide id every time and nothing resolves. `_rel_id` requires the
+      namespace qualification. The second trap is that slide POSITION and slide PART
+      NUMBER are now two different numbers: every satellite lookup — the slide's own
+      rels, the `notesSlideN.xml` fallback — keeps using the part number, and
+      conflating them moves a slide's speaker notes to whichever slide sits at that
+      position, with nothing in any report changing.
+
+      `## Slide N` counts position in **both** branches, including the fallback. A
+      heading has to mean one thing: a reader cannot act on `## Slide 10` without
+      knowing whether it is the tenth slide or the tenth file. A slide part the deck
+      never lists is published after the ordered ones under `## Slide (unlisted): …`,
+      following the `## Sheet (unlinked): …` precedent — it has no position, so it may
+      not claim one, and dropping it would fail token recall.
+
+      **Where the order reader lives, adjudicated by measurement.** This plan said to
+      put `pptx_slide_order` in `_pptx_struct.py`. That is the cardinal error: that
+      module is the converter-blind pptx GROUND TRUTH, and its own docstring already
+      refuses to read `ppt/presentation.xml` for this exact reason. A shared reader is
+      called on both sides, so a bug in it cancels — verified by injection: two
+      converter faults both go GREEN under a shared reader and RED under a separately
+      derived one. It lives in `_ooxml_md.py`, is re-exported from `backend.ingest` so
+      `scripts/` need not reach into a private module, and P9.6's truth must derive
+      order again, itself.
+
+      **`ppt/presentation.xml` is a content part.** Same measurement as
+      `word/styles.xml` in P9.4, and it carries no text at all — "text-bearing" was
+      never the real criterion, "backs a claim the output makes" is. Truncated, it
+      degrades through `_root()` to "no order" and the lane publishes the wrong deck:
+
+          pristine               Slide 2 — Rollout plan     recall=1.0  valid=True
+          presentation TRUNCATED Slide 2 — Open questions   recall=1.0  valid=True
+
+      The split falls out of the existing mechanism: `malformed_content_part` only
+      inspects parts that are PRESENT, so a deck with no presentation part still
+      converts (it makes no ordering statement, so filename order contradicts nothing)
+      while a deck whose ordering statement is unreadable fails loudly. The limit is
+      stated rather than implied: `ppt/_rels/presentation.xml.rels` backs the same
+      claim and is NOT covered, because `_rels` are excluded as a class.
+
+      **What no gate can see, said plainly.** Token recall compares MULTISETS, so a
+      permutation is invisible to it by construction — the reordered deck measures
+      `recall: 1.0, n_source: 135` whether the order is right or wrong. The fact
+      vector is **not** blind: `block_sequence`, `heading_path` and `list_item_words`
+      all move. But nothing consults them for a deck, because pptx
+      `structure_fidelity` is `unmeasured` until P9.6. So the protection today is the
+      `slide_order` decision record plus the heading pins on
+      `office/kestrel-reordered.pptx`, and that is a corpus-level regression check
+      rather than a gate on the document in front of you. The red-direction test pins
+      which three facts move, which is the minimum P9.6's truth has to supply — a
+      truth offering only `headings` would grade a reordered deck green, because
+      counting levels is permutation-blind.
+
+      **P9.5r — what the review found, including a blocker I wrote.**
+
+      **A cap applied to two of three readers.** I capped `_LEAD_LIST_NUM` at
+      `\d{1,9}` — CommonMark's own limit — after checking it against
+      `_mdstructure._ORDERED`. There are THREE regexes that read an ordered marker:
+      that one decides what the structure gate sees, `_LEAD_LIST_NUM` decides what
+      the converter escapes, and `_markdown._LIST` decides what the TOKEN gate sees.
+      The third was still `\d+`. So `1234567890. bill of materials` was correctly
+      left unescaped, `markdown_to_text` stripped the number anyway, and a FAITHFUL
+      document refused to publish at `recall: 0.833, missing: [('1234567890', 1)]` —
+      30 site/text combinations regressed against HEAD. **And my test for the rule
+      could not have caught it**: it exercised a pptx BULLET, where the leading `- `
+      is itself a marker that absorbs the substitution, so the assertion was green
+      while the paragraph and heading paths were broken. The test is now parametrised
+      over the emission SITE, and fails in six places against the old reader.
+
+      **A pair-of-lines rule wired to one caller.** `_LEAD_DELIM_ROW` was applied in
+      `_esc_fig`, which knew its own previous line. But `_join_blocks` stacks
+      consecutive list items with a single newline, so the same three labels built
+      the same table as BULLETS — and there the fact vector does not even see it
+      (marko builds `ul,li,table,thead,…`; `md_structure` reports `tables: 0`). The
+      rule now lives in `_esc_block_start` and fires unconditionally, which costs
+      nothing worth having: a line that matches is made only of dashes, colons, pipes
+      and spaces, so it carries no token at all.
+
+      **A heading whose content was read as a list.** Pre-existing, in the emitter
+      this slice rewrote: `markdown_to_text` stripped the ATX prefix and then ran the
+      LIST stripper over what remained, so a workbook with a sheet named
+      `1. Overview` — or any numbered heading — lost the number and failed at
+      `recall: 0.500`. A line belongs to exactly one block.
+
+      **The guard was half-installed.** `ppt/_rels/presentation.xml.rels` backs the
+      deck's order exactly as `ppt/presentation.xml` does — `p:sldIdLst` names
+      relationship ids, and without the rels they resolve to nothing. Truncating it
+      alone published `Slide 2 — Open questions` where the deck says
+      `Slide 2 — Rollout plan`. Excluding it while including the part it serves was
+      arbitrary, so both are content parts now.
+
+      **The corpus could not see the escape at all.** Deleting `_esc_block_start`
+      outright left all twelve office documents byte-identical and the eval fully
+      green: nothing in the corpus contained text that opens a markdown block, so
+      the whole of defect 3 was protected by unit tests written from the same
+      understanding as the code. The reordered fixture now carries two bullets a
+      presenter would really type — `1. Reset, 2. clocks, 3. fabric traffic` and
+      `+ 5% timing margin held across the clock tree` — pinned in both their escaped
+      and unescaped forms, and deleting the helper now fails the eval in four places.
+
+      **The fixture did not pin the thing it was built for.** Two separate
+      `md_contains` probes for a heading and for its notes both pass while the notes
+      hang off the wrong slide; only ADJACENCY pins the binding. One multi-line probe
+      spans `## Slide 2 — Rollout plan` through the speaker notes, and injecting the
+      position/part conflation into both satellite lookups now fails the eval.
+
+      **Three smaller ones of mine.** `reordered` in the decision evidence compared
+      the published order against every slide PART, so it read true for any deck
+      holding one unlisted part however faithfully its listed slides were ordered.
+      The notes-title change renumbered the notes BODY shape unconditionally, which
+      silently rewrote `kestrel-overview.pptx` by one attribute — invisible, because
+      the id is not rendered and no output moved with it. And the splice into
+      `md_structure` used `lines.insert`, moving every remaining line on every list
+      item: measured 30µs/item against 18 at 80k items. It is a one-slot stack now,
+      flat at 20µs.
+
+      **The instrument's own instrument had a hole.** `thematic_breaks` — the fact
+      that catches a paragraph DISAPPEARING, and the one that caught the
+      self-deleting bullet — was not among the facts the CommonMark differential
+      compares, and the differential corpus contained no thematic break at all, so
+      adding it to the adapters changed nothing until nine break cases went in with
+      it. It now fails in twelve places if the reader stops counting them. The three
+      still ungraded (`heading_path`, `list_item_words`, `block_sequence`) are named
+      in that file's exclusion list, because they are exactly what P9.6 needs.
+
+      **Found here, deliberately not fixed here.**
+      - `_LEAD_RULE`'s `=` branch escapes a line of equals signs everywhere, and only
+        `_esc_fig` can produce the preceding paragraph line that makes one a setext
+        underline. Narrowing it means an `after_para` flag on `_esc_lead`, which moves
+        bytes on the docx paragraph path with no fixture demanding it — and the safe
+        default would have to be "escape", so every caller but one opts in. Recorded
+        in a test rather than left as folklore; the round trip is unaffected either
+        way, since `markdown_to_text` strips the backslash.
+      - `ppt/_rels/presentation.xml.rels` backs slide order exactly as
+        `ppt/presentation.xml` does but is NOT a content part, because `_rels` are
+        excluded as a class (the same exclusion that leaves a corrupt
+        `word/_rels/document.xml.rels` costing hyperlink destinations). A corrupt
+        presentation rels still falls back silently, with only the decision record.
+      - The corpus decks exercise five of the thirteen pptx emission sites. Neither
+        deck holds a chart, a SmartArt part, a comments part, an SVG media part, a
+        picture or a connector with a `txBody`, so the escapes at those sites are
+        asserted only by unit tests — written from the same understanding as the code
+        they check. The marko differential is what stands in for that today.
+      - `evals/gen_corpus.py` is byte-deterministic for every HAND-BUILT file
+        (verified across two runs); the three soffice-derived outputs — `.odt` and
+        both PDFs — are not, because LibreOffice stamps them. Pre-existing.
+      - A slide part not named `slideN.xml` is dropped from BOTH sides of the gate
+        — the converter's `_SLIDE_PART` and the truth's `_SLIDE` spell the same
+        restriction independently, so they agree and nothing moves. The xlsx lane
+        already accepts any name under `worksheets/`; the deck lane does not, and
+        `--audit-parts` is the only thing that would report it. Pre-existing.
+      - `md_structure` misses a GFM table built by a LAZY CONTINUATION across two
+        list items (marko builds one; the fact vector reports `tables: 0`). The
+        converter no longer emits such markdown, so nothing is exposed today, but
+        the reader gap is real and it is the same shape as the marker-line gap this
+        slice closed.
+      - A pptx bullet that skips three or more outline levels merges into its
+        parent: the deck path has no `_list_indent` clamp, which the docx path grew
+        in P0.1.
+      - No `.ppt` derivation of the reordered deck, and the reason is measured:
+        LibreOffice **renumbers the slide parts into `sldIdLst` order** on a round
+        trip, so the derived file would no longer disagree with itself and the fixture
+        would prove nothing. That renumbering is also independent confirmation that
+        presentation position is the deck's real order.
+
+      *Done: new fixture `office/kestrel-reordered.pptx` (`sldIdLst` = 1,5,3,4,2,
+      parts unrenumbered — what PowerPoint writes on a drag), whose 11 pinned checks
+      fail in four places against the old converter. All 12 previously shipped
+      documents byte-identical, every gate number unchanged, `source_repr_chars` the
+      only value that moves (the two new parts are genuinely read; `savings_ratio_min`
+      is a floor and no deck pins one). 101 new tests, `1599 → 1700` passed / 108
+      skipped on both the normal and the yaml-blocked 3.6.8 ring (the extra skips are the
+      differential cases, which need a CommonMark parser the bare ring has no way to
+      install); eval 21/0/3; grader 34/34 A; kb_lint 16 documents, 0 errors,
+      0 warnings; docs parity 11/11; `--audit-parts` still reports no unread
+      text-bearing part; the hand-built corpus regenerates byte-identically and
+      every previously shipped fixture is byte-identical to HEAD.*
+- [x] **P9.6 — pptx. The last format brought under the second gate.**
+      `pptx_source_structure`, `pptx_policy_drops`, the `a:tblGrid` floor in
+      `_pptx_table_md`, and rubric `A1` tightened — and the slice found three more
+      defects on the way in, two of them live in a format that was already gated.
+
+      **The gate is a gate**, proved by converter-fault injection over the shipped
+      decks rather than by editing the input (the pipeline is self-paired, so a
+      faithful conversion of a damaged source *should* pass):
+
+      | injected converter bug | token gate | structure gate |
+      |---|---|---|
+      | the deck's order read off the unqualified `id` | **1.0, valid** | fail `block_sequence, heading_path, list_item_words` |
+      | no shape is a title any more | **1.0, valid** | fail 5 facts |
+      | the outline flattened to one level | **1.0, valid** | fail `block_sequence, list_items` |
+      | two bullets exchanged on every slide | **1.0, valid** | fail 3 facts |
+      | the last table row dropped | 0.99, invalid | fail `block_sequence, tables` |
+      | the speaker-notes section never opened | 0.89, invalid | fail 6 facts |
+
+      **Four of the six are invisible to token recall** — every word present, only
+      the arrangement changed — and all four shipped `status: ok` before this slice.
+
+      **The truth derives the slide order AGAIN, and the cost of not doing so is
+      measured, not asserted.** P9.5 rejected the plan's own instruction to put
+      `pptx_slide_order` in `_pptx_struct.py`; the first row above is what that
+      rejection was worth. `test_sharing_the_converters_order_reader_would_cancel_the_first_row`
+      runs the same injection against a truth whose order comes from the converter
+      and against the real one: `pass` and `fail`, side by side, in one test.
+
+      **Three defects found here, two of them in the docx lane:**
+      - **A picture between a step and its sub-step flattened the list, in BOTH
+        formats, live.** `_join_blocks` separates any non-`li` block with a blank
+        line, so an image sentinel at column 0 CLOSES the list it interrupts.
+        Measured on a two-item nested list with one picture: `list_items`
+        `{0: 1, 1: 1}` with images off, `{0: 2}` with them on — and
+        `build_bundle.py` always converts with them on. So a *faithful* conversion
+        of an ordinary runbook failed the docx structure gate and refused to
+        publish. docx already had half the fix (`item_pad`, for a picture sharing
+        the step's own paragraph); a picture in a paragraph of its OWN — which is
+        how Word documents actually carry a screenshot — had none, and the deck
+        lane had none at all. The sentinel is now indented to the open item's
+        content column, which makes it a CONTINUATION of that item, and settled
+        back to column 0 when no item follows: without that second half,
+        `kestrel-clock-spec.docx` moved a byte for no gate benefit.
+      - **A deck's table published one column narrower than it declares.**
+        DrawingML writes the FULL grid, so a span-covered trailing column is
+        present-and-empty and looks exactly like the styled-but-valueless one
+        `_gfm_table` trims. `a:tblGrid` is now the floor, the way `w:tblGrid`
+        already was for docx. `recall: 1.0`, well-formed GFM, no warning: nothing
+        else could have seen it.
+      - **A bullet three levels below its parent was ABSORBED into it.** Six
+        columns of indent under a content column of two is a lazy continuation, so
+        the item stopped existing with every token still present; a slide OPENING
+        below level 0 became an indented code block instead. docx grew
+        `_list_indent`'s clamp in P0.1 and the deck path never did — and that clamp
+        turned out to have a defect of its own, which P9.6r records.
+
+      **The clamp is a fact about markdown, and that distinction is the whole
+      module.** CommonMark nests a child only under a parent that exists, so a
+      truth reading `a:pPr/@lvl` straight off the source would demand a depth no
+      renderer produces and would fail every faithful conversion of a deck whose
+      author skipped a level, permanently and with no fix available. Both readers
+      reach the depth independently and the lost level is COUNTED
+      (`flattened_list_levels`) rather than invented or ignored. *The first version
+      of the rule was wrong and the review caught it cancelling — see P9.6r.*
+
+      **What the truth refuses to state.** `ordered_items` is a stated zero only for
+      a deck with no `a:buAutoNum`: a deck CAN number a paragraph, so the zero would
+      certify the drop on one that does. `strong`/`em`/`strike`/`links` are omitted
+      outright for the same reason xlsx omits them, and the adversarial deck reports
+      six names in `unmeasured` with a counted warning behind each.
+
+      **Five new warning codes, and one widened.** `dropped_slide_chrome`,
+      `dropped_shape_emphasis`, `dropped_shape_links`, `dropped_shape_alt_text`,
+      `flattened_bullet_formatting`; `hidden_content_published` now also reads
+      `p:sld/@show="0"`, one code for one disclosure across two markup families the
+      way `flattened_table_spans` reads three. The chrome one is the interesting
+      case: **both** halves of the token gate exclude the same shapes under the same
+      declared policy, so 59 characters of banner left `n_source`, `recall` and the
+      markdown byte-for-byte where they were. A symmetric exclusion cannot move a
+      recall metric, and a shape excluded from both sides touches none of the
+      sixteen compared facts — the count is the only record there can be.
+
+      **The corpus could not see any of it.** With only the three older decks,
+      deleting the grid floor, the clamp or the picture indent left all twelve
+      documents byte-identical and the eval fully green — the same hole P9.5 found
+      for `_esc_block_start`. `office/kestrel-adversarial.pptx` closes it: each
+      deletion now fails the structure gate on real bytes while `recall` stays at
+      exactly 1.0.
+
+      **Row `A1` reports per FORMAT.** It divided one count by another, so a deck
+      lane that quietly stopped being dispatched would still read `pass on 2 of 3
+      (1 unmeasured)` — a green tick with a whole format behind it. A format named
+      in `_GRADED_FORMATS` that reports `unmeasured` on a real bundle now FAILS;
+      one that is not named is disclosed by name instead of folded into a total.
+      Evidence now reads `pass on 7 of 7 office bundles, by format: docx 3/3,
+      pptx 2/2, xlsx 2/2`.
+
+      **The warning vocabulary's own rule reached only one format.**
+      `test_a_deliberate_drop_carries_the_size_of_the_loss` ran over a hand-built
+      `.docx`, so the nine codes a workbook and a deck emit were exempt from the one
+      contract that file exists to enforce — and `cells`/`sheets`/`rows` were not
+      even in `_COUNT_KEY`. Both are fixed, and the count-key list is spelled out
+      rather than loosened to a pattern.
+
+      **Every office bundle in the eval corpus is now structurally graded.** Row A1
+      over `data/eval_bundles` reads `pass on 14 of 14 office bundles, by format:
+      doc 1/1, docx 3/3, odt 1/1, ppt 1/1, pptx 4/4, rtf 1/1, xls 1/1, xlsx 2/2` —
+      up from 6 of 11 unmeasured when P9 opened.
+
+      *Done: 1700 → 1777 passed, 115 skipped on both 3.6.8 rings (the extra skips are
+      the seven new CommonMark differential cases, which need a parser the bare ring
+      cannot install); the 3.12 + marko ring's 20 failures are byte-identical to
+      HEAD's and are a Pillow/VLM environment gap, not this slice; eval 21 → 22 pass,
+      0 fail, 3 skip; rubric 34/34 **A** on a corpus that now contains decks;
+      `kb_lint` 17 documents, 0 errors, 0 warnings; `--audit-parts` still reports no
+      unread text-bearing part; every corpus source that existed before this slice
+      regenerates byte-identically, and so does every one of the eight office
+      documents' markdown, with images on.*
+
+      **Found here, deliberately not fixed here.**
+      - A producer that OMITS a span-covered `a:tc` (non-conformant: ECMA-376
+        requires the full grid) puts every later value one column left, and BOTH
+        readers agree on it because both enumerate `a:tc`. The guard that fixes it
+        is narrow — expand `gridSpan` only when the row has fewer cells than
+        `gridCol`, carries no `hMerge`, and its spans sum to the grid width — but it
+        is a two-sided policy that wants its own fixture, and no conformant producer
+        writes the shape.
+      - `_find_locals` in `_pptx_table_md` isolates a nested `a:tbl` by accident
+        rather than by declaration (it does not descend into a found element); a
+        nested table written as a direct child of `a:tbl` would be hoisted into the
+        outer rows. The truth guards it explicitly, so the two would disagree —
+        loudly, which is the right direction, but the converter should say so.
+      - A deck's comment AUTHOR is dropped with no receipt, and so is a docx
+        comment's. Cross-format, so it belongs to a slice that fixes both.
+      - `ppt/slideLayouts/*` and `ppt/slideMasters/*` carry text no side reads, and
+        `--audit-parts` classifies them as furniture, so a title that lives only on
+        the layout is lost with no signal. Measured: 40 characters, `recall: 1.0`.
+      - **`.odp` and `.ods` are now gated, with zero corpus coverage.** The plan has
+        carried this as a warning since P9's sizing note, and it is no longer a
+        prediction: the LibreOffice lane converts to an OOXML sibling BEFORE either
+        gate runs, so `bundle_inputs` dispatches on the EFFECTIVE format and an
+        `.odp` reports `gate: pass, compared: 7`, an `.ods` `pass, compared: 4`, both
+        with `pre_conversion_structure` declared. Every office format the lane
+        accepts is therefore graded, which is the good news; the two with no fixture
+        are a live gate nobody has exercised, which is the bad. A fixture is the
+        fix, and a soffice-derived one is non-deterministic, so it wants its own
+        slice. Rubric row `A1` was corrected to decide coverage on the effective
+        format — bucketing on the source extension filed the whole LibreOffice lane
+        under formats it did not recognise and quietly stopped demanding them.
+- [x] **P9.6r — what the review found, including a cancellation I wrote.** A
+      five-lens adversarial review of the above, every finding then re-run by a
+      skeptic whose job was to refute it. The two most serious were introduced by
+      P9.6 itself, and one of them is the exact failure this whole phase exists to
+      end.
+
+      **THE CANCELLATION, measured.** The nesting clamp was written as "one deeper
+      than the deepest item currently OPEN". That is right for the FIRST item at a
+      skipped level and wrong for every one after it, because each successive item
+      finds the stack one entry taller — so three PEER bullets at outline level 2
+      published as a three-deep chain, and a bring-up slide read as though its steps
+      nested. And because `_add_bullet` had been written to mirror `_list_indent`
+      rather than to derive containment for itself, the delta CANCELLED: a sweep of
+      every level sequence of length 2–4 over levels 0–3 found **199 of 336
+      misrepresented, every one at `gate: pass, deltas: [], recall: 1.0`**. The
+      docx contrast is the proof it was a two-sided bug: the same shared
+      `_list_indent` produced the same staircase there, and because the docx truth
+      did NOT clamp, docx failed loudly on exactly the damage pptx certified.
+
+      The rule that is actually true of markdown is CONTAINMENT: an item's depth is
+      how many STRICTLY SHALLOWER ancestors are still open above it, so two items at
+      the same source level are siblings whatever that level is. Both sides now
+      derive it, differently, and the corrected truth CATCHES the old converter —
+      `recall 1.0, gate fail` on the staircase it used to certify. All eight corpus
+      documents are byte-identical after the fix, because for a well-formed outline
+      the two rules agree.
+
+      **The compensating disclosure it was justified by did not exist.**
+      `_add_bullet`'s docstring and this plan both said the lost level "is counted",
+      naming `flattened_list_levels` and `flattened_bullet_formatting` respectively.
+      The first existed in prose only — two mentions, no emitter, no docs row — and
+      the second counts `buAutoNum`/`buChar`/`buNone`, which cannot see a flattening
+      at all. That is `dropped_headers_footers` again: prose promising behaviour no
+      code delivers, which is the failure `test_warning_vocabulary.py` was written
+      for. `flattened_list_levels` is now a real code, on **both** formats.
+
+      **The docx truth's raw `w:ilvl` was a publish-blocker.** Pre-existing at HEAD
+      and confirmed end to end: a Word runbook with one skipped level (`ilvl` 0, 2,
+      0) rendered correctly, disagreed with a truth demanding a depth no renderer
+      produces, and `build_bundle.py` wrote `status: failed` with no `document.md`.
+      Both formats now state the rendered depth and count the loss.
+
+      **Two false FAILs in the new truth, both on faithful decks.** A diagram two
+      slides both reference was deduplicated document-wide while the converter
+      publishes it under each — six deltas at `recall 1.0`. And a slide's embedded
+      sections were ordered by relationship id as a STRING, where `rId10` precedes
+      `rId9`, while the markdown uses document order.
+
+      **`ordered_items: 0` was stated over a numbered list.** `a:buAutoNum` in a
+      shape's own `a:txBody/a:lstStyle` numbers every paragraph in it, and the
+      per-paragraph reader could not see it — the exact certification the omission
+      rule exists to prevent. The probe now reads wide; the per-paragraph COUNT
+      stays narrow, because the two answer different questions.
+
+      **Omission alone left the opposite direction open.** "Omit rather than certify
+      a zero" protects against the converter DROPPING a mark and does nothing about
+      it FABRICATING one: with escaping reduced to the identity, a bullet reading
+      `set *ready* high` renders real emphasis over words the deck wrote literally,
+      at `gate: pass`. `strong`/`em`/`strike`/`links` are now stated as zero exactly
+      when the SOURCE carries none of that mark — a statement about the document —
+      and omitted when it does.
+
+      **Three warnings asserted the text survived while scanning shapes whose text
+      does not.** A bold run inside a footer was reported as emphasis lost "while
+      every character is kept"; an `mc:Fallback` duplicate reported one picture's alt
+      text twice; a `buAutoNum` in a footer took `ordered_items` away from a deck
+      whose body has none. Every scan now shares one scope test, and it is the same
+      one the gate uses.
+
+      **Two locators named the wrong thing.** A hidden-and-unlisted slide published
+      its PART number as a "position", which on a reordered deck pointed at a slide
+      the deck fully shows; and a hyperlink in speaker notes fell through to its raw
+      package path, which on a reordered deck is the notes of the slide published
+      fifth.
+
+      **Row `A1` could not see a format that had stopped being BUILT.** Renaming the
+      two deck builders made the graded corpus silently docx+xlsx, and the row
+      printed the "N of N, 0 unmeasured" it had just been rewritten to kill —
+      `OVERALL A`, exit 0. It now fails when a format with a ground truth is absent.
+
+      **The docs-parity net could not see a non-docx report key.** Its fixture built
+      one `.docx`, so **45 keys** the real corpus emits were unpoliced — including
+      `structure_fidelity.blind_to` / `.unmeasured`, the whole `slide_order` evidence
+      block and every count field the deck and workbook drop warnings carry.
+      Scrubbing six of them from the reference left the entire suite green. The
+      fixture now converts a deck and a workbook beside the document.
+
+      **Refuted, and worth recording as refuted:** that a `p:cxnSp` divider makes
+      `thematic_breaks: 0` too strong (it emits no markdown at all); that `_measured`
+      leaves a `compared: 0, gate: pass` hole (the emitted side must be empty too,
+      and then the document is vacuously empty); that an internal hyperlink target
+      should be printed as a position (the relationship target is what a reader can
+      check against the package).
+
+      **Found here, deliberately not fixed here.** Partial SVG label loss is
+      invisible to both gates, because `_svg_parts_text` is one reader on both sides
+      of the token gate — pre-existing, cross-format, and its own docstring admits
+      it; the all-or-nothing case IS caught. A table whose first row is
+      delimiter-shaped is deleted from the render at `gate: pass` (pre-existing, both
+      formats). An all-empty table row and a table nested in a cell are both
+      flattened by a mirrored policy with no receipt. Nine test files carry no
+      `pytestmark`, so a `-m unit` run collects none of them (CI is safe: it runs by
+      path).
+
+      *Done: 1777 → 1805 passed, 115 skipped on both 3.6.8 rings; eval 22 pass,
+      0 fail, 3 skip; rubric 34/34 **A**; `kb_lint` 17 documents, 0 errors,
+      0 warnings; all eight pre-P9.6 documents still byte-identical.*
+- [x] **P9.7 — Docs and rubric selectors.** The parity tests did hold — every flag,
+      env var, report key, warning code and vocabulary term added across P9.0–P9.6
+      is documented, and the deck+workbook fixture P9.6 put into `test_docs_parity`
+      polices the non-docx half. What they cannot police is the part of
+      documentation that is a CLAIM rather than a key: which loss a warning code is
+      the receipt for, and which test demonstrates a rubric row. Both had drifted.
+
+      **The rubric graded its newest lanes least.** Row A5 asserts "adversarial
+      fixtur**es** are pinned in the eval corpus" and named `kestrel-adversarial.docx`
+      — one of the three the corpus builds, unchanged since before the workbook (P9.4)
+      and the deck (P9.6) grew adversarial fixtures of their own. Measured, not
+      argued: with the deck's and the workbook's expectations deleted from
+      `evals/expectations.json`, the old selector returned `('pass',
+      'evals/run_eval.py: office/kestrel-adversarial.docx')`. The fixtures keep being
+      generated and the eval keeps passing over them with nothing asserted, so
+      `OVERALL A`, exit 0. The selector now names one fixture per graded format, and
+      dropping any of the three returns `fail … the evidence this row is graded on has
+      disappeared`; a fixture that runs but SKIPS returns `skip`, because a skip is
+      not a demonstration. Row A4 had the same shape one size smaller: its condition
+      is "**every** deliberate drop emits a named warning carrying a count" and its
+      evidence was `test_a_deliberate_drop_carries_the_size_of_the_loss`, a docx.
+      `test_every_format_s_drops_carry_the_size_of_the_loss` — written in P9.6 and
+      never wired to the row that asserts what it proves — now backs it.
+
+      **Nothing graded the selectors, which is the rubric's own version of the bug
+      it exists to catch.** A `_suite` row's selector is the difference between "this
+      row's condition is demonstrated" and "that file is green", and it was the one
+      part of the grader no test read. Three guards, in
+      `tests/unit/backend/test_validate_rubric.py`, parametrised one row per id so a
+      failure names the row (plus a non-parametrised floor on the row count, because
+      pytest reports a parametrisation over an empty list as zero tests collected
+      rather than as a failure — a rubric that lost its suite rows would have taken
+      both guards green with it): every target exists; every named test still exists in it
+      (`ast`, not import — a renamed test used to surface only at grade time, in a
+      subprocess, as a row graded on silence); and A5's fixture list is held to
+      `_GRADED_FORMATS` **and** to the `build_adversarial_*` functions
+      `evals/gen_corpus.py` really defines (asserted non-empty first: rename those
+      builders and the set to check against is empty, so the guard would otherwise
+      be vacuous in exactly the case that matters), in both directions — so a format that
+      acquires a second implementation cannot arrive without the fixture written to
+      break a naive converter for it. All three verified red: renaming
+      `test_a_document_that_loses_nothing_reports_nothing` fails at `A4`, adding a
+      `build_adversarial_odp` stub fails the corpus guard, and renaming every
+      `build_adversarial_*` to `build_hostile_*` fails the non-empty assertion.
+
+      **The design doc still taught the rule P9.6r proved wrong.**
+      `docs/design/ooxml-lane.md` described rendered depth as "the CLAMP" and "the
+      clamped depth" — the stack-height rule that published three peer bullets at
+      level 2 as a three-deep chain and misrepresented 199 of 336 level sequences at
+      `gate: pass, deltas: [], recall: 1.0`. The code was fixed in P9.6r; the
+      document a reader would learn the lane from was not, which is how a corrected
+      bug gets re-introduced by someone following the design. It now states
+      CONTAINMENT — how many strictly shallower ancestors are still open — keeps the
+      clamp as the named, dated mistake, and says why it survived (the truth mirrored
+      the converter, so the delta cancelled). The same paragraph named
+      `flattened_bullet_formatting` as the receipt for a lost outline level: that is
+      the deck's *other* list receipt, for the `buAutoNum`/`buChar`/`buNone` cascade.
+      The receipt for a lost level is `flattened_list_levels`, on both formats, and
+      `output-schema.md` had it right all along — the prose pointed at the wrong row
+      of a table in the same repo. Two in-code comments in `_ooxml_md.py` still called
+      `_list_indent` "the clamp"; both now say containment, and the edits are proven
+      prose-only by comparing the module's `ast.dump` with docstrings stripped.
+
+      *Not fixed here, deliberately:* the guards read function definitions with
+      `ast`, so a selector naming a test generated by `parametrize` or defined inside
+      a class would read as missing. Every selector today names a module-level
+      `def`, and a guard that silently accepted unknown names would be worth less
+      than one that is occasionally too strict about a shape the rubric does not use.
+
+      *Done: 1813 → 1848 passed, 115 skipped on both 3.6.8 rings (host, and
+      yaml-blocked via `sitecustomize`); 3.12 ring 20 failures, all four
+      caption/figure files, byte-identical to HEAD's set; rubric **34/34 A**, with
+      A5's evidence now reading all three fixtures plus `eval census: 22 pass, 0
+      fail, 3 skip`; converter executable code provably unchanged, so no document
+      byte moved.*
+- [x] **P9.8 — Retire the `unmeasured` list.** Done, and the shape of the work was
+      decided by one rule that could not be bent: **a fact the converter drops must
+      be OMITTED, never stated as zero.** A stated `strong: 0` over a deck that draws
+      bold makes the ground truth inherit the converter's blind spot on the very axis
+      it exists to police — it CERTIFIES the loss. So the list could not be emptied by
+      writing zeros. It emptied by the converters learning to emit what they had been
+      dropping, which made this a converter slice with a gate slice attached.
+
+      **P9.8a — a deck's runs.** `pptx_markdown` read paragraphs through `_text_of`,
+      a flat text scan that discards run structure entirely. It now builds
+      `[(marks, text)]` segments and feeds `_render_runs` — the docx lane's renderer,
+      which already owns CommonMark's flanking rules and the coalescing that stops a
+      word split across runs from emitting `**Dma****Arbiter**`. Only the READER is
+      new, because DrawingML states a run's properties as ATTRIBUTES of `a:rPr` and
+      puts a hyperlink INSIDE them rather than around a span of runs. Inline escaping
+      moved to per-run, where the only code that knows which characters are the
+      document's and which are the converter's lives; `_esc_block_start_md` does the
+      line-leading half on already-rendered markdown.
+
+      **P9.8c — a workbook's cells.** A third distinct read: emphasis is per CELL,
+      through `@s` into `cellXfs` into `fonts`, all positional; a link is attached to
+      the cell by `@ref` in the sheet's own `<hyperlinks>` block. An empty cell gains
+      no markers, because `****` is four literal asterisks the workbook never wrote
+      and a row of them is a GFM delimiter row waiting to happen.
+
+      **P9.8b — the bullet cascade, the last two facts.** `a:buAutoNum` makes a
+      paragraph an ORDERED item, which markdown holds perfectly well, so this was
+      pure loss: `1. 2. 3.` published as three identical dashes and a reader could not
+      tell a SEQUENCE from a set. The ordinal is drawn rather than stored, so token
+      recall was blind to the whole of it. Resolving it means the full cascade —
+      the paragraph's own `a:pPr`, the shape's `a:txBody/a:lstStyle`, the slide
+      LAYOUT's matching placeholder, the slide MASTER's `p:txStyles/p:bodyStyle` —
+      followed by RELATIONSHIP rather than filename, so a deck with two masters
+      resolves each layout to the master its own rels name. `a:buNone` is a
+      DECLARATION and beats an inherited number: a paragraph the slide draws plain
+      must not come out numbered. Written TWICE on purpose, once in the converter and
+      once in the truth, because a single shared resolver would make a bug in it land
+      on both sides and cancel.
+
+      **Four receipts narrowed or retired**, because a warning is a receipt for a loss
+      and a receipt for a loss nobody suffered teaches a reader to discount the whole
+      vocabulary. `dropped_shape_emphasis` and `dropped_cell_emphasis` are gone;
+      `dropped_shape_links`/`dropped_cell_links` now report only an INTERNAL jump,
+      which really does still lose its destination because `[text]()` is a dead link
+      and a slide-to-slide jump has no address a reader outside the deck could follow;
+      `flattened_bullet_formatting` lost its `auto_numbered` field and keeps
+      `custom_char` and `suppressed`, which are the two markdown genuinely cannot
+      hold — it has exactly one bullet glyph and no way to write an item with no
+      marker. The adversarial deck gained an internal jump on an EXISTING run so the
+      narrowed code keeps a corpus fixture without moving a token.
+
+      **The two cascades are compared by RUNNING them, not by reading them.** They
+      are near-line-for-line duplicates by design, so the cost of that design is
+      drift — and a drift is a faithful deck that cannot publish. A review compared
+      them side by side and found nothing, which is not the same as evidence: 265
+      generated decks now drive every combination of the four declaration sites
+      (`a:pPr`, shape `a:lstStyle`, layout placeholder, master `p:bodyStyle`) × four
+      bullet kinds, four outline levels, five placeholder spellings and a `p:grpSp`
+      nesting, render each, and ask `md_structure` who was right.
+
+      *Measured, not asserted.* `unmeasured` is now **empty on all nine office
+      documents**; the adversarial deck went `compared: 7 -> 13` and the adversarial
+      workbook `4 -> 6`. Of the 38 truth/markdown outputs snapshotted over those nine
+      documents, the seven that carry none of these constructs are byte-identical in
+      markdown, and the only non-adversarial change anywhere is `kestrel-registers.xlsx`
+      gaining four stated zeros. Five new red-direction rows bug the converter on the
+      pristine adversarial fixtures and demand the gate name the delta; all five leave
+      `token_recall` at exactly 1.0, which is the point — a marker is drawn, not
+      stored, and a URL is markup on neither side.
+
+      *One row had to be re-derived after it passed for the wrong reason:* bugging
+      `_pptx_step` to make every marker read `1.` is **not damage**. CommonMark
+      RENUMBERS a list from its first marker, so `1. a / 1. b` and `1. a / 2. b` are
+      the same document to a reader, the truth says `[1, 2]` for both, and the gate is
+      right to pass. `ordered_numbers` compares what the reader SEES; the row now
+      moves the START, which a reader really does see.
+
+      *Also fixed in passing, both pre-existing:* `_rels_name` in the deck truth was
+      spelled as two string replacements for `ppt/slides/` and `ppt/notesSlides/` and
+      silently returned `ppt/slideLayouts/slideLayout1.xml.rels` — a part no package
+      contains — the moment the cascade needed to walk a LAYOUT's relationships, so
+      the whole layout→master chain resolved to nothing. And `_emphasised_styles`
+      returned `set()` on a missing `xl/styles.xml` where its own docstring promised a
+      dict; the only caller iterated the result, and iterating an empty set and an
+      empty dict look identical, so the wrong TYPE went unnoticed until a second
+      caller did a lookup on it. Three conditional-zero probes (`_marked_runs`,
+      `_has_hyperlinks`, `_has_auto_numbering`) are deleted — the conditionals they
+      existed to feed are gone.
+
+      *Done: 2065 → 2352 passed, 115 skipped, 11 xfailed on both 3.6.8 rings; 3.12
+      ring 20 failures, the unchanged caption/figure environment gap; eval 22 pass,
+      0 fail, 3 skip; rubric **34/34 A**; `vocabulary.md` untouched.*
+- [x] **P9.9 — two adjacencies markdown cannot write without help.** Opened by
+      P9.8a's differential and finished here, and the slice grew once it was measured
+      properly: the entry said "exactly 1 of the 25 adjacent mark pairs", and widening
+      the alphabet to include COMBINED marks (bold+strike, italic+strike) found 326
+      misreads over 576 one-to-three-span documents. Both defects were pre-existing,
+      cross-format, and **publish-blockers on entirely ordinary Word**.
+
+      **`**Dma**Arbiter` — emphasis ending mid-word.** `_mdstructure._words` reduces
+      text to `[a-z0-9]+` runs, so every other character SEPARATES. That is right for
+      punctuation the document wrote and wrong for a marker the CONVERTER wrote: this
+      side read `("dma", "arbiter")` where the source truth correctly read
+      `("dmaarbiter",)`, so `list_item_words` disagreed and the document was refused
+      at `token_recall: 1.0`. Bolding part of a word is the most ordinary thing in a
+      datasheet, and `pre**fix**` failed the same way. `_words` now strips unescaped
+      runs of `*`, `~` and backtick, stepping AROUND code spans — code is verbatim, so
+      an asterisk inside one is the document's and must keep separating.
+
+      That is the same argument the module already makes for a link's URL and for
+      `<br>`, and it is safe for one reason: `_esc` escapes all three whenever the
+      document's own text holds them. So the claim is checked rather than argued —
+      `_words(_esc(src)) == _struct_common._words(src)` over an exhaustive alphabet of
+      short strings plus a seeded wide sample, 0 disagreements. `_` is deliberately
+      NOT in the set: this converter never emits it as a marker and leaves it
+      unescaped inside an identifier (`CLK_100M`), so stripping it would JOIN two
+      tokens the source separates.
+
+      **`***alpha****beta*` — two spans whose delimiters fuse.** Four asterisks is ONE
+      em span to CommonMark, and the text layer mis-paired it too, so this one moved
+      `em` AND took recall to 0.0. `**~~beta~~**` after a letter is the same family
+      through a different rule: the `**` cannot LEFT-flank, its outer neighbour being a
+      word character and its inner a `~`. `_render_runs` now writes an empty HTML
+      comment between two spans whose delimiters would fuse or fail to flank. It
+      renders as nothing, carries no token, and breaks the run; `markdown_to_text` and
+      `_words` both remove it to NOTHING, which they must — it only ever stands where
+      two spans meet with NO whitespace, which is to say between two halves of one
+      word, and a space there splits a token the source holds whole.
+
+      *Two ordering traps, both found by a failing test rather than by reading.*
+      `_COMMENT` matched the empty form too, so the separator was consumed before the
+      emphasis it exists to keep apart had been unwrapped — `(?!-*->)` makes the two
+      patterns disjoint and the empty one is now stripped AFTER `_BOLD`/`_ITALIC`. And
+      the first fixture put the two constructs in a PARAGRAPH: `list_item_words` is
+      the only fact that grades text word by word, so the mid-word case was invisible
+      to the gate there and deleting its fix left the document passing. It is a LIST
+      ITEM now.
+
+      *A residual removed rather than re-documented.* `Note**.** end.` — a
+      one-character bold span of `.` — had its emphasis lost because nothing can move
+      out of a one-character span; the test pinning that was called
+      `..._keeps_its_markers` and asserted `gate == "fail"`. The separator is exactly
+      what the shift could not be, changing what sits OUTSIDE the delimiter without
+      touching the span's own characters: marko reads `strong=0` for the old form and
+      `strong=1` for the separated one, so the gate now passes because nothing is lost.
+
+      *One thing the separator broke, found by probing rather than by the review.* A
+      heading can hold one, and its DASHES are `-` — a character the anchor rule
+      KEEPS — so `***read***<!---->*only*` published the fragment `read-only` while
+      the heading a renderer shows is `readonly`, and a reader copying the link off
+      the page landed nowhere. All THREE copies of that rule had it (the one that
+      publishes anchors, the one that grades them, the one that resolves a `ref`
+      against them), and `test_anchor_parity.py` was green throughout: it proves the
+      three AGREE, which is necessary and not sufficient. Each now drops an HTML
+      comment before slugging, and the parity corpus asserts the slug a renderer
+      would produce rather than only that the three match.
+
+      *Measured.* **Zero** of the 38 truth/markdown outputs over the nine corpus
+      documents moved — no shipped document contains an adjacency that needs a
+      separator, which confirms the rule is minimal and, by the P9.6 lesson, means
+      nothing in the corpus DEFENDED the fix. The adversarial `.docx` now carries both
+      constructs in one bullet, and each fix is deleted in turn to prove it: without
+      the separator, `gate: fail [em]` at recall 0.998; without the marker strip,
+      `gate: fail [list_item_words]` at recall **1.0** — invisible to the token gate,
+      which is the shape this whole phase exists for; without the text layer's
+      handling, recall falls off 1.0. Nine adjacency shapes joined the marko
+      differential corpus, and the `strict=True` xfail family P9.8 left behind went
+      RED the moment the fix landed, which is what strict is for.
+
+      *Done: 2352 → 2402 passed, 124 skipped, **0 xfailed** on both 3.6.8 rings; 3.12
+      ring 20 failures, the unchanged caption/figure environment gap; eval 22 pass,
+      0 fail, 3 skip; rubric **34/34 A**.*
+
+**Honest sizing.** Roughly 1.5–2× what the slice table implies, concentrated in three
+categories that carry no line in any size column: ~1000–1400 lines of corpus
+fixtures (`build_adversarial_docx` alone is ~280 lines for *one*), ~15 new warning
+codes against 18 existing — an 83% increase, each needing an emission site, a docs
+row and a test — and documentation parity. `.odp`/`.ods` acquire a hard gate with
+zero coverage and need fixtures before P9.4 lands.
+
+---
+
 ## Recorded deviations
 
 Kept here so they are decisions, not drift. The list grew a great deal in P8;
@@ -1149,7 +2316,7 @@ it is grouped by area below, in the same voice throughout.
 
 | Decision | Alternative | Why this way |
 |---|---|---|
-| When a `*`/`**`/`~~` delimiter cannot flank, **one rendering unit of the span's own text moves outside the markers**, so `(2:0)` bolded in the source emits as `Field MODE(**2:0)**` | Fall back to inline `<strong>`/`<em>` HTML | CommonMark cannot express emphasis whose delimiter has a word character outside and punctuation inside — the asterisks print literally and the emphasis is gone from the render. Inline HTML collides head-on with the table-span row above (raw-HTML islands are invisible to all four pipe-shaped table detectors) and would need `_mdstructure._scan_inline` and `markdown_to_text` taught the tags. Moving the minimum — one unit, only when the delimiter is actually blocked — keeps the emphasis in the render and the character in the text; marko and markdown-it both confirm the result |
+| When a `*`/`**`/`~~` delimiter cannot flank, **one rendering unit of the span's own text moves outside the markers**, so `(2:0)` bolded in the source emits as `Field MODE(**2:0)**`. *P9.9 added a second mechanism that costs nothing — an empty HTML comment outside the delimiter — and it now handles the cases the shift cannot (a delimiter as the inner neighbour, and two runs fusing). The shift still fires FIRST, so this row still describes what `(2:0)` does; retiring it in favour of the separator would keep the emphasis over the whole span and is a follow-up, not a P9.9 claim.* | Fall back to inline `<strong>`/`<em>` HTML | CommonMark cannot express emphasis whose delimiter has a word character outside and punctuation inside — the asterisks print literally and the emphasis is gone from the render. Inline HTML collides head-on with the table-span row above (raw-HTML islands are invisible to all four pipe-shaped table detectors) and would need `_mdstructure._scan_inline` and `markdown_to_text` taught the tags. Moving the minimum — one unit, only when the delimiter is actually blocked — keeps the emphasis in the render and the character in the text; marko and markdown-it both confirm the result |
 | The shift is **not** applied when a span carries two delimiter kinds (`**~~x~~**`) or is a single punctuation character; those keep markers a renderer prints literally | Drop the emphasis markers instead | The delimiter's inner neighbour is another marker and cannot move; dropping the markers would delete a fact the document carries. Either way the fidelity gate reports `strong 1 vs 0` and the document does not publish, so the loss stays **measured** rather than hidden |
 | `_esc`'s `](`/`][` bracket test is made against the assembled **paragraph** text (`_p_literal`), which holds a hyperlink's display text but not the `](url)` the converter synthesises around it | A post-pass over the finished markdown line | The finished line contains the converter's *own* link syntax, so a paragraph holding one genuine link would freeze every unrelated `[31:0]` back into `\[31:0\]` — a silent regression against the recorded `[payments]` decision. Reading only what the document wrote keeps the exemption where it was earned and still sees the danger a run boundary creates |
 | `_esc_lead` escapes 1–6 leading hashes (with or without a following space), a line of only `-` or only `=`, and `[label]:`; it does **not** escape 7+ hashes or `#1 priority` | Escape any leading marker character | None of the unescaped shapes is a block construct in CommonMark, so escaping them would put a visible backslash into text that was never at risk — the same argument the `[payments]` and `\_` rows make. The escaped shapes all render the paragraph *away*: `-----`, `===` and `[REG]: 0x04` carry no token and no heading fact, so both gates passed while the paragraph was deleted from the render |
@@ -1221,7 +2388,7 @@ it is grouped by area below, in the same voice throughout.
 | `_rubric` **re-implements** the fenced-code mask and the GFM table-separator test instead of importing them from `backend.sections` / `_mdcheck` | Import the producer's helpers | The rubric grades what those modules produced. A check that asked the producer where the code is, or how many tables it found, would only be asking a module whether it agrees with itself — the same reason the fallback anchor and `gfm_anchor` are spelled out there rather than imported. Independent restatement **is** the measurement |
 | A suite row is answered **only** by the tests it names, so an unrelated *failing* test in the same file does not fail the row | Fail a row when its file is red | The row asserts one condition; a green file cannot demonstrate it and a red file cannot refute it. That unrelated test belongs to some other row, or to none — and if to none, the fix is a row, not a false failure here. The complementary half (an unrelated *green* test cannot earn a row) is the defect this change exists to close |
 | Row C5 hard-fails the office lane for an unaddressed table but reports non-office lanes `unmeasured` | One uniform rule | The same asymmetry `structure_fidelity` already records: the office lane has a converter-blind ground truth, docling's flat outline may legitimately be unable to address a table. `unmeasured` is printed in the evidence and is never counted as a pass |
-| Row A5 is graded on **one** eval fixture, not on the eval exiting 0, and the eval's other skips are printed rather than graded | Grade the eval's exit code | "Adversarial fixtures are pinned" is a claim about one expectation; eighteen green siblings do not make it true, and the row must fail if that expectation is dropped. The remaining 3 PDF skips are a **declared** exclusion (the grader hardcodes `--skip-pdf`) printed in the row's evidence — no row claims them, which is why the census is there |
+| Row A5 is graded on the named adversarial fixture of **each graded format**, not on the eval exiting 0, and the eval's other skips are printed rather than graded | Grade the eval's exit code | "Adversarial fixtures are pinned" is a claim about specific expectations; eighteen green siblings do not make it true, and the row must fail if any of them is dropped. It named one fixture for two slices after the deck and workbook grew their own, so the newest lane was the least defended; the selector is now pinned to `_GRADED_FORMATS` in both directions. The remaining 3 PDF skips are a **declared** exclusion (the grader hardcodes `--skip-pdf`) printed in the row's evidence — no row claims them, which is why the census is there |
 | Row C6 asks only about one ALL-CAPS literal in one fixture; the general claim is row C6s over the unit suite | Extend C6's probe list | The graded corpus contains no numbered or keyword body sentence to ask C6 of, and the rubric cannot re-derive `is_heading`'s bound without reimplementing the code it grades. C6 is now named for exactly what it measures instead of overclaiming |
 | `grade_output.py --json` emits `{"error": …}` — with no `summary` and no `rows` — on exit 2 | Emit `{summary, rows}` with an error field | The error document must not be readable as a grade with zero failing rows. A consumer keyed on `summary` raises, which is the correct outcome for "the run broke" |
 

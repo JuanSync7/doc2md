@@ -15,6 +15,7 @@ import importlib.util
 import io
 import json
 import os
+import sys
 import re
 import zipfile
 
@@ -343,7 +344,14 @@ def _build_a_real_bundle(tmp_path):
     `outline[].images` came out empty, so the documented link-node and image-node
     keys (`text`/`url`/`line`, `image_id`/`ref`/`alt`/`caption`/`bytes`/`width`/
     `height`) were never in the compared set at all. A key the fixture cannot emit
-    is a key this test cannot police."""
+    is a key this test cannot police — and for a long time it
+    could emit only a DOCX's keys. Diffing the real corpus found 45 report keys no
+    docx bundle writes, among them `structure_fidelity.blind_to` / `.unmeasured`,
+    every count field the deck and workbook drop warnings carry, and the whole
+    `slide_order` evidence block; scrubbing six of them out of the reference left
+    the entire suite green. So the fixture converts a DECK and a WORKBOOK beside the
+    document, and the tests below walk all three bundles rather than whichever one
+    the filesystem listed first."""
     spec = importlib.util.spec_from_file_location(
         "build_bundle", os.path.join(REPO, "scripts", "build_bundle.py"))
     bb = importlib.util.module_from_spec(spec)
@@ -401,21 +409,30 @@ def _build_a_real_bundle(tmp_path):
         zf.writestr("word/numbering.xml", numbering)
         zf.writestr("word/_rels/document.xml.rels", rels)
         zf.writestr("word/media/shot.png", PNG)
+    # The deck and the workbook are the corpus generator's OWN adversarial
+    # fixtures, so the keys under test are the ones that really ship rather than a
+    # second understanding of them written here.
+    sys.path.insert(0, os.path.join(REPO, "evals"))
+    import gen_corpus                                   # noqa: E402
+    gen_corpus.build_adversarial_pptx(os.path.join(str(src), "deck.pptx"))
+    gen_corpus.build_adversarial_xlsx(os.path.join(str(src), "book.xlsx"))
     assert bb.main(["--src", str(src), "--out", str(out), "--run-id", "R"]) == 0
     em.main(["--bundles", str(out), "--run-id", "R"])       # offline: exit 2 = pending
-    d = [os.path.join(str(out), n) for n in os.listdir(str(out))
-         if os.path.isdir(os.path.join(str(out), n))][0]
-    return str(out), d
+    dirs = sorted(os.path.join(str(out), n) for n in os.listdir(str(out))
+                  if os.path.isdir(os.path.join(str(out), n)))
+    assert len(dirs) == 3, dirs
+    return str(out), dirs
 
 
 def test_every_report_and_structure_key_is_documented(tmp_path):
-    out, d = _build_a_real_bundle(tmp_path)
+    _out, dirs = _build_a_real_bundle(tmp_path)
     sections = _sections(_read(SCHEMA_DOC))
     missing = []
     for name in ("report.json", "structure.json"):
         keys = set()
-        with io.open(os.path.join(d, name), encoding="utf-8") as fh:
-            _key_paths(json.load(fh), "", keys)
+        for d in dirs:
+            with io.open(os.path.join(d, name), encoding="utf-8") as fh:
+                _key_paths(json.load(fh), "", keys)
         missing += _undocumented(sections, name, keys)
     _assert_documented(missing, ("report.json", "structure.json"))
 
@@ -428,9 +445,9 @@ def test_a_key_is_not_documented_by_another_blocks_table(tmp_path):
     `losslessness{}`, `reason` belongs to `decisions[]`. Under the old flat bag all
     three were accepted, and a fidelity `ratio` beside `compared` is exactly the
     field somebody adds next."""
-    out, d = _build_a_real_bundle(tmp_path)
+    _out, dirs = _build_a_real_bundle(tmp_path)
     sections = _sections(_read(SCHEMA_DOC))
-    with io.open(os.path.join(d, "report.json"), encoding="utf-8") as fh:
+    with io.open(os.path.join(dirs[0], "report.json"), encoding="utf-8") as fh:
         report = json.load(fh)
     report["structure_fidelity"]["ratio"] = 0.5
     report["structure_fidelity"]["note"] = "undocumented"
@@ -447,7 +464,7 @@ def test_a_key_is_not_documented_by_another_blocks_table(tmp_path):
 
 def test_every_manifest_and_frontmatter_key_is_documented(tmp_path):
     from backend.ingest import split_front_matter
-    out, d = _build_a_real_bundle(tmp_path)
+    out, dirs = _build_a_real_bundle(tmp_path)
     doc = _read(SCHEMA_DOC)
     sections = _sections(doc)
     missing = []
@@ -456,10 +473,12 @@ def test_every_manifest_and_frontmatter_key_is_documented(tmp_path):
         row = json.loads(fh.readline())
     missing += _undocumented(sections, "manifest.jsonl", set(row))
 
-    meta, _body = split_front_matter(_read(os.path.join(d, "document.md")))
-    # source_* properties are documented as one family, by prefix.
-    keys = set(k for k in meta
-               if not (k.startswith("source_") and "`source_*`" in doc))
+    keys = set()
+    for d in dirs:
+        meta, _body = split_front_matter(_read(os.path.join(d, "document.md")))
+        # source_* properties are documented as one family, by prefix.
+        keys |= set(k for k in meta
+                    if not (k.startswith("source_") and "`source_*`" in doc))
     missing += _undocumented(sections, "front matter", keys)
     _assert_documented(missing, ("manifest.jsonl", "front matter"))
 

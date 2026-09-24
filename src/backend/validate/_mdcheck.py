@@ -343,7 +343,44 @@ def _content_metrics(md, token_count=None):
 _FIDELITY_FACTS = ("headings", "heading_path", "list_items", "ordered_items",
                    "bullet_items", "ordered_numbers",
                    "strong", "em", "strike", "code_spans", "code_blocks",
-                   "links", "tables", "list_item_words", "thematic_breaks")
+                   "links", "tables", "list_item_words", "thematic_breaks",
+                   "block_sequence")
+
+# THE ADMISSION TEST for a new name in that tuple, written down because the list is
+# closed on purpose and this is the first addition since it was closed:
+#
+#   1. Both sides can derive it INDEPENDENTLY. The emitted half must reach it from
+#      markdown alone, with no knowledge of the source format — otherwise it is not
+#      a second opinion, it is the converter's opinion written twice.
+#   2. It is format-NEUTRAL. A fact only one format can supply would sit in every
+#      other format's `unmeasured` list for ever, inverting that field's meaning from
+#      "be suspicious" into "ignore this line".
+#   3. It catches damage no existing fact can express.
+#
+# `block_sequence` was admitted on all three. It is the interleaving of blocks the
+# vector ALREADY states — six kinds, every one of them counted somewhere else — so it
+# models nothing new; and it closes a class every other fact is blind to by
+# construction. A table moved from under one heading to under another leaves the
+# histogram, the geometry, the cell contents and the token multiset all identical:
+# measured on a workbook whose every table was detached from its sheet heading,
+# `gate: pass, compared: 3, deltas: []` against an otherwise fully populated truth.
+# Only the order changed, so only an ordered fact can say so.
+#
+# A prose paragraph is deliberately NOT a kind. Neither ground truth has an opinion
+# about where paragraphs land, and predicting them would fail every faithful
+# conversion that emits an image sentinel or lifts a text box.
+
+
+def _measured(source):
+    # type: (dict) -> bool
+    """Did a ground truth actually supply any graded fact?
+
+    Not plain truthiness. A source dict carrying only reserved keys — a `_blind_to`
+    declaration and nothing else — is not a measurement, and treating it as one
+    would publish `compared: 0, gate: "pass"`: a clean bill of health from a truth
+    that stated nothing. The same shape of hole `n_source_tokens` exists to close on
+    the losslessness side."""
+    return any(fact in (source or {}) for fact in _FIDELITY_FACTS)
 
 
 def _has_evidence(value):
@@ -392,7 +429,12 @@ def structure_fidelity_report(emitted, source, lane="office"):
         bill of health. ``gate`` still answers only for what was measured; read the
         two together."""
     out = OrderedDict()
-    out["method"] = "ooxml-structure-ground-truth" if source else "unmeasured"
+    measured = _measured(source)
+    out["method"] = "ooxml-structure-ground-truth" if measured else "unmeasured"
+    # `compared`'s denominator, inline. Without it an archived report says "compared:
+    # 6" and the reader has to know how long the list was on the day it was written —
+    # and the list has now been widened once, so that day matters.
+    out["facts"] = len(_FIDELITY_FACTS)
     deltas = []
     unmeasured = []
     compared = 0
@@ -425,10 +467,18 @@ def structure_fidelity_report(emitted, source, lane="office"):
             deltas.append(OrderedDict([("fact", fact), ("source", want),
                                        ("markdown", got)]))
     out["compared"] = compared
-    if source and unmeasured:
+    if measured and unmeasured:
         out["unmeasured"] = unmeasured
+    # `unmeasured` and `blind_to` answer two different questions and a reader who
+    # conflates them will misjudge the report. `unmeasured` is a fact this VECTOR has
+    # that this ground truth did not supply — a gap somebody closes by writing code.
+    # `blind_to` is structure the FORMAT carries that no name in the closed list can
+    # express, so a `pass` never claimed it; it closes only by widening the list, or
+    # never, when markdown cannot hold the thing at all.
+    if (source or {}).get("_blind_to"):
+        out["blind_to"] = list(source["_blind_to"])
     out["deltas"] = deltas
-    if not source:
+    if not measured:
         out["gate"] = "unmeasured"
     elif lane != "office":
         out["gate"] = "best-effort"

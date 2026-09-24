@@ -687,7 +687,31 @@ def test_the_abstract_floor_takes_prose_and_nothing_else():
     # Bounded, and cut at a sentence rather than mid-word.
     short = abstract_floor(BODY, OUTLINE, max_chars=60)
     assert len(short) <= 60 and short.endswith(".")
+    # An outline handed in beside an EMPTY body cannot have come from it, so there
+    # is nothing to summarise and the section-name fallback must not fire.
     assert abstract_floor("", OUTLINE) == ""
+
+
+def test_a_document_with_no_prose_at_all_still_gets_a_floor():
+    """A workbook converts to headings and pipe tables and nothing else, so the
+    lede scan finds no paragraph. That returned the empty string, and every
+    spreadsheet in the corpus shipped with NO abstract — invisible to the rubric
+    for as long as the documents under grade were all prose-bearing `.docx`.
+
+    The fallback names the document's own sections: measured evidence, in the
+    document's own words, nothing characterised or inferred. A poorer summary than
+    a lede, and a real one."""
+    from backend.sections import document_outline
+    body = ("## Milestones\n\n| Milestone | Due |\n| --- | --- |\n| RTL freeze | 46027 |\n"
+            "\n## Rails\n\n| Rail | mW |\n| --- | --- |\n| VDD_CORE | 182.5 |\n")
+    outline = document_outline(body)["outline"]
+    assert abstract_floor(body, outline) == "Sections: Milestones, Rails."
+
+    # Prose still wins wherever there is any: the fallback is a floor under the
+    # lede, never a replacement for it.
+    mixed = "## Overview\n\nThe arbiter serves both queues.\n\n| a |\n| --- |\n| 1 |\n"
+    assert abstract_floor(mixed, document_outline(mixed)["outline"]) == (
+        "The arbiter serves both queues.")
 
 
 def test_every_harvested_link_is_categorised_and_carries_the_section_it_sits_in():
@@ -1208,3 +1232,69 @@ def test_a_model_reply_that_is_not_an_object_is_rejected_rather_than_raised(voca
                                 "wrong-kind-expected-mapping")]
     # None still means "no answer to judge", not a rejection.
     assert accept_model_meta(None, vocab, {})["rejected"] == []
+
+
+# ============= a title a reader sees must not carry the converter's own punctuation
+#
+# `_render_runs` writes `<!---->` between two adjacent emphasis spans whose delimiter
+# runs would otherwise fuse. Unlike `**`, that comment corresponds to NOTHING in the
+# source document — it is punctuation this converter invented for its own purposes.
+#
+# The outline stores a heading's title VERBATIM by design (structure.json publishes
+# what the render says), but the METADATA path is different: `title`, `abstract` and
+# `slug` are what a person and the KB read. Measured before this fix, on a heading
+# `***read***<!---->*only* registers`:
+#
+#     title:    "***read***<!---->*only* registers"
+#     abstract: "Sections: ***read***<!---->*only* registers."
+#     slug:     "read-only-registers"     <- and the outline anchor said "readonly-…"
+#
+# The slug is the sharpest of the three: `slugify` turns every non-slug character into
+# a hyphen, so the comment's dashes became a WORD BOUNDARY that the heading does not
+# have, and the document's own url form disagreed with its heading's fragment.
+
+_SEP_TITLE = "***read***<!---->*only* registers"
+
+
+def _sep_outline():
+    return [{"title": _SEP_TITLE, "anchor": "readonly-registers", "children": []}]
+
+
+def test_a_title_drops_the_converters_span_separator():
+    from backend.kb._enrich import title_floor
+    title, _src = title_floor("", "", "irrelevant.docx", _sep_outline())
+    assert title == "readonly registers"
+
+
+def test_the_no_prose_abstract_drops_it_too():
+    """The path commit 0349b7c added: a workbook converts to headings and tables and
+    nothing else, so the abstract is built out of section TITLES — which is exactly
+    where a raw title reaches a reader."""
+    from backend.kb._enrich import abstract_floor
+    got = abstract_floor("## x\n\n| a | b |\n| --- | --- |\n", outline=_sep_outline())
+    assert "<!---->" not in got, got
+    assert got == "Sections: readonly registers."
+
+
+def test_the_slug_agrees_with_the_headings_own_fragment():
+    """The comment's dashes became a hyphen, so the document's url form claimed a word
+    boundary the heading does not have."""
+    from backend.kb._derive import heading_anchor, slugify
+    from backend.kb._enrich import title_floor
+    title, _src = title_floor("", "", "irrelevant.docx", _sep_outline())
+    assert slugify(title) == "readonly-registers"
+    assert heading_anchor(_SEP_TITLE) == "readonly-registers"
+
+
+def test_a_published_title_is_prose_and_not_markdown():
+    """Removing only the COMMENT was tried first and is not enough: the asterisks left
+    behind invent the same word boundary, so the slug still disagreed with the
+    heading's own fragment. `title`, `abstract` and `slug` are consumed as strings by
+    things that do not parse markdown, so the whole of the syntax goes.
+
+    Measured before changing it: no heading in any of the nine shipped office documents
+    carries a marker, so this moves no published byte today."""
+    from backend.kb._enrich import title_floor
+    out, _src = title_floor(
+        "", "", "x.docx", [{"title": "**Bold** heading here", "children": []}])
+    assert out == "Bold heading here"

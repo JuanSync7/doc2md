@@ -44,6 +44,17 @@ summary: Hand-written cases pin the CommonMark contract (list nesting, emphasis,
 #     text, so the corpus uses emphasis around words.
 #  6. HTML blocks, link reference definitions and entity references: md_structure
 #     has no concept of them and the corpus contains none.
+#  7. THREE GATE FACTS ARE STILL UNGRADED HERE, and they are named because an
+#     omission nobody wrote down reads exactly like a fact nobody needed:
+#     `heading_path`, `list_item_words` and `block_sequence`. Each is an ORDERED
+#     record rather than a count, so corroborating it means walking the reference's
+#     tree in document order and extracting text the way this reader does — real
+#     work, not a one-line adapter. They matter: those three are exactly the facts
+#     that move when a deck's slides are published in the wrong order
+#     (quality-plan P9.5), so they are what P9.6 will grade a reordered pptx with.
+#     Until then they are pinned only by hand-written cases.
+#     `thematic_breaks` used to be a fourth, and was the worst of them — it is the
+#     fact that catches a paragraph DISAPPEARING — so it is graded now.
 # ---------------------------------------------------------------------------
 import pytest
 
@@ -390,6 +401,8 @@ def _facts_marko(module, source):
         name = type(el).__name__
         if name in ("Heading", "SetextHeading"):
             facts["headings"][el.level] = facts["headings"].get(el.level, 0) + 1
+        elif name == "ThematicBreak":
+            facts["thematic_breaks"] += 1
         elif name == "ListItem":
             facts["list_items"][depth] = facts["list_items"].get(depth, 0) + 1
             facts["ordered_items" if ordered else "bullet_items"] += 1
@@ -448,7 +461,9 @@ def _facts_markdown_it(module, source):
 
     for tok in module.MarkdownIt("commonmark").parse(source):
         kind = tok.type
-        if kind == "heading_open":
+        if kind == "hr":
+            facts["thematic_breaks"] += 1
+        elif kind == "heading_open":
             level = int(tok.tag[1:])
             facts["headings"][level] = facts["headings"].get(level, 0) + 1
         elif kind in ("bullet_list_open", "ordered_list_open"):
@@ -493,6 +508,8 @@ def _facts_commonmark(module, source):
                 lists.pop()
         elif not entering:
             continue
+        elif kind == "thematic_break":
+            facts["thematic_breaks"] += 1
         elif kind == "heading":
             facts["headings"][node.level] = facts["headings"].get(node.level, 0) + 1
         elif kind == "item":
@@ -520,10 +537,16 @@ def _facts_commonmark(module, source):
 
 
 def _blank_facts():
+    # `thematic_breaks` is graded here because it is the fact that catches a
+    # DISAPPEARANCE. A break carries no token and no heading, so a paragraph turned
+    # into one is invisible to the recall gate and to every other fact — which is
+    # exactly how an unescaped slide bullet reading `- - -` deleted itself with both
+    # gates green (quality-plan P9.5). A fact that load-bearing must be corroborated
+    # by a real parser, not only by hand-written cases.
     return {"headings": {}, "list_items": {}, "ordered_items": 0,
             "bullet_items": 0, "ordered_numbers": [], "strong": 0, "em": 0,
             "code_spans": 0, "code_blocks": 0, "links": 0, "images": 0,
-            "block_quotes": 0}
+            "block_quotes": 0, "thematic_breaks": 0}
 
 
 def _load_reference():
@@ -549,7 +572,48 @@ _NO_PARSER = ("no CommonMark reference parser importable (tried marko, "
 # The corpus. The hand-written cases above, plus samples chosen to hurt: the
 # indent rules a converter gets wrong, lazy continuations, list-vs-paragraph
 # interruption, emphasis flanking, and nesting that crosses construct kinds.
-CORPUS = [
+# A picture between a list item and its child. The converter emits the sentinel at
+# the OPEN item's content column so the list survives (`_emit_image_blocks`), and a
+# reader that got the nesting wrong here would fail a faithful conversion of any
+# runbook with a screenshot in it — so the reference parser has to corroborate the
+# claim rather than this project's own reader asserting it. The ordered pair is the
+# case that nearly went wrong: CommonMark lets a list interrupt a PARAGRAPH only at
+# `1`, so gluing the picture on with a single newline would have swallowed step 2.
+_PIC_IN_ITEM = [
+    ("picture_inside_bullet_item",
+     "- parent\n\n  <!-- ooxml-image:x.png -->\n\n  - child\n"),
+    ("picture_inside_ordered_item_sub_at_2",
+     "1. step one\n\n   <!-- ooxml-image:x.png -->\n\n   2. sub step\n"),
+    ("picture_inside_ordered_item_sub_at_1",
+     "1. step one\n\n   <!-- ooxml-image:x.png -->\n\n   1. sub step\n"),
+    ("picture_then_a_shallower_item",
+     "- a\n  - b\n\n  <!-- ooxml-image:x.png -->\n\n- c\n"),
+    ("two_pictures_inside_one_item",
+     "- a\n\n  <!-- ooxml-image:1.png -->\n\n  <!-- ooxml-image:2.png -->\n\n  - b\n"),
+    ("resolved_image_link_inside_item",
+     "- parent\n\n  ![plot](media/x.png)\n\n  - child\n"),
+    ("picture_at_column_zero_ends_the_list",
+     "- parent\n\n<!-- ooxml-image:x.png -->\n\n- sibling\n"),
+]
+
+# P9.9. Every shape `_render_runs` can emit at a span boundary, so the reference
+# parser rules on the separator rather than this project's own reader asserting it.
+# The `_SEP` cases are what the converter really writes; the bare ones are what it
+# wrote before, kept so the corpus records WHY the separator is there — marko reads
+# one em span in `***a****b*` and two in the separated form.
+_SPAN_ADJACENCY = [
+    ("two_spans_that_fuse_without_help", "- ***alpha****beta*\n"),
+    ("two_spans_separated", "- ***alpha***<!---->*beta*\n"),
+    ("a_marker_that_cannot_flank_after_a_word", "- alpha**~~beta~~**\n"),
+    ("that_marker_separated", "- alpha<!---->**~~beta~~**\n"),
+    ("emphasis_ending_mid_word", "- **Dma**Arbiter\n"),
+    ("emphasis_starting_mid_word", "- pre**fix**\n"),
+    ("one_punctuation_character_span", "Note<!---->**.** end.\n"),
+    ("separator_between_a_span_and_plain_text", "- *~~alpha~~*<!---->beta\n"),
+    ("ordinary_emphasis_needs_no_separator", "- set **ready** high\n"),
+]
+
+CORPUS = _PIC_IN_ITEM + _SPAN_ADJACENCY + [
     ("nested_at_col_3", NESTED_AT_COL_3),
     ("sibling_at_col_2", SIBLING_AT_COL_2),
     ("bullet_child_col_2", "- one\n- two\n  - two-a\n- three\n"),
@@ -637,6 +701,35 @@ CORPUS = [
     ("quote_two_blocks", "> one\n> two\n\n> three\n"),
     ("quote_inline", "> note: **required**, see `DB_MAX_CONN_LIMIT`\n"),
     ("quote_then_rule", "> a\n---\n"),
+    # A BLOCK OPENING ON THE MARKER'S OWN LINE. These are here because their
+    # absence is what let a real disagreement survive: this reader saw every one of
+    # these constructs on a CONTINUATION line and none of them on the first line of
+    # the item, so the corpus below certified a scanner that read `- ## Rollout` as
+    # a plain bullet and `- 15. step` as no ordered list at all. That is exactly
+    # where a converter puts source text, and an unescaped slide bullet reading
+    # `- - -` therefore deleted itself with both gates green (quality-plan P9.5).
+    # THEMATIC BREAKS. Grading the fact was vacuous until these existed: the corpus
+    # below held not one break, so the adapters could agree about a number that was
+    # zero on both sides in every case. It is the fact that catches a paragraph
+    # DISAPPEARING, so it is the last one that should have gone uncorroborated.
+    ("rule_between_paragraphs", "before\n\n---\n\nafter\n"),
+    ("rule_asterisks", "before\n\n***\n\nafter\n"),
+    ("rule_underscores", "before\n\n___\n\nafter\n"),
+    ("rule_spaced", "before\n\n- - -\n\nafter\n"),
+    ("rule_spaced_stars", "before\n\n* * *\n\nafter\n"),
+    ("rule_indented_three", "before\n\n   ---\n\nafter\n"),
+    ("rule_opens_document", "---\n\nafter\n"),
+    ("rule_inside_item", "- one\n- - - -\n- three\n"),
+    ("rule_ends_a_list", "- one\n\n---\n\n- two\n"),
+    ("heading_on_marker_line", "- ## Rollout\n"),
+    ("ordered_on_marker_line", "- 15. step\n"),
+    ("bullet_on_marker_line", "- + item\n"),
+    ("quote_on_marker_line", "- > quote\n"),
+    ("fence_on_marker_line", "- ```sh\nkubectl\n```\n"),
+    ("marker_line_chain", "- - x\n"),
+    ("bullet_holding_ordered_pair", "- 1. a\n- 2. b\n"),
+    ("ordered_holding_bullet", "1. - x\n"),
+    ("lone_marker_then_marker", "- -\n"),
     ("empty", ""),
     ("only_blanks", "\n\n\n"),
     ("realistic_document",
@@ -663,10 +756,12 @@ CORPUS = [
 
 # Exactly the facts both sides agree on. `tables` and `strike` are absent because
 # they are GFM; see the exclusion list at the top of this module.
+# Adding a name here is what makes the adapters' work count: a fact an adapter
+# computes but this tuple omits is compared against nothing.
 COMPARED = ("headings", "list_items", "ordered_items", "bullet_items",
             "ordered_numbers",
             "strong", "em", "code_spans", "code_blocks", "links", "images",
-            "block_quotes")
+            "block_quotes", "thematic_breaks")
 
 
 @pytest.mark.skipif(_reference_adapter is None, reason=_NO_PARSER)
@@ -798,3 +893,156 @@ def test_a_cell_line_break_is_a_word_boundary_and_not_a_word():
     # An ESCAPED tag is the document talking ABOUT the tag: that `br` IS content.
     escaped = md_structure("| a | b |\n| --- | --- |\n| use \\<br> here | x |\n")
     assert escaped["tables"][0]["cells"][1][0] == ("use", "br", "here")
+
+
+def test_re_dispatching_an_items_first_line_terminates():
+    """The item's first line is spliced back into the scanner's input, so the only
+    thing standing between this reader and an infinite loop is that `rest` is always
+    shorter than the line it came from by at least the marker. These are the inputs
+    that would expose it if that were ever not true — a whole document of markers,
+    nothing else."""
+    import time
+    for source in ("- " * 2000 + "x\n",
+                   "1. " * 2000 + "x\n",
+                   "- 1. " * 1000 + "x\n",
+                   "+ " * 3000 + "\n",
+                   "-\n"):
+        started = time.time()
+        facts = md_structure(source)
+        assert time.time() - started < 30, "no progress on %r" % source[:20]
+        assert isinstance(facts["bullet_items"], int)
+
+
+# ============================ P9.9: the separator is markup, so `_words` sees through
+#
+# This side's `_words` exists to read EMITTED markdown, which is why it already strips
+# a link's URL and a `<br>` before tokenising. `<!---->` is the same kind of thing —
+# markup the converter wrote, never a character the document supplied — and it is
+# inserted exactly where two spans meet with no space between them. Left in, it split
+# `alphabeta` into two tokens and `list_item_words` disagreed with a source truth
+# that had correctly read one.
+
+def test_words_sees_through_an_empty_comment():
+    from backend.validate._mdstructure import _words
+    assert _words("alpha<!---->beta") == ("alphabeta",)
+
+
+def test_a_content_bearing_comment_is_still_CONTENT_to_this_reader():
+    """The narrowing is deliberate, and it is the same call the note above `_BR`
+    makes: this reader is converter-blind, so it does not get to decide that an
+    arbitrary comment carries nothing. Only the EMPTY form is treated as the
+    converter's own punctuation — because only the empty form is something the
+    converter writes for its own purposes, in a place where a source document has no
+    character at all."""
+    from backend.validate._mdstructure import _words
+    assert _words("one <!-- ooxml-image:x.png --> two") == (
+        "one", "ooxml", "image", "x", "png", "two")
+
+
+def test_a_separated_pair_of_spans_is_one_word_in_the_item_facts():
+    got = md_structure("- ***alpha***<!---->*beta*\n")
+    assert got["list_item_words"] == [("alphabeta",)]
+    assert (got["strong"], got["em"]) == (1, 2)
+
+
+# ===================== P9.9: a marker is markup, and markup does not split a word
+#
+# `_words` extracts `[a-z0-9]+` runs, so every character that is not a letter or a
+# digit SEPARATES. That is right for punctuation the document wrote and wrong for a
+# marker the CONVERTER wrote: bolding part of a word — `**Dma**Arbiter`, the most
+# ordinary thing in a datasheet — made this side say ("dma", "arbiter") where the
+# source truth correctly says ("dmaarbiter",). Measured at HEAD: `token_recall: 1.0`,
+# `structure_fidelity: fail` on `list_item_words`, and the document REFUSES TO
+# PUBLISH. Three shapes, all of them ordinary Word:
+#
+#     **Dma**Arbiter   emphasis ending mid-word
+#     pre**fix**       emphasis starting mid-word
+#     ***a****b*       two adjacent spans (P9.9's other half)
+#
+# This is the same argument the module already makes for a link's URL and for `<br>`,
+# and it is safe for exactly one reason: the converter ESCAPES `*`, `~` and a backtick
+# whenever the DOCUMENT's own text contains one, so an unescaped run of them in the
+# emitted markdown is always the converter's. `_` is deliberately NOT in the set — it
+# is never a marker this converter emits, and it is left unescaped inside an
+# identifier (`CLK_100M`), so stripping it would join two tokens the source separates.
+
+@pytest.mark.parametrize("md,want", [
+    ("**Dma**Arbiter", ("dmaarbiter",)),
+    ("pre**fix**", ("prefix",)),
+    ("*a*b*c*", ("abc",)),
+    ("~~old~~new", ("oldnew",)),
+    ("set **ready** high", ("set", "ready", "high")),
+    # The document's own asterisk, escaped by the converter, still separates.
+    ("a\\*b", ("a", "b")),
+    ("a\\~b", ("a", "b")),
+    # `_` is content, never a marker this converter writes.
+    ("CLK_100M", ("clk", "100m")),
+    ("\\_\\_x\\_\\_", ("x",)),
+])
+def test_a_marker_does_not_split_a_word_but_an_escaped_one_does(md, want):
+    from backend.validate._mdstructure import _words
+    assert _words(md) == want
+
+
+def test_a_code_span_keeps_its_own_punctuation():
+    """Code is emitted VERBATIM — that is what a code span is for — so an asterisk
+    inside one is the document's, not a marker. Stripping it would join two tokens
+    the source keeps apart, which is this fix breaking the thing it exists to fix.
+
+    The second case reads oddly and is right: a bold run immediately followed by a
+    code run is `bolda*b` in the SOURCE too, because there is no space between them.
+    Both sides weld `bold` to `a` and both split at the document's own asterisk —
+    which is the only thing being asserted here, that they agree."""
+    from backend.ingest import _struct_common
+    from backend.validate._mdstructure import _words
+    assert _words("`a*b`") == ("a", "b") == _struct_common._words("a*b")
+    assert _words("**bold**`a*b`") == _struct_common._words("bolda*b")
+    assert _words("**bold** `a*b`") == _struct_common._words("bold a*b")
+
+
+# --------------------------- the invariant `_strip_markers` actually rests on
+#
+# Stripping `*`, `~` and backticks from the MARKDOWN side is safe for exactly one
+# reason, and it is a property of the converter's ESCAPING rather than of anyone's
+# intent: `_esc` escapes every one of those characters whenever the DOCUMENT's own
+# text contains it, so an unescaped run in emitted markdown is always a marker.
+#
+# That sentence is the whole argument, so it is checked rather than asserted:
+#
+#     _words(_esc(source)) == _struct_common._words(source)
+#
+# for every source string. The two sides have to agree about what a WORD is even
+# though only one of them ever sees markup — which is the same claim the gate makes
+# on every document, reduced to one line.
+
+def _escape_roundtrip_sources():
+    """Exhaustive short strings over the marker alphabet, plus a seeded wide sample.
+
+    Seeded, not random: a test that fails one run in ten is a test nobody trusts."""
+    import itertools
+    import random
+    out = []
+    for n in (1, 2, 3, 4):
+        for combo in itertools.product("a*~`\\_ ", repeat=n):
+            out.append("".join(combo))
+    rng = random.Random(7)
+    alphabet = list("ab12 *~`_\\[]()<>#-.|!")
+    for _ in range(4000):
+        out.append("".join(rng.choice(alphabet)
+                           for _ in range(rng.randint(1, 14))))
+    return out
+
+
+def test_escaping_makes_the_two_sides_agree_about_every_word():
+    from backend.ingest import _struct_common
+    from backend.ingest._ooxml_md import _esc
+    from backend.validate._mdstructure import _words
+    bad = []
+    for src in _escape_roundtrip_sources():
+        emitted, source = _words(_esc(src)), _struct_common._words(src)
+        if emitted != source:
+            bad.append((src, _esc(src), source, emitted))
+    assert not bad, (
+        "%d source string(s) tokenise differently once escaped and read back — "
+        "`_strip_markers` is removing a character the document really wrote:\n  %s"
+        % (len(bad), "\n  ".join(repr(b) for b in bad[:5])))
