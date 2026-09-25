@@ -368,6 +368,7 @@
   "losslessness_method": "pdf-text-coverage",
   "losslessness_gate": "best-effort",
   "token_recall_min": 0.97,
+  "gap_absent_max": 0,
   "coverage_gate": "pass",
   "has_toc": true,
   "_note": "`toc_lines_min` is 1 and that is the TRUTH, not the desire. Measured on the pinned toolchain: docling emits the entire Table of Contents as a SINGLE merged line ('Table of Contents 1 Introduction .......... 3 1.1 Scope .......... 3 ...'), so one line is what `is_toc_line` can honestly count -- and the .docx of the same document still meets the floor of 9, which is how we know this is the PDF lane's defect and not the fixture's. The floor is re-encoded rather than the row being marked `xfail`, deliberately: everything else here is healthy (recall 0.9925, images pass over 3 referenced, every md_contains probe holds), and an xfail would switch off twenty live checks to silence one. TOC-shape robustness in `is_toc_line`/`content_start` is roadmap M2; when it lands this floor goes back up, which is a deliberate edit somebody reviews.",

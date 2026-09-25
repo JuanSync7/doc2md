@@ -55,6 +55,19 @@ Dated full-run results on the development host; a fresh run diffs itself
 against the latest entry. CI's nightly `eval-pdf` job is the same harness on
 `ubuntu-latest`.
 
+## `gap_absent_max` — gating the *explained* gap
+
+`token_recall_min` is a floor, and a floor tolerates real loss as long as there is
+little of it. `gap_absent_max` pins the other thing: how much of the shortfall is
+**unexplained**. A ceiling of 0 says "this document's whole gap is page numbers and
+running furniture" — measured on `pdf/kestrel-clock-spec.pdf`, whose recall of 0.9925
+decomposes into 6 numeric and 12 residual-boilerplate occurrences and `absent: 0`.
+
+Asking about a gap a report does not carry is a FAIL, not a silent pass: the OCR path
+publishes no gap block (there is no independent text layer to decompose), so the
+expectation is mis-set and saying nothing would be the passing-over-nothing this
+harness exists to refuse.
+
 ## Expected failures (`xfail`)
 
 A permanently-red gate is not a gate: nobody reads the number, so the day a real

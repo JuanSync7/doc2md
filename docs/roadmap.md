@@ -129,10 +129,30 @@ a constraints file is a candidate follow-up if variance recurs.
       pinning the older HONEST outcome (degraded, with the bail warnings) and
       carries the marker. Nightly: `24 pass, 0 fail, 0 skip (1 xfail, 0 xpass)`,
       exit 0 — green for the first time since it was pinned.)*
-- [ ] Wire `explain_gap`/`GapReport` (built and exported from
+- [x] Wire `explain_gap`/`GapReport` (built and exported from
       `backend.ingest`, currently uncalled outside its tests) into the pdf
       `losslessness` block: bucket counts + `absent_top`, so every report
       says *why* recall < 1.0.
+      *(2026-09-25: `_pdf_losslessness` now takes the RAW page-delimited text
+      rather than a de-boilerplated one and strips it itself — `explain_gap`
+      applies the strip internally so it can ALSO see the sub-threshold
+      repeated lines, and handing it pre-stripped text makes `residual_boiler`
+      read 0 and re-counts every one of those tokens as `absent`, overstating
+      loss on exactly the documents the block exists to explain. Taking the raw
+      text as the parameter rather than an optional extra is what makes that
+      unable to happen.*
+      *Measured on the pinned toolchain, `pdf/kestrel-clock-spec.pdf`:
+      `recall 0.9925` decomposes to `n_source 420, covered 402, numeric 6,
+      residual_boiler 12, absent 0` — the whole shortfall is page numbers and
+      a running footer, and nothing is unaccounted for. The buckets partition
+      the source, which is asserted.*
+      *Published is not the same as checked — `explain_gap` was built,
+      exported and called by nothing for two milestones, and a field nobody
+      reads is the same shape. `gap_absent_max` gates it, and is pinned at 0 on
+      that document: a far stronger statement than a `token_recall_min` floor,
+      which tolerates real loss as long as there is little of it. Asking about
+      a gap a report does not carry is a FAIL, never a silent pass — the OCR
+      path publishes no block, having no text layer to decompose.)*
 
 ## M1 — Trustworthy measurement (self-validation hardening)
 

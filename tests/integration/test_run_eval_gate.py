@@ -194,3 +194,74 @@ def test_a_document_that_was_never_generated_is_skipped_not_expected_to_fail(
     assert "\nSKIP" in out and "scan-tools-unavailable" in out
     assert "XFAIL" not in out
     assert rc == 0
+
+
+# ============================== the gap block is CHECKED, not merely published
+#
+# `explain_gap` was built, exported from `backend.ingest`, covered by its own unit
+# tests — and called by nothing, for two milestones. A field nobody reads is the same
+# shape: the report would carry `absent: 0` and no expectation would notice the day it
+# stopped being 0. `gap_absent_max` is the probe that makes it a measurement.
+
+def _gap_harness(tmp_path, absent, with_block=True):
+    """A bundle on disk whose report carries (or omits) a gap block."""
+    import os
+    bundles = tmp_path / "bundles"
+    d = bundles / "deadbeefdeadbeef"
+    os.makedirs(str(d))
+    loss = {"method": "pdf-text-coverage", "gate": "best-effort",
+            "token_recall": 0.99}
+    if with_block:
+        loss["gap"] = {"n_source": 100, "covered": 100 - absent, "fused": 0,
+                       "numeric": 0, "image_text": 0, "residual_boiler": 0,
+                       "short": 0, "absent": absent}
+    with open(str(d / "report.json"), "w", encoding="utf-8") as fh:
+        json.dump({"doc_id": "deadbeefdeadbeef", "lane": "pdf",
+                   "source_relpath": "pdf/x.pdf", "status": "ok",
+                   "losslessness": loss, "warnings": []}, fh)
+    return bundles
+
+
+def test_an_unexplained_gap_over_the_ceiling_fails(tmp_path, capsys):
+    from backend.ingest import doc_id
+    rel = "pdf/x.pdf"
+    exp = {rel: {"kind": "bundle", "lane": "pdf", "gap_absent_max": 0}}
+    args = _harness(tmp_path, exp)
+    bundles = _gap_harness(tmp_path, absent=7)
+    os.rename(str(bundles / "deadbeefdeadbeef"), str(bundles / doc_id(rel)))
+    rc = _run_eval().main(args)
+    out = capsys.readouterr().out
+    assert "gap.absent" in out and "1 fail" in out
+    assert rc == 1
+
+
+def test_a_fully_explained_gap_passes(tmp_path, capsys):
+    """Recall below 1.0 with `absent: 0` is a document whose whole shortfall is page
+    numbers and running furniture — nothing for a person to chase."""
+    from backend.ingest import doc_id
+    rel = "pdf/x.pdf"
+    exp = {rel: {"kind": "bundle", "lane": "pdf", "gap_absent_max": 0}}
+    args = _harness(tmp_path, exp)
+    bundles = _gap_harness(tmp_path, absent=0)
+    os.rename(str(bundles / "deadbeefdeadbeef"), str(bundles / doc_id(rel)))
+    rc = _run_eval().main(args)
+    out = capsys.readouterr().out
+    assert "0 fail" in out, out
+    assert rc == 0
+
+
+def test_asking_about_a_gap_a_report_does_not_carry_is_a_failure(tmp_path, capsys):
+    """The vacuity guard. An OCR-path report has no gap block at all — there is no
+    independent text layer to decompose — so an expectation asking about one is
+    mis-set, and answering it with silence would be the passing-over-nothing this
+    harness exists to refuse."""
+    from backend.ingest import doc_id
+    rel = "pdf/x.pdf"
+    exp = {rel: {"kind": "bundle", "lane": "pdf", "gap_absent_max": 0}}
+    args = _harness(tmp_path, exp)
+    bundles = _gap_harness(tmp_path, absent=0, with_block=False)
+    os.rename(str(bundles / "deadbeefdeadbeef"), str(bundles / doc_id(rel)))
+    rc = _run_eval().main(args)
+    out = capsys.readouterr().out
+    assert "gap" in out and "1 fail" in out
+    assert rc == 1
