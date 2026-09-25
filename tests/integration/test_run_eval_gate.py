@@ -104,3 +104,93 @@ def test_the_committed_expectations_are_clean_under_the_per_kind_rule():
     stray = dict((rel, mod.unknown_keys(exp)) for rel, exp in expectations.items()
                  if mod.unknown_keys(exp))
     assert stray == {}, "evals/expectations.json carries keys no checker reads"
+
+
+# ===================================== the expected-fail marker (roadmap M0)
+#
+# The nightly ring has been red for months over two PDF expectations that encode
+# TRUTHFUL behaviour nobody wants yet. A permanently-red gate is not a gate: nobody
+# reads the number, so the day a real regression lands it changes nothing. The
+# alternatives were to delete the expectations (which stops measuring the thing) or
+# to encode the desired-but-false answer (which makes the eval lie).
+#
+# `xfail: true` is the third option: keep grading it, keep printing what it really
+# does, and stop gating on it — with the pressure kept on by making an unexpected
+# PASS a FAILURE, so a fixed document cannot sit under a stale marker.
+
+def _xfail_exp(**extra):
+    """A bundle expectation that cannot hold — no bundle exists on disk."""
+    exp = {"kind": "bundle", "lane": "office"}
+    exp.update(extra)
+    return {"office/kestrel-readme.docx": exp}
+
+
+def test_an_expected_failure_is_reported_and_does_not_gate(tmp_path, capsys):
+    """The whole point. The row still prints what the document really did — the
+    eval does not stop measuring it — but the exit code stops carrying it."""
+    rc = _run_eval().main(_harness(tmp_path, _xfail_exp(
+        xfail=True, _note="docling drops the knife-edge probe; real fix is M1")))
+    out = capsys.readouterr().out
+    assert "\nXFAIL" in out, out
+    assert "0 fail" in out
+    assert "1 xfail" in out
+    assert rc == 0
+
+
+def test_an_unexpected_pass_gates(tmp_path, capsys):
+    """The pressure valve. Without this, a marker outlives the defect it describes
+    and the expectation silently stops asserting anything — the same vacuous pass
+    the `n_source_tokens` floor and the stray-key guard exist to prevent."""
+    passing = {"text/synth-flow.tcl": {"kind": "unsupported", "xfail": True,
+                                       "_note": "stale marker"}}
+    rc = _run_eval().main(_harness(tmp_path, passing))
+    out = capsys.readouterr().out
+    assert "\nXPASS" in out, out
+    assert "1 fail" in out
+    assert rc == 1
+
+
+def test_an_expected_failure_must_say_why(tmp_path, capsys):
+    """An `xfail` with no `_note` is a silenced check. The note is what makes the
+    marker reviewable — and what a later reader needs to decide whether it still
+    applies."""
+    rc = _run_eval().main(_harness(tmp_path, _xfail_exp(xfail=True)))
+    out = capsys.readouterr().out
+    assert "_note" in out
+    assert "1 fail" in out
+    assert rc == 1
+
+
+def test_a_typod_key_is_still_a_failure_under_an_expected_failure(tmp_path, capsys):
+    """`xfail` says the DOCUMENT behaves in an undesired way. It says nothing about
+    the EXPECTATION being well formed, so the guard that catches a check nobody
+    reads must still gate — otherwise a marker would switch off the thing that
+    stops checks being switched off."""
+    rc = _run_eval().main(_harness(tmp_path, _xfail_exp(
+        xfail=True, _note="why", tokens_recal=1.0)))
+    out = capsys.readouterr().out
+    assert "tokens_recal" in out and "1 fail" in out
+    assert "XFAIL" not in out
+    assert rc == 1
+
+
+def test_a_document_that_was_never_generated_is_skipped_not_expected_to_fail(
+        tmp_path, capsys):
+    """A fixture the corpus could not build has produced no evidence either way —
+    the scanned-PDF one skips whenever Pillow is absent. Reporting XFAIL there would
+    claim a measurement nobody took, and would hide the missing fixture behind a
+    marker that says the opposite."""
+    rel = "pdf/kestrel-clock-spec-scan.pdf"
+    exp = {rel: {"kind": "bundle", "lane": "pdf", "xfail": True, "_note": "why"}}
+    args = _harness(tmp_path, exp)
+    manifest = os.path.join(os.path.dirname(args[args.index("--corpus") + 1]),
+                            os.path.basename(args[args.index("--corpus") + 1])
+                            + ".manifest.json")
+    with open(manifest, "w", encoding="utf-8") as fh:
+        json.dump({"files": {rel: {"kind": "skipped",
+                                   "reason": "scan-tools-unavailable"}}}, fh)
+    rc = _run_eval().main(args)
+    out = capsys.readouterr().out
+    assert "\nSKIP" in out and "scan-tools-unavailable" in out
+    assert "XFAIL" not in out
+    assert rc == 0

@@ -99,12 +99,36 @@ a constraints file is a candidate follow-up if variance recurs.
       floating `main` revisions, the very drift to kill. Hermeticity proven
       offline; `pdf_toolchain` warning stamped + eval-asserted; CI caches
       the artifacts. Eval unchanged at 19/2/0.)*
-- [ ] Give the eval harness an expected-fail mechanism: an `xfail: true` +
+- [x] Give the eval harness an expected-fail mechanism: an `xfail: true` +
       `_note` marker in `expectations.json` that `run_eval.py` reports as
       XFAIL (and XPASS as a failure to re-encode), so truthful-but-undesired
       pinned behavior doesn't leave the nightly permanently red and useless.
-- [ ] Re-encode the two failing pdf expectations truthfully for the pinned
+      *(2026-09-25: two rules keep it honest — an `xfail` with no `_note` is a
+      FAIL, because a marker nobody can review is how a defect becomes
+      permanent; and an XPASS gates, so a marker cannot outlive the defect it
+      describes. A stray-key typo is still a FAIL under the marker: `xfail`
+      says the DOCUMENT behaves undesirably, not that the EXPECTATION is well
+      formed. Verified both directions on the real corpus.)*
+- [x] Re-encode the two failing pdf expectations truthfully for the pinned
       toolchain (dataflow's knife-edge probe gets its real fix in M1).
+      *(2026-09-25: they needed DIFFERENT remedies, which is what made the pair
+      worth doing together.*
+      *`kestrel-clock-spec.pdf` — `toc_lines: got 1, want >= 9`. Docling emits
+      the whole Table of Contents as one MERGED line, so 1 is the truth. The
+      floor is re-encoded to 1 with a `_note`; an `xfail` would have switched
+      off twenty live checks on an otherwise healthy document (recall 0.9925,
+      images pass over 3) to silence one. The .docx of the same document still
+      meets 9, which is how we know it is the PDF lane's defect and not the
+      fixture's. Real fix: TOC-shape robustness in `is_toc_line`, M2.*
+      *`kestrel-dataflow.pdf` — this one got WORSE in a way that made the gates
+      read BETTER, and that is why it is the `xfail`. Docling now detects no
+      picture at all, so nothing bails: `images.gate` reads `pass` over ZERO
+      images and `status` reads `ok`, over a diagram-only PDF reduced to one
+      line of 19 tokens with 0 headings and 0 images. Encoding that as expected
+      would make the eval assert a destroyed document is fine, so the row keeps
+      pinning the older HONEST outcome (degraded, with the bail warnings) and
+      carries the marker. Nightly: `24 pass, 0 fail, 0 skip (1 xfail, 0 xpass)`,
+      exit 0 — green for the first time since it was pinned.)*
 - [ ] Wire `explain_gap`/`GapReport` (built and exported from
       `backend.ingest`, currently uncalled outside its tests) into the pdf
       `losslessness` block: bucket counts + `absent_top`, so every report

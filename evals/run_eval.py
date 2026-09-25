@@ -133,7 +133,9 @@ class Checker(object):
 # and `outline_probe` in a bundle one are read by nobody, and a global set called
 # them both fine. Adding a probe means adding its key to the kinds whose checker
 # reads it, in the same change.
-_KEYS_ROUTE = frozenset(("kind", "requires"))            # read by main(), any kind
+# `xfail` is routed, not checked: it changes what a row's VERDICT means rather than
+# what any checker asks, so it belongs to every kind and is read only by main().
+_KEYS_ROUTE = frozenset(("kind", "requires", "xfail"))   # read by main(), any kind
 _KEYS_BY_KIND = {
     "bundle": _KEYS_ROUTE | frozenset((
         "lane", "status",
@@ -518,8 +520,42 @@ def main(argv=None):
             fails = check_unsupported(rel, exp, args.bundles, args.text_out)
         else:
             fails = ["unknown expectation kind %r" % kind]
-        if fails:
-            results.append(("FAIL", rel, "; ".join(fails)))
+        # THE EXPECTED-FAILURE MARKER, and the two rules that keep it honest.
+        #
+        # A permanently-red nightly is not a gate: nobody reads the number, so the
+        # day a real regression lands it changes nothing. `xfail: true` keeps the
+        # document GRADED and keeps printing what it really did, and stops the exit
+        # code carrying it.
+        #
+        # (1) It must say WHY. An `xfail` with no `_note` is a silenced check, and
+        #     the note is what a later reader needs to decide whether it still
+        #     applies. A marker nobody can review is how a defect becomes permanent.
+        # (2) An unexpected PASS is a FAILURE. Without that, a marker outlives the
+        #     defect it describes and the expectation quietly stops asserting
+        #     anything — the same vacuous pass `n_source_tokens_min` and the
+        #     stray-key guard exist to prevent. The fix is to re-encode the row,
+        #     which is a deliberate edit somebody reviews.
+        #
+        # Deliberately AFTER the stray-key guard above: `xfail` says the DOCUMENT
+        # behaves in a way nobody wants, and says nothing about the EXPECTATION being
+        # well formed. Letting it swallow a typo would switch off the guard that
+        # stops checks being switched off.
+        xfail = bool(exp.get("xfail"))
+        if xfail and not str(exp.get("_note") or "").strip():
+            results.append(("FAIL", rel,
+                            "xfail with no `_note`: an expected failure has to say "
+                            "why, and what would let the marker be removed"))
+        elif fails:
+            results.append(("XFAIL" if xfail else "FAIL", rel, "; ".join(fails)))
+        elif xfail:
+            # The note is quoted but CAPPED: these run to a paragraph by design (a
+            # marker nobody can review is how a defect becomes permanent), and one
+            # of them printed in full turns the result table into prose.
+            note = str(exp.get("_note") or "").strip()
+            results.append(("XPASS", rel,
+                            "marked xfail and PASSED — re-encode the expectation "
+                            "truthfully and drop the marker (%s)"
+                            % (note[:97] + "..." if len(note) > 100 else note)))
         else:
             results.append(("PASS", rel, "%d check(s)" % max(1, len(exp) - 1)))
 
@@ -530,12 +566,22 @@ def main(argv=None):
     n_pass = sum(1 for v, _, _ in results if v == "PASS")
     n_skip = sum(1 for v, _, _ in results if v == "SKIP")
     n_fail = sum(1 for v, _, _ in results if v == "FAIL")
+    n_xfail = sum(1 for v, _, _ in results if v == "XFAIL")
+    n_xpass = sum(1 for v, _, _ in results if v == "XPASS")
     print("-" * 100)
-    print("eval: %d pass, %d fail, %d skip" % (n_pass, n_fail, n_skip))
+    # XPASS is counted into `fail` as well as named, because the exit code has to be
+    # readable off this one line: a census that said `0 fail, 1 xpass` beside exit 1
+    # is the same contradiction the FAIL rows were fixed for.
+    census = "eval: %d pass, %d fail, %d skip" % (n_pass, n_fail + n_xpass, n_skip)
+    if n_xfail or n_xpass:
+        census += " (%d xfail, %d xpass)" % (n_xfail, n_xpass)
+    print(census)
     # The exit code IS the printed table: every FAIL row gates, and no row can
     # gate that was not printed. CI reads only this number, so a table that says
-    # `1 fail` next to an exit 0 is worse than no eval at all.
-    return 0 if n_fail == 0 else 1
+    # `1 fail` next to an exit 0 is worse than no eval at all. An XFAIL row is
+    # printed and does NOT gate — that is the whole point of the marker — and an
+    # XPASS row gates exactly like a FAIL.
+    return 0 if (n_fail + n_xpass) == 0 else 1
 
 
 if __name__ == "__main__":

@@ -23,7 +23,7 @@ suite for doc2md.
 |------|------------|
 | `gen_corpus.py` | Deterministic corpus generator. Hand-builds OOXML (docx/xlsx/pptx) by writing the XML parts directly (`zipfile` + string templates), writes the text-lane files, and derives legacy formats (doc/rtf/odt/xls/ppt) + digital PDFs via LibreOffice and a scanned PDF via poppler + Pillow. |
 | `run_eval.py` | The harness: generates (or reuses) the corpus, runs the office/text/PDF lanes, then checks `expectations.json` and prints a pass/fail table (nonzero exit on failure). |
-| `expectations.json` | Per-document expected lane, status, gates, and targeted content probes, keyed by corpus relpath. `_note` keys document truthfully-encoded pipeline gaps (TODOs). |
+| `expectations.json` | Per-document expected lane, status, gates, and targeted content probes, keyed by corpus relpath. `_note` keys document truthfully-encoded pipeline gaps (TODOs). `xfail: true` marks a document whose behaviour is known-undesired — see below. |
 
 Generated artifacts go to `data/eval_corpus/` (sources, plus a sibling
 `eval_corpus.manifest.json`) and `data/eval_bundles/` / `data/eval_bundles_text/`
@@ -54,6 +54,42 @@ generated), never to silent passes. A pytest wrapper lives at
 Dated full-run results on the development host; a fresh run diffs itself
 against the latest entry. CI's nightly `eval-pdf` job is the same harness on
 `ubuntu-latest`.
+
+## Expected failures (`xfail`)
+
+A permanently-red gate is not a gate: nobody reads the number, so the day a real
+regression lands it changes nothing. The nightly ring sat red over PDF expectations
+encoding behaviour that was truthful and undesired, and the two obvious escapes both
+made things worse — deleting the expectation stops measuring the thing, and encoding
+the desired-but-false answer makes the eval lie.
+
+`xfail: true` is the third option. The document is still graded, the row still prints
+what it really did, and the exit code stops carrying it:
+
+```
+XFAIL pdf/kestrel-dataflow.pdf   status: got 'ok', want one of ['degraded']; ...
+eval: 24 pass, 0 fail, 0 skip (1 xfail, 0 xpass)
+```
+
+Two rules keep the marker honest:
+
+- **It must say why.** An `xfail` with no `_note` is a FAIL. The note is what a later
+  reader needs to decide whether the marker still applies, and what would remove it.
+- **An unexpected PASS is a failure.** A row marked `xfail` that passes prints `XPASS`
+  and exits non-zero, so a marker cannot outlive the defect it describes and leave the
+  expectation quietly asserting nothing. Fixing it means re-encoding the row, which is
+  a deliberate edit somebody reviews.
+
+`xfail` is scoped to the whole DOCUMENT, so it is the wrong tool when one probe has
+drifted and the rest of the row is healthy — that is a re-encoded key with a `_note`,
+which keeps the other checks gating. Both shapes are in the table today:
+`pdf/kestrel-dataflow.pdf` is `xfail` (its gates now pass *vacuously* over a diagram
+that is never extracted, so the row pins the honest outcome it must return to), while
+`pdf/kestrel-clock-spec.pdf` simply re-encodes `toc_lines_min` to the 1 line docling
+really emits and leaves its other twenty checks live.
+
+A stray-key typo is still a FAIL under `xfail`: the marker says the DOCUMENT behaves
+in a way nobody wants, and says nothing about the EXPECTATION being well formed.
 
 ### 2026-07-17 (b) — toolchain pinned, artifacts hermetic
 
