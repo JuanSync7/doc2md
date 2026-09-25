@@ -140,7 +140,7 @@ _KEYS_BY_KIND = {
     "bundle": _KEYS_ROUTE | frozenset((
         "lane", "status",
         "losslessness_gate", "losslessness_method", "token_recall_min",
-        "n_source_tokens_min",
+        "n_source_tokens_min", "gap_absent_max",
         "structure_fidelity_gate", "structure_fidelity_compared_min",
         "coverage_gate", "toc_lines_min", "has_toc", "max_depth",
         "savings_ratio_min", "content_links_min",
@@ -210,6 +210,27 @@ def check_bundle(rel, exp, bundles_dir):
                 "n_source_tokens: got %r, want >= %s (a fall means the ground truth "
                 "stopped reading part of the source, which recall cannot see)"
                 % (got, exp["n_source_tokens_min"]))
+    if "gap_absent_max" in exp:
+        # WHY the recall is not 1.0, gated rather than merely published. `explain_gap`
+        # partitions the source-to-target gap into buckets where each missing
+        # occurrence is claimed by the first one that can explain it, so `absent` is
+        # the only bucket that is real, unexplained content loss. A ceiling of 0 says
+        # "this document's whole shortfall is page numbers and running furniture" —
+        # which is a far stronger statement than a `token_recall_min` floor, because
+        # a floor tolerates real loss as long as there is little of it.
+        #
+        # A MISSING block is a FAIL, never a silent pass: the OCR path publishes no
+        # gap at all (there is no independent text layer to decompose), so an
+        # expectation asking about one there is mis-set, and answering it with
+        # silence is exactly the passing-over-nothing this harness refuses.
+        gap = (rep.get("losslessness") or {}).get("gap")
+        if not isinstance(gap, dict):
+            c.check(False, "losslessness.gap: absent, but gap_absent_max is set "
+                           "(no gap block is published on the OCR path)")
+        else:
+            c.check(gap.get("absent", -1) <= exp["gap_absent_max"],
+                    "losslessness.gap.absent: got %r, want <= %r"
+                    % (gap.get("absent"), exp["gap_absent_max"]))
     if "coverage_gate" in exp:
         cov = rep.get("structure", {}).get("coverage", {})
         c.eq(cov.get("gate"), exp["coverage_gate"], "structure.coverage.gate")

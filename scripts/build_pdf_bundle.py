@@ -67,6 +67,7 @@ from backend.ingest import (doc_id, tokenize,    # noqa: E402
                             identifier_vocab, repair_split_tokens,
                             coverage, markdown_to_text, char_ngram_recall,
                             is_lossy_explained, strip_running_lines,
+                            explain_gap,
                             pdf_info_meta, load_ingest_config, load_source_root,
                             normalize_accept)
 from backend.validate import image_report, caption_report   # noqa: E402  (report policy)
@@ -170,7 +171,7 @@ def _extract_figures(doc):
     return renders, assets, missing
 
 
-def _pdf_losslessness(src_stripped, md, furniture, image_text, cfg):
+def _pdf_losslessness(src_raw, md, furniture, image_text, cfg):
     # type: (str, str, str, str, object) -> tuple
     """The measured best-effort losslessness block for a digital PDF/HTML doc.
 
@@ -179,9 +180,20 @@ def _pdf_losslessness(src_stripped, md, furniture, image_text, cfg):
     figure-region text excluded from the ground truth; char-n-gram content recall as
     the tokenization-blind second opinion. Returns ``(loss_block, is_real_loss)`` —
     ``is_real_loss`` is True only under the explained-gap model (low token recall AND
-    low content recall), which is what should degrade the document status."""
+    low content recall), which is what should degrade the document status.
+
+    ``src_raw`` is the RAW page-delimited extraction, not a de-boilerplated one, and
+    the difference is load-bearing rather than cosmetic. The body metric wants the
+    stripped text, so this strips it here — one place knows the policy. `explain_gap`
+    wants the raw text, because it applies the strip ITSELF in order to also see the
+    SUB-THRESHOLD repeated lines a running footer leaves behind. Hand it text that
+    was already stripped and those repeats are gone, `residual_boiler` reads 0, and
+    every one of those tokens is re-counted as `absent` — the block would overstate
+    loss on exactly the documents it exists to explain. Taking the raw text as the
+    parameter, rather than an optional extra, is what makes that unable to happen."""
     exclude = (furniture + " " + image_text).strip()
     md_text = markdown_to_text(md)
+    src_stripped = strip_running_lines(src_raw or "", cfg.header_footer_min_frac)
     rep = coverage(src_stripped, md_text, exclude=exclude)
     content = char_ngram_recall(
         src_stripped, (md_text + " " + exclude) if exclude else md_text)
@@ -199,6 +211,32 @@ def _pdf_losslessness(src_stripped, md, furniture, image_text, cfg):
     # gates cannot recover is VISIBLE per doc: this is exactly what the VLM caption
     # stage exists to bring back.
     loss["figure_text_tokens"] = len(tokenize(image_text)) if image_text else 0
+    # WHY the recall is what it is. A bare `token_recall: 0.97` is a number nobody can
+    # act on: it does not say whether three words were re-hyphenated across a line
+    # break, a running footer survived the strip, or a paragraph is gone — and those
+    # need three different fixes, one of which is not a fix at all. Each missing
+    # occurrence is claimed by the FIRST bucket that can explain it, which leaves
+    # `absent` as the only one that is real, unexplained content loss.
+    #
+    # The buckets PARTITION the source, so a reader can subtract:
+    #     covered + fused + numeric + image_text + residual_boiler + short + absent
+    #         == gap.n_source
+    #
+    # `gap.n_source` is deliberately NOT `n_source_tokens`. The body metric excludes
+    # furniture and figure text from its ground truth; this one excludes neither, it
+    # BUCKETS them — which is the only way a reader can see how much of the gap each
+    # of them explained. Two denominators, both named, neither blurred into the other.
+    #
+    # Stated on every document, including the clean ones: `absent: 0` is a claim about
+    # the document, while an absent block is a claim about nobody having looked, and
+    # a stated zero is what makes a later non-zero readable.
+    gap = explain_gap(src_raw or "", md_text, cfg.header_footer_min_frac, image_text)
+    loss["gap"] = OrderedDict((
+        ("n_source", gap.n_source), ("covered", gap.covered), ("fused", gap.fused),
+        ("numeric", gap.numeric), ("image_text", gap.image_text),
+        ("residual_boiler", gap.residual_boiler), ("short", gap.short),
+        ("absent", gap.absent)))
+    loss["absent_top"] = [[tok, n] for tok, n in gap.absent_top]
     loss["ocr_used"] = False
     loss["gate"] = "best-effort"
     return loss, lossy
@@ -302,6 +340,9 @@ def build_one(row, conv, ocr_conv, ocr_mode, out_root, run_id, cfg,
     if not use_ocr:
         raw = dc._source_text(row["src"])
         src_stripped = strip_running_lines(raw, cfg.header_footer_min_frac)
+        # `_pdf_losslessness` takes the RAW text and strips it again for the body
+        # metric: `explain_gap` needs the un-stripped pages to recognise a surviving
+        # running footer. The local `src_stripped` is for the fallback body below.
         if lane == "pdf" and raw:
             md = repair_split_tokens(md, identifier_vocab(raw))
         # Text-layer fallback: docling provably dropped content the layer holds.
@@ -326,8 +367,7 @@ def build_one(row, conv, ocr_conv, ocr_mode, out_root, run_id, cfg,
         image_text = ""
         if lane == "pdf":
             image_text = dc._image_region_text(row["src"], dc._picture_boxes(doc))
-        loss, real_loss = _pdf_losslessness(src_stripped, md, furniture,
-                                            image_text, cfg)
+        loss, real_loss = _pdf_losslessness(raw, md, furniture, image_text, cfg)
     if real_loss:
         warnings.append({"code": "pdf_content_loss",
                          "detail": "token recall %.3f / content recall %.3f below "

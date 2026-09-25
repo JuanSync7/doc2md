@@ -181,3 +181,97 @@ def test_every_failure_branch_withdraws_the_bundle_the_last_run_published():
     bpb_mod = _mod("build_pdf_bundle")
     for helper in ("_withdraw_published", "_clear_withdrawn", "_announce_withdrawn"):
         assert hasattr(bpb_mod.bb, helper)
+
+
+# ================================ why recall is not 1.0 (roadmap M0, explain_gap)
+#
+# `token_recall: 0.97` is a number nobody can act on. It does not say whether three
+# words were re-hyphenated across a line break, or a running footer survived the
+# strip, or a whole paragraph is gone — and those need three different fixes, one of
+# which is not a fix at all. `explain_gap` decomposes the gap into buckets where each
+# missing occurrence is claimed by the FIRST bucket that can explain it, leaving
+# `absent` as the only one that is real, unexplained content loss.
+#
+# It was built, exported from `backend.ingest`, covered by its own unit tests — and
+# called by nothing. Every PDF report carried the bare number.
+
+def _cfg():
+    from backend.ingest import load_ingest_config
+    return load_ingest_config()
+
+
+def _buckets(loss):
+    g = loss["gap"]
+    return (g["covered"] + g["fused"] + g["numeric"] + g["image_text"]
+            + g["residual_boiler"] + g["short"] + g["absent"])
+
+
+def test_the_gap_block_accounts_for_every_source_token(bpb):
+    """The invariant that makes the buckets readable: they PARTITION the source, so
+    a reader can subtract. If they did not sum, a bucket could quietly absorb loss
+    and the block would be decoration."""
+    src = "alpha beta gamma delta epsilon " * 40
+    loss, _real = bpb._pdf_losslessness(src, "# T\n\n" + src, "", "", _cfg())
+    assert _buckets(loss) == loss["gap"]["n_source"]
+    assert loss["gap"]["absent"] == 0
+
+
+def test_the_gap_block_is_stated_even_when_nothing_is_missing(bpb):
+    """A stated zero is a claim about the document; an absent block is a claim about
+    nobody having looked. `absent: 0` is what makes a later non-zero readable."""
+    src = "alpha beta gamma delta epsilon " * 40
+    loss, _real = bpb._pdf_losslessness(src, "# T\n\n" + src, "", "", _cfg())
+    assert loss["gap"]["absent"] == 0 and loss["absent_top"] == []
+
+
+def test_real_loss_lands_in_absent_and_is_named(bpb):
+    """The bucket that matters. `absent_top` is what turns "0.50" into a sentence a
+    person can act on."""
+    kept, lost = "alpha beta gamma delta epsilon ", "zeta eta theta iota kappa "
+    src = (kept + lost) * 40
+    loss, real = bpb._pdf_losslessness(src, "# T\n\n" + kept * 40, "", "", _cfg())
+    assert real is True
+    # 200 occurrences went missing and they do NOT all land in `absent`: `eta` is
+    # three characters, and a token that short cannot be substring-matched honestly
+    # against the target, so its 40 occurrences are claimed by `short` first. That
+    # split is the whole point of the buckets — 160 is the number a person should
+    # chase, and the other 40 are a measurement artefact nobody can fix.
+    assert (loss["gap"]["absent"], loss["gap"]["short"]) == (160, 40), loss["gap"]
+    assert dict(loss["absent_top"])["zeta"] == 40
+    assert "eta" not in dict(loss["absent_top"])
+
+
+def test_a_running_footer_is_explained_not_counted_as_loss(bpb):
+    """THE ROW THAT DECIDES THE SIGNATURE. `explain_gap` applies the boilerplate
+    strip ITSELF so it can also see sub-threshold repeated lines — so it has to be
+    handed the RAW page-delimited extraction. Hand it text that was already stripped
+    and the repeats are gone, `residual_boiler` reads 0, and every one of those
+    tokens is re-counted as `absent`: the block would overstate loss on exactly the
+    documents it exists to explain."""
+    body = "alpha beta gamma delta epsilon\n"
+    page = "Page %d of 2\n" + body
+    src = (page % 1) + "\f" + (page % 2)
+    loss, _real = bpb._pdf_losslessness(src, "# T\n\n" + body + body, "", "", _cfg())
+    assert loss["gap"]["residual_boiler"] > 0, loss["gap"]
+    assert loss["gap"]["absent"] == 0, loss["gap"]
+
+
+def test_figure_text_is_explained_rather_than_absent(bpb):
+    """Words over vector art are figure CONTENT, not lost body text — the same call
+    the body metric already makes with `exclude`, made visible per bucket."""
+    body = "alpha beta gamma delta epsilon " * 40
+    fig = "statemachine idlestate activestate resetstate"
+    loss, _real = bpb._pdf_losslessness(body + fig, "# T\n\n" + body, "", fig, _cfg())
+    assert loss["gap"]["image_text"] == 4, loss["gap"]
+    assert loss["gap"]["absent"] == 0, loss["gap"]
+
+
+def test_the_gap_denominator_is_named_and_is_not_the_body_one(bpb):
+    """Two denominators, on purpose, and the report must not blur them.
+    `n_source_tokens` is the BODY metric's — furniture and figure text excluded from
+    the ground truth. `gap.n_source` excludes neither: it BUCKETS them, which is the
+    only way a reader can see how much of the gap each explained."""
+    body = "alpha beta gamma delta epsilon " * 40
+    fig = "statemachine idlestate activestate resetstate"
+    loss, _real = bpb._pdf_losslessness(body + fig, "# T\n\n" + body, "", fig, _cfg())
+    assert loss["gap"]["n_source"] > loss["n_source_tokens"]
