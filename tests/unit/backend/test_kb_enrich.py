@@ -1298,3 +1298,42 @@ def test_a_published_title_is_prose_and_not_markdown():
     out, _src = title_floor(
         "", "", "x.docx", [{"title": "**Bold** heading here", "children": []}])
     assert out == "Bold heading here"
+
+
+def test_a_grouped_field_tells_the_model_what_the_group_keys_are():
+    """Found by running the real enricher against a real bundle with Claude as the
+    model, and reading what came back: EVERY entity was rejected as
+    `untyped-member-of-unknown-group`.
+
+    The spec for `entities` said `kind: groups` and listed the entity TYPES under
+    `values`, so the obvious compliant reading is to key the groups by type —
+    `{"Identifier": [...]}`. But acceptance takes a member's type from
+    `vocab.group_type(group_name)`, which only knows the registry's own group names
+    (`identifiers`, `metrics`, `organisations`, ...). A model keying by type loses
+    every record, and nothing in the prompt could have told it otherwise.
+
+    That is the repo's own rule 1 — constrain at GENERATION, not only at validation
+    — being broken by the one field that carries the knowledge graph. The stub-client
+    tests could not catch it: a canned reply is shaped to pass by construction."""
+    from backend.kb import request_spec, load_vocab
+    spec = request_spec(load_vocab())["entities"]
+    assert spec["kind"] == "groups"
+    assert "identifiers" in spec["group_keys"]
+    assert "organisations" in spec["group_keys"]
+    # and the entry must say what a key MEANS, or a model reads it as a second
+    # closed list with no stated relationship to the types beside it
+    assert "type" in spec["group_keys_note"].lower()
+
+
+def test_a_group_key_the_registry_declares_is_actually_accepted():
+    """The other half of the same contract: the keys the prompt now names must be
+    the keys acceptance honours. Proven end to end rather than by reading both
+    lists, because a spec that names the wrong keys is the bug it just replaced."""
+    from backend.kb import request_spec, load_vocab, accept_model_meta
+    vocab = load_vocab()
+    key = request_spec(vocab)["entities"]["group_keys"][0]
+    out = accept_model_meta(
+        {"entities": {key: [{"name": "thing", "ref": "#s"}]}},
+        vocab, existing={}, model="probe", prompt_sha="x", anchors={"s"})
+    assert out["rejected"] == [], out["rejected"]
+    assert out["accepted"].get("entities", {}).get(key), out["accepted"]

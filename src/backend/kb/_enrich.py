@@ -230,6 +230,22 @@ def request_spec(vocab, wanted=None):
                 entry["new_values_allowed"] = True
                 entry["new_values_note"] = (
                     "a term not listed is recorded as a proposal, not used directly")
+        # A GROUPED field is keyed by a registry GROUP NAME, not by the type list
+        # sitting beside it in `values`. Acceptance takes an untyped member's type
+        # from `vocab.group_type(group_name)`, so a model that keys by type — the
+        # only reading the spec used to support — loses EVERY record to
+        # `untyped-member-of-unknown-group`. Naming the keys here is rule 1 again:
+        # constrain at generation, not only at validation.
+        gv = group_vocab(name)
+        if gv.get("member_type"):
+            keys = vocab.group_names() if hasattr(vocab, "group_names") else []
+            if keys:
+                entry["group_keys"] = list(keys)
+                entry["group_keys_note"] = (
+                    "the JSON object's keys MUST come from `group_keys`; each key "
+                    "implies the `type` of every member under it, so a member needs "
+                    "no `type` of its own. Never key this object by a value from "
+                    "`values` — that is the type vocabulary, not the group names.")
         sub = record_vocab(name)
         if sub:
             entry["record_fields"] = OrderedDict(

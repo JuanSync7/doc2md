@@ -163,6 +163,20 @@ class Vocabulary(object):
         """
         return (self._node("entity_types").get("group_types") or {}).get(group, "")
 
+    def group_names(self):
+        # type: () -> list
+        """Every entity GROUP name the registry declares, sorted.
+
+        The counterpart of `group_type`. Acceptance reads a member's type from the
+        group NAME, so a model that is never told these names cannot produce an
+        acceptable entity — which is what happened: keying the groups by entity
+        TYPE (the only list the prompt showed) lost every record to
+        `untyped-member-of-unknown-group`."""
+        node = self._d.get("entity_types")
+        if not isinstance(node, dict):
+            return []
+        return sorted((node.get("group_types") or {}).keys())
+
     def maps_to(self, field, value=None):
         # type: (str, str) -> str
         """The standard term for a field, or for one of its values.
