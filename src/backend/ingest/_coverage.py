@@ -18,9 +18,10 @@ summary: Measure what fraction of a source document's content survived into a ta
 # block actually moves the number — which is what lets it DRIVE the fixes.
 import html as _htmllib
 import re
+import unicodedata
 from collections import Counter, namedtuple
 
-__all__ = ["tokenize", "coverage", "CoverageReport", "is_lossy", "is_lossy_explained",
+__all__ = ["tokenize", "normalize_pdf_text", "coverage", "CoverageReport", "is_lossy", "is_lossy_explained",
            "char_ngram_recall", "html_to_text", "strip_running_lines", "words_in_bbox",
            "explain_gap", "GapReport", "merge_boxes"]
 
@@ -43,6 +44,42 @@ def tokenize(text):
     if not text:
         return []
     return _TOKEN.findall(text.lower())
+
+
+# Characters a PDF's text layer carries that a reader never sees and NFKC does not
+# touch — they are formatting marks, not compatibility equivalents. A soft hyphen
+# left at a line break splits a word for the ASCII tokenizer exactly as a ligature
+# does: `hyphen\xadated` arrives as two tokens, and both are counted as lost.
+_INVISIBLE = re.compile("[\u00ad\u200b\u200c\u200d\u2060\ufeff]")
+
+
+def normalize_pdf_text(text):
+    # type: (str) -> str
+    """Fold the character-level noise a PDF text layer and a converter disagree on.
+
+    THE PDF LANE ONLY. Poppler hands back the ligature glyph the font actually
+    contains (``con\ufb01dential``); docling hands back the two letters a reader sees
+    (``confidential``). The shared tokenizer is ``[a-z0-9]+``, so ``\ufb01`` is not in
+    the class at all: the source word arrives as ``con`` + ``dential``, neither half
+    matches, and a document that lost nothing is reported as having lost two tokens.
+
+    Deliberately NOT inside `tokenize`. The office lane gates at EXACTLY 1.0 against
+    a ground truth read from the same OOXML the converter read, so both sides already
+    agree about characters and nothing there needs this — while a fold in the shared
+    tokenizer would quietly change what that 1.0 means on every office document. If
+    it ever does move into shared code, the full office corpus is re-run first.
+
+    NFKC is a COMPATIBILITY fold, not a transliteration: ``na\u00efve`` stays
+    ``na\u00efve``. Both sides then read the same non-ASCII word, the ASCII tokenizer
+    reads it as two fragments on both sides, and the measurement stays symmetric.
+    Stripping the accent would assert the document said ``naive``, which this function
+    is not entitled to do.
+
+    Applied SYMMETRICALLY to source and markdown, or it is not a fold but a thumb on
+    the scale — `pdf_coverage_report` is the one caller and applies it to both."""
+    if not text:
+        return ""
+    return _INVISIBLE.sub("", unicodedata.normalize("NFKC", text))
 
 
 _HTML_SCRIPT_STYLE = re.compile(r"(?is)<(script|style)\b[^>]*>.*?</\1\s*>")

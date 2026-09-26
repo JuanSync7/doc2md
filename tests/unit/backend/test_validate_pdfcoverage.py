@@ -189,3 +189,51 @@ def test_it_touches_no_disk_network_or_process():
         elif isinstance(node, ast.ImportFrom):
             imported.add((node.module or "").split(".")[0])
     assert imported <= {"collections", "backend"}, sorted(imported)
+
+
+# ================================ the ligature fold (roadmap M1), wired in here
+#
+# `normalize_pdf_text` is a pdf-lane-only entry point, and THIS is the lane's one
+# choke point: every string the block measures — source, markdown, furniture and
+# figure text — passes through it, so the fold is symmetric by construction rather
+# than by a caller remembering to do it on both sides.
+
+def test_a_ligature_in_the_text_layer_is_no_longer_reported_as_loss():
+    """The bug this closes. Poppler returns the glyph the font contains, docling
+    returns the letters a reader sees, and unfolded the ASCII tokenizer matches
+    neither to the other — a document that lost NOTHING reported two lost tokens for
+    every ligature in it."""
+    body = "the conﬁdential oﬀset of the ﬂow controller is ﬁxed "
+    src = body * 40
+    md = "# T\n\n" + ("the confidential offset of the flow controller is fixed " * 40)
+    loss, real = _report(src, md)
+    assert loss["token_recall"] == 1.0
+    assert real is False and loss["gap"]["absent"] == 0
+
+
+def test_the_fold_is_symmetric_and_the_ligature_can_sit_on_either_side():
+    """A fold applied to one side only is not a fold, it is a thumb on the scale.
+    The same pair scores 1.0 whichever side carries the glyph."""
+    plain = "the confidential offset of the flow controller is fixed " * 40
+    lig = "the conﬁdential oﬀset of the ﬂow controller is ﬁxed " * 40
+    assert _report(lig, "# T\n\n" + plain)[0]["token_recall"] == 1.0
+    assert _report(plain, "# T\n\n" + lig)[0]["token_recall"] == 1.0
+
+
+def test_the_fold_reaches_the_excluded_strings_too():
+    """Furniture and figure text are matched against the SAME source, so a fold that
+    stopped at the two main arguments would leave a ligature in a running header
+    counted as body loss."""
+    body = "alpha beta gamma delta epsilon " * 40
+    furniture = "kestrel conﬁdential draft"
+    loss, _ = _report(body + " kestrel confidential draft", "# T\n\n" + body,
+                      furniture)
+    assert loss["token_recall"] == 1.0
+
+
+def test_real_loss_still_survives_the_fold():
+    """The fold must remove NOISE, not signal. A document that actually dropped half
+    its content still reports that loss with the fold in place."""
+    kept, lost = "alpha beta gamma delta epsilon ", "zeta eta theta iota kappa "
+    loss, real = _report((kept + lost) * 40, "# T\n\n" + kept * 40)
+    assert real is True and loss["gap"]["absent"] == 160

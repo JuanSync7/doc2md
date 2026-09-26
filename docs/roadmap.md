@@ -177,10 +177,24 @@ OCR path measures nothing, and a diagram-only digital PDF misroutes to OCR.
       a no-op, so the real teeth are a caller stripping at its OWN threshold —
       measured at 0.77 recall against the document and a flattering 1.00 against
       a pre-stripped copy of it.)*
-- [ ] NFKC + ligature normalization applied symmetrically to both sides —
+- [x] NFKC + ligature normalization applied symmetrically to both sides —
       as a **pdf-lane-only entry point**, not inside the shared `tokenize`
       (office 1.0 gate untouched; if it ever moves into shared code, re-run
       the full office corpus first).
+      *(2026-09-26: `backend.ingest.normalize_pdf_text` — NFKC plus the
+      invisible marks NFKC does NOT touch (soft hyphen, ZW\*, word joiner,
+      BOM), which split a word for the ASCII tokenizer exactly as a ligature
+      does. Applied inside `pdf_coverage_report` to source, markdown,
+      furniture and figure text alike, so the symmetry is structural rather
+      than a caller's discipline. The office `tokenize` is untouched and a
+      test asserts it still reads `con\ufb01dential` as two fragments.
+      CAVEAT, measured: no document in the corpus contains a ligature or an
+      invisible mark, so the fold is a no-op on all 17 and is proven at unit
+      level only. The asymmetry it fixes — poppler returning the font's glyph
+      where docling returns the letters — needs a PDF whose font actually
+      ligates, which LibreOffice does not produce deterministically from the
+      synthetic sources. That is the "hyphenation + ligature doc" stress
+      fixture below, and it is a harder fixture than it reads.)*
 - [ ] Make the exclusion set converter-blind at convert time: use
       `_pdf_drawn_boxes` (pypdfium2, the PDF's own drawing objects) instead
       of docling's `_picture_boxes` for figure-region text — removes the last

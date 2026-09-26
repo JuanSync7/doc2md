@@ -27,7 +27,7 @@ from collections import OrderedDict
 
 from backend.ingest import (tokenize, coverage, markdown_to_text,
                             char_ngram_recall, is_lossy_explained,
-                            strip_running_lines, explain_gap)
+                            strip_running_lines, explain_gap, normalize_pdf_text)
 
 __all__ = ["pdf_coverage_report"]
 
@@ -60,6 +60,19 @@ def pdf_coverage_report(src_raw, md, furniture, image_text,
     default here would be a second copy of `ingest.toml`'s policy, free to drift from
     the one the lane actually ran on, and a drift nobody would see in the artifact.
     """
+    # The pdf-lane character fold, applied at the ONE choke point every measured
+    # string passes through — source, markdown, furniture and figure text alike. A
+    # fold applied to one side is not a fold but a thumb on the scale, and doing it
+    # here is what makes the symmetry structural rather than a caller's discipline.
+    #
+    # Without it, a ligature is not merely mismatched, it is INVISIBLE: the shared
+    # tokenizer is `[a-z0-9]+`, so `con\ufb01dential` from poppler arrives as `con`
+    # + `dential`, neither half matches docling's `confidential`, and a document
+    # that lost nothing reports two lost tokens for every ligature it contains.
+    src_raw = normalize_pdf_text(src_raw)
+    md = normalize_pdf_text(md)
+    furniture = normalize_pdf_text(furniture)
+    image_text = normalize_pdf_text(image_text)
     exclude = (furniture + " " + image_text).strip()
     md_text = markdown_to_text(md)
     src_stripped = strip_running_lines(src_raw or "", header_footer_min_frac)

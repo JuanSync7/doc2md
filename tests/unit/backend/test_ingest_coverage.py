@@ -385,3 +385,71 @@ def test_explain_gap_image_text_bucket_claims_figure_labels():
     assert counts == [1, 3]
     big = [c for c, n in clusters if n == 3][0]
     assert big == (0.1, 0.1, 0.4, 0.2)
+
+
+# ================================ the PDF lane's normalization (roadmap M1)
+#
+# A PDF's text layer and a converter's markdown disagree about characters in ways
+# that have nothing to do with content: poppler hands back the ligature glyph the
+# font actually contains (`conﬁdential`), docling hands back the two letters a
+# reader sees (`confidential`), and the shared ASCII tokenizer — `[a-z0-9]+` — can
+# match NEITHER of them to the other. `ﬁ` is outside the class, so the source word
+# arrives as `con` + `dential` and both halves are counted as LOST.
+#
+# That is measurement noise reported as content loss, and it is exactly the class
+# `token_recall` must not manufacture. The fold is deliberately NOT inside
+# `tokenize`: the office lane gates at exactly 1.0 against a ground truth built from
+# the same OOXML the converter read, and nothing there needs this.
+
+def test_a_ligature_and_its_letters_tokenize_the_same_after_the_fold():
+    """The row the whole entry point exists for. Untouched, the ASCII tokenizer
+    cannot see a ligature at all, so a word containing one is read as two fragments
+    and reported as loss on a document where nothing was lost."""
+    from backend.ingest import normalize_pdf_text, tokenize
+    assert tokenize("conﬁdential oﬀset ﬂow") == \
+        ["con", "dential", "o", "set", "ow"]              # the damage, unfolded
+    assert tokenize(normalize_pdf_text("conﬁdential oﬀset ﬂow")) == \
+        tokenize("confidential offset flow")
+
+
+def test_invisible_characters_a_pdf_injects_are_removed():
+    """NFKC leaves these in place — they are not compatibility equivalents, they are
+    formatting marks. A soft hyphen at a line break splits a word for the tokenizer
+    exactly as a ligature does, and the reader never sees either."""
+    from backend.ingest import normalize_pdf_text, tokenize
+    for invisible in ("­", "​", "‌", "‍", "⁠", "﻿"):
+        assert tokenize(normalize_pdf_text("hyphen" + invisible + "ated")) == \
+            ["hyphenated"], repr(invisible)
+
+
+def test_the_fold_is_idempotent_and_safe_on_nothing():
+    from backend.ingest import normalize_pdf_text
+    once = normalize_pdf_text("conﬁdential­ text")
+    assert normalize_pdf_text(once) == once
+    assert normalize_pdf_text("") == "" and normalize_pdf_text(None) == ""
+
+
+def test_ordinary_text_is_returned_unchanged():
+    """The fold must be a no-op on the overwhelming majority of documents, or its
+    blast radius is every PDF rather than the ones with a ligature in them."""
+    from backend.ingest import normalize_pdf_text
+    plain = "The clk_ref_sel field selects between the crystal oscillator (0x1f).\n"
+    assert normalize_pdf_text(plain) == plain
+
+
+def test_an_accent_is_not_flattened_into_ascii():
+    """NFKC is a COMPATIBILITY fold, not a transliteration. `naïve` stays `naïve`:
+    both sides see the same non-ASCII word, the ASCII tokenizer reads it as two
+    fragments on both sides, and the measurement stays symmetric. Stripping the
+    accent would be a different claim — that the document said `naive` — and this
+    function is not entitled to make it."""
+    from backend.ingest import normalize_pdf_text
+    assert normalize_pdf_text("naïve café") == "naïve café"
+
+
+def test_the_shared_tokenizer_is_untouched_so_the_office_gate_cannot_move():
+    """The roadmap's constraint, as a test. The office lane gates at EXACTLY 1.0
+    against a ground truth read from the same OOXML; a fold inside `tokenize` would
+    silently change what that 1.0 means on 14 documents that currently pass."""
+    from backend.ingest import tokenize
+    assert tokenize("conﬁdential") == ["con", "dential"]

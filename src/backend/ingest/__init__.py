@@ -21,7 +21,8 @@ from ._figures import (gate_figures, caption_is_useful, caption_type_is_furnitur
                        FIG_LOST_BADCROP, FIG_LOST_BAIL)
 from ._imageprobe import sniff_image_format, image_dimensions, IMAGE_EXTS
 from ._media import resolve_media_refs, is_body_part
-from ._coverage import (tokenize, coverage, CoverageReport, is_lossy, is_lossy_explained,
+from ._coverage import (tokenize, normalize_pdf_text, coverage, CoverageReport,
+                        is_lossy, is_lossy_explained,
                         char_ngram_recall, html_to_text, strip_running_lines, words_in_bbox,
                         explain_gap, GapReport, merge_boxes)
 from ._provenance import core_properties, pdf_info_meta, front_matter
@@ -55,6 +56,7 @@ from ._recovery import (classify_failure, recovery_action,
 
 __all__ = [
     "tokenize",
+    "normalize_pdf_text",
     "coverage",
     "CoverageReport",
     "is_lossy",
