@@ -310,7 +310,11 @@ def build_one(row, conv, ocr_conv, ocr_mode, out_root, run_id, cfg,
         furniture = dc._furniture_text(doc)
         image_text = ""
         if lane == "pdf":
-            image_text = dc._image_region_text(row["src"], dc._picture_boxes(doc))
+            # Both detectors must agree a region is a figure before its text leaves
+            # the ground truth — docling's boxes alone would let a misclassified
+            # body block excuse exactly the text it dropped. See dc._figure_regions.
+            image_text = dc._image_region_text(
+                row["src"], dc._figure_regions(row["src"], dc._picture_boxes(doc)))
         loss, real_loss = _pdf_losslessness(raw, md, furniture, image_text, cfg)
     if real_loss:
         warnings.append({"code": "pdf_content_loss",

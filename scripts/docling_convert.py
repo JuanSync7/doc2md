@@ -38,7 +38,7 @@ from backend.ingest import (doc_id, gate_figures, caption_is_useful,
                             front_matter, pdf_info_meta, is_lossy_explained,
                             char_ngram_recall, html_to_text, strip_running_lines,
                             words_in_bbox, tokenize, recommend_shards, order_todo,
-                            load_source_root, merge_boxes,
+                            load_source_root, merge_boxes, intersect_boxes,
                             summarize_routes, normalize_accept, unknown_formats,
                             supported_formats, ROUTE_DOCLING, ROUTE_OOXML,
                             ROUTE_LIBREOFFICE, ROUTE_PASSTHROUGH, ROUTE_FENCE)
@@ -453,6 +453,46 @@ def _pdf_drawn_boxes(path):
         except Exception:
             pass
     return out
+
+
+def _figure_regions(path, doc_boxes):
+    """Figure regions BOTH detectors agree on, for a PDF; docling's alone otherwise.
+
+    The exclusion set is the most dangerous input to the measurement: whatever
+    decides "this region is a figure" removes that text from the ground truth, so it
+    can delete the evidence of a real loss. Docling's own picture bboxes deciding it
+    alone is circular — a body block it misclassified as a picture would excuse
+    exactly the text it dropped, and the gate would read green over real damage.
+
+    The PDF's own drawing objects are independent, but they cannot own the decision
+    either: measured on `pdf/kestrel-clock-spec.pdf`, the register map's ruling lines
+    form a path cluster, so `_pdf_drawn_boxes` claims the whole table and would take
+    55 tokens of real body text out of the ground truth with it. Swapping one
+    detector for the other trades a circular exclusion for an over-wide one.
+
+    So `intersect_boxes` keeps only what both claim, over their overlap alone. Each
+    detector can then merely SHRINK the exclusion, and any disagreement leaves the
+    text counting against the converter.
+
+    For a non-PDF (HTML) there are no drawing objects to consult, so docling's boxes
+    are all there is and that lane's exclusion stays as circular as it was — recorded
+    in the roadmap rather than papered over here. The detector is not even CALLED for
+    one, so a missing pypdfium2 cannot silently change an HTML document's ground
+    truth."""
+    doc_boxes = list(doc_boxes or [])
+    if path.rsplit(".", 1)[-1].lower() != "pdf":
+        return doc_boxes
+    drawn = _pdf_drawn_boxes(path)
+    # Measure-only sweeps run without a conversion, so there are no docling boxes to
+    # agree with. The independent detector is then the only evidence there is, and
+    # using it alone is this path's pre-existing behaviour — NOT the better answer:
+    # it is the over-wide one, so a swept document reads a little kinder than the
+    # same document does at convert time, where agreement is required. Not circular
+    # (nothing docling said is trusted), but flattering, and the convert-time number
+    # in report.json is the authoritative one. Recorded in the roadmap.
+    if not doc_boxes:
+        return drawn
+    return intersect_boxes(doc_boxes, drawn)
 
 
 def _image_region_text(path, boxes):
@@ -966,9 +1006,7 @@ def _coverage_record(did, rel, path, md, extras=None):
     # Boxes come from docling's layout (convert time) or, when absent (measure-only
     # sweeps), from the INDEPENDENT drawing-object detector — so the apple-to-apple
     # holds without a conversion, and the evidence isn't docling judging itself.
-    boxes = (extras or {}).get("pic_boxes")
-    if not boxes and path.rsplit(".", 1)[-1].lower() == "pdf":
-        boxes = _pdf_drawn_boxes(path)
+    boxes = _figure_regions(path, (extras or {}).get("pic_boxes"))
     image_text = _image_region_text(path, boxes) if boxes else ""
     exclude = (furniture + " " + image_text).strip()
     md_text = markdown_to_text(md)

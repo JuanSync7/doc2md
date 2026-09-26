@@ -23,7 +23,7 @@ from collections import Counter, namedtuple
 
 __all__ = ["tokenize", "normalize_pdf_text", "coverage", "CoverageReport", "is_lossy", "is_lossy_explained",
            "char_ngram_recall", "html_to_text", "strip_running_lines", "words_in_bbox",
-           "explain_gap", "GapReport", "merge_boxes"]
+           "explain_gap", "GapReport", "merge_boxes", "intersect_boxes"]
 
 # recall  : n_covered / n_source in [0, 1] (1.0 when the source has no tokens)
 # n_source: total source tokens (multiset size)
@@ -187,6 +187,46 @@ def merge_boxes(boxes, pad=0.01):
                 out.append((box, n))
         clusters = out
     return clusters
+
+
+def intersect_boxes(claimed, evidence):
+    # type: (list, list) -> list
+    """Figure regions TWO independent detectors agree on: ``[(page, x0, y0, x1, y1)]``.
+
+    Text inside a figure region is excluded from the losslessness ground truth,
+    because it is figure content rather than lost body text. That exclusion is the
+    most dangerous line in the measurement — whatever decides "this region is a
+    figure" can delete the evidence of a real loss — so the decider must not be the
+    converter being graded, and must not be naive either. Measured on
+    `pdf/kestrel-clock-spec.pdf`, neither available detector can own the decision:
+
+      * docling's own picture bboxes are SELF-GRADING. A body block it misclassified
+        as a picture would excuse exactly the text it dropped, and the gate would
+        read green over real damage.
+      * the PDF's own drawing objects are INDEPENDENT but naive. The register map's
+        ruling lines are a cluster of vector paths, so that detector claims the whole
+        table — 55 tokens of real body text leave the ground truth with it.
+
+    So a region counts as a figure only where both agree, and only over their
+    OVERLAP. Each detector can then merely shrink the exclusion, never widen it, and
+    any disagreement leaves the text counting against the converter. Symmetric by
+    construction: neither argument is privileged, and the names say only which
+    detector a caller happened to put first.
+
+    A zero-area intersection is not an overlap — it excuses nothing, and returning
+    it would put an empty rectangle in the exclusion set for every abutting pair."""
+    out = []
+    for cpg, cx0, cy0, cx1, cy1 in claimed or []:
+        for epg, ex0, ey0, ex1, ey1 in evidence or []:
+            if cpg != epg:
+                continue
+            x0, y0 = max(cx0, ex0), max(cy0, ey0)
+            x1, y1 = min(cx1, ex1), min(cy1, ey1)
+            if x1 > x0 and y1 > y0:
+                out.append((cpg, x0, y0, x1, y1))
+    # Deterministic, because these boxes reach report.json through the text they
+    # exclude and a reordering would show up as a diff nobody caused.
+    return sorted(set(out))
 
 
 _PAGE_BREAK = "\f"

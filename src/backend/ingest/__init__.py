@@ -24,7 +24,8 @@ from ._media import resolve_media_refs, is_body_part
 from ._coverage import (tokenize, normalize_pdf_text, coverage, CoverageReport,
                         is_lossy, is_lossy_explained,
                         char_ngram_recall, html_to_text, strip_running_lines, words_in_bbox,
-                        explain_gap, GapReport, merge_boxes)
+                        explain_gap, GapReport, merge_boxes,
+                        intersect_boxes)
 from ._provenance import core_properties, pdf_info_meta, front_matter
 from ._yamlblock import (YamlSubsetError, render_block, render_front_matter,
                          parse_block, split_front_matter)
@@ -66,6 +67,7 @@ __all__ = [
     "explain_gap",
     "GapReport",
     "merge_boxes",
+    "intersect_boxes",
     "strip_running_lines",
     "words_in_bbox",
     "core_properties",

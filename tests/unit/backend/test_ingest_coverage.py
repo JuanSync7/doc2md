@@ -453,3 +453,80 @@ def test_the_shared_tokenizer_is_untouched_so_the_office_gate_cannot_move():
     silently change what that 1.0 means on 14 documents that currently pass."""
     from backend.ingest import tokenize
     assert tokenize("conﬁdential") == ["con", "dential"]
+
+
+# ================================ figure regions, agreed by two detectors (M1)
+#
+# Text inside a figure is excluded from the ground truth, because it is figure
+# content rather than lost body text. That exclusion is the most dangerous line in
+# the measurement: whatever decides "this region is a figure" can delete evidence
+# of real loss, so the DECIDER must not be the converter being graded.
+#
+# Neither available detector can own the decision alone. Measured on
+# `pdf/kestrel-clock-spec.pdf`:
+#
+#   * docling's own picture bboxes are self-grading — a body block it misclassified
+#     as a picture would excuse exactly the text it dropped;
+#   * the PDF's own drawing objects are independent but naive: the register map's
+#     ruling lines are a cluster of vector paths, so the detector claims the whole
+#     table and 55 tokens of real body text leave the ground truth with it.
+#
+# So a region is a figure only where BOTH agree, and only over the overlap. Each
+# detector can then merely SHRINK the exclusion, never widen it, and any
+# disagreement leaves the text counting against the converter.
+
+def test_a_region_both_detectors_claim_survives_as_their_overlap():
+    from backend.ingest import intersect_boxes
+    claimed = [(2, 0.10, 0.20, 0.50, 0.60)]
+    evidence = [(2, 0.15, 0.25, 0.60, 0.70)]
+    assert intersect_boxes(claimed, evidence) == [(2, 0.15, 0.25, 0.50, 0.60)]
+
+
+def test_a_region_only_the_converter_claims_is_not_excused():
+    """The circularity this closes. Docling calling a paragraph a picture is not
+    evidence of a picture, and on its own it must buy no exclusion at all."""
+    from backend.ingest import intersect_boxes
+    assert intersect_boxes([(1, 0.1, 0.1, 0.9, 0.9)], []) == []
+    assert intersect_boxes([(1, 0.1, 0.1, 0.4, 0.4)],
+                           [(1, 0.5, 0.5, 0.9, 0.9)]) == []
+
+
+def test_a_table_the_drawing_detector_claims_alone_is_not_excused():
+    """The other half, and the reason this is not just a stricter docling filter:
+    the register map's rules make a path cluster that the independent detector
+    reports as a figure. With nothing from docling agreeing, the table's text stays
+    in the ground truth where it belongs."""
+    from backend.ingest import intersect_boxes
+    table = [(2, 0.085, 0.434, 0.860, 0.634)]       # measured, kestrel-clock-spec
+    assert intersect_boxes([], table) == []
+
+
+def test_pages_are_never_crossed():
+    from backend.ingest import intersect_boxes
+    assert intersect_boxes([(1, 0.1, 0.1, 0.9, 0.9)],
+                           [(2, 0.1, 0.1, 0.9, 0.9)]) == []
+
+
+def test_a_touching_edge_is_not_an_overlap():
+    """A zero-area intersection excuses nothing, and returning it would put an empty
+    rectangle into the exclusion set for every box that merely abuts another."""
+    from backend.ingest import intersect_boxes
+    assert intersect_boxes([(1, 0.1, 0.1, 0.5, 0.5)],
+                           [(1, 0.5, 0.1, 0.9, 0.5)]) == []
+
+
+def test_every_agreeing_pair_is_kept_and_the_result_is_ordered():
+    """One claimed region may overlap several drawing clusters (a figure with a
+    raster and a caption rule), and one cluster may sit under several claims. Every
+    agreeing pair contributes, deterministically ordered so the artifact diffs."""
+    from backend.ingest import intersect_boxes
+    got = intersect_boxes([(1, 0.0, 0.0, 1.0, 1.0)],
+                          [(1, 0.6, 0.6, 0.8, 0.8), (1, 0.1, 0.1, 0.2, 0.2)])
+    assert got == [(1, 0.1, 0.1, 0.2, 0.2), (1, 0.6, 0.6, 0.8, 0.8)]
+
+
+def test_it_is_symmetric_and_empty_on_nothing():
+    from backend.ingest import intersect_boxes
+    a, b = [(1, 0.1, 0.1, 0.5, 0.5)], [(1, 0.2, 0.2, 0.6, 0.6)]
+    assert intersect_boxes(a, b) == intersect_boxes(b, a)
+    assert intersect_boxes([], []) == []

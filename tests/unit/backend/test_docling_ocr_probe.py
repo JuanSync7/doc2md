@@ -117,3 +117,44 @@ def test_fully_digital_multipage_uses_page_count(monkeypatch):
     # head AND tail windows both dense -> digital; pdfinfo(1) + 2 window probes
     assert m.pdf_has_text_layer("x.pdf") is True
     assert calls["n"] == 1 + 2
+
+
+# ================================ the exclusion set needs two witnesses (M1)
+
+def test_a_body_region_docling_alone_calls_a_picture_buys_no_exclusion(monkeypatch):
+    """Fault injection on the most dangerous input in the measurement. Text inside a
+    figure region leaves the losslessness ground truth, so a converter that could
+    nominate those regions by itself could excuse exactly the text it dropped — and
+    the gate would read green over real damage.
+
+    Here docling claims a whole page is a picture and the PDF's own drawing objects
+    report nothing there. The claim buys nothing."""
+    m = _mod()
+    monkeypatch.setattr(m, "_pdf_drawn_boxes", lambda path: [])
+    assert m._figure_regions("/x/spec.pdf", [(1, 0.0, 0.0, 1.0, 1.0)]) == []
+
+
+def test_a_region_both_witnesses_claim_is_narrowed_to_the_overlap():
+    """Agreement is necessary but does not let either side widen the region: what is
+    excluded is the overlap, so an over-wide claim on either side is trimmed by the
+    other rather than believed."""
+    m = _mod()
+    m._pdf_drawn_boxes = lambda path: [(1, 0.20, 0.20, 0.50, 0.50)]
+    assert m._figure_regions("/x/spec.pdf", [(1, 0.0, 0.0, 0.40, 0.40)]) == \
+        [(1, 0.20, 0.20, 0.40, 0.40)]
+
+
+def test_a_non_pdf_has_no_drawing_objects_to_consult(monkeypatch):
+    """HTML has no drawing objects, so docling's boxes are all there is and that
+    lane's exclusion stays as circular as it was. Asserted rather than left implicit,
+    because the honest statement is 'this lane is not yet covered', not 'this lane is
+    fine' — the drawing detector must never be CALLED for it either, or a missing
+    pypdfium2 would silently change an HTML document's ground truth."""
+    m = _mod()
+
+    def _boom(path):
+        raise AssertionError("the drawing detector must not run for a non-PDF")
+
+    monkeypatch.setattr(m, "_pdf_drawn_boxes", _boom)
+    claimed = [(1, 0.1, 0.1, 0.4, 0.4)]
+    assert m._figure_regions("/x/page.html", claimed) == claimed

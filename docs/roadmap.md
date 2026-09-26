@@ -195,12 +195,32 @@ OCR path measures nothing, and a diagram-only digital PDF misroutes to OCR.
       ligates, which LibreOffice does not produce deterministically from the
       synthetic sources. That is the "hyphenation + ligature doc" stress
       fixture below, and it is a harder fixture than it reads.)*
-- [ ] Make the exclusion set converter-blind at convert time: use
+- [x] Make the exclusion set converter-blind at convert time: use
       `_pdf_drawn_boxes` (pypdfium2, the PDF's own drawing objects) instead
       of docling's `_picture_boxes` for figure-region text — removes the last
       docling-judges-docling input from the measurement. pypdfium2 stays in
       the PDF-lane script; only its box *output* crosses into the 3.6-stdlib
       validate function.
+      *(2026-09-26: done, but NOT as "instead of" — measurement said that
+      would have been a downgrade. On `pdf/kestrel-clock-spec.pdf` the
+      register map's ruling lines form a path cluster, so `_pdf_drawn_boxes`
+      claims the whole table and 55 tokens of real body text would leave the
+      ground truth with it: swapping one detector for the other trades a
+      circular exclusion for an over-wide one. Implemented instead as
+      `backend.ingest.intersect_boxes` + `dc._figure_regions`: a region is a
+      figure only where BOTH detectors agree, and only over their overlap, so
+      each can merely SHRINK the exclusion and any disagreement leaves the
+      text counting against the converter. Docling's claim is no longer
+      SUFFICIENT to excuse anything, which is the part that mattered.
+      Numerically a no-op on the corpus (clock-spec's agreed regions hold no
+      text, so `figure_text_tokens` was already 0) — this is a guarantee, not
+      a fix, and it is proven by injecting a full-page docling picture claim
+      and showing it buys no exclusion. Two gaps left, both narrower than the
+      original: the HTML lane has no drawing objects to consult, so its
+      exclusion stays circular; and a measure-only sweep has no docling boxes
+      to agree with, so it uses the independent detector alone — not
+      circular, but over-wide, so a swept document reads slightly kinder than
+      the same document at convert time.)*
 - [ ] Fix the OCR routing: area-weighted text-layer probe (a diagram-only
       digital PDF must not trip full-doc OCR); when a thin text layer exists,
       score the OCR output against it; record RapidOCR per-box confidence
