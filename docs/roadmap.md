@@ -164,11 +164,19 @@ Remaining holes: no NFKC/ligature fold (a residual `ﬁ` fakes loss), the
 exclusion set partly trusts docling's own picture bboxes (self-grading), the
 OCR path measures nothing, and a diagram-only digital PDF misroutes to OCR.
 
-- [ ] Move the gate policy into `src/`: `_pdf_losslessness` →
+- [x] Move the gate policy into `src/`: `_pdf_losslessness` →
       `backend.validate.pdf_coverage_report` (pure strings-in/dict-out, 3.6 +
       stdlib; poppler subprocess calls stay in the script), with a mirrored
       `tests/unit/backend/` file — *before* any policy change, so the office
       coercion invariant (`gate` never `pass` off-lane) is test-protected.
+      *(2026-09-26: done. The script keeps a 3-line adapter that unpacks the
+      config; the validator REFUSES to default its four thresholds, so they
+      cannot drift from `ingest.toml`, and the integration test moves each one
+      alone to prove the argument order. The move also corrected an overstated
+      claim about the raw-text signature: pre-stripping at the same threshold is
+      a no-op, so the real teeth are a caller stripping at its OWN threshold —
+      measured at 0.77 recall against the document and a flattering 1.00 against
+      a pre-stripped copy of it.)*
 - [ ] NFKC + ligature normalization applied symmetrically to both sides —
       as a **pdf-lane-only entry point**, not inside the shared `tokenize`
       (office 1.0 gate untouched; if it ever moves into shared code, re-run
