@@ -182,21 +182,92 @@ def _window_cpp(path, first, last, timeout=60):
     return len(out.replace("\f", "").strip()) / float(pages_read)
 
 
-def pdf_has_text_layer(path, sample_pages=10, min_chars_per_page=100, retries=1):
+def _page_raster_fracs(path):
+    """``{page_no: largest raster object's page-area fraction}`` from the PDF itself.
+
+    The evidence that separates a SCAN from a thin-text digital page. Measured on the
+    corpus: a scanned page is one page-sized image object and no text objects at all
+    (frac 1.000); a diagram-only digital page is vector paths and a handful of text
+    objects (frac 0.000). Char volume cannot tell those apart — 79 chars/page and 0
+    chars/page both sit under a 100-char threshold.
+
+    Rasters only. A vector drawing is not evidence of a scan: it is content the PDF
+    records exactly, and re-rendering it for OCR would throw that exactness away.
+
+    ``{}`` when pypdfium2 is unavailable, which the caller must treat as NO evidence
+    rather than as evidence of absence."""
+    try:
+        import ctypes
+        import pypdfium2 as pdfium
+        import pypdfium2.raw as pdfium_c
+    except Exception:
+        return {}
+    out = {}
+    try:
+        pdf = pdfium.PdfDocument(path)
+    except Exception:
+        return {}
+    try:
+        for pg_no in range(len(pdf)):
+            try:
+                page = pdf[pg_no]
+                w, h = page.get_size()
+                if w <= 0 or h <= 0:
+                    continue
+                biggest = 0.0
+                for obj in page.get_objects(max_depth=4):
+                    if obj.type != pdfium_c.FPDF_PAGEOBJ_IMAGE:
+                        continue
+                    l = ctypes.c_float()
+                    b = ctypes.c_float()
+                    r = ctypes.c_float()
+                    t = ctypes.c_float()
+                    if not pdfium_c.FPDFPageObj_GetBounds(obj.raw, l, b, r, t):
+                        continue
+                    frac = ((r.value - l.value) * (t.value - b.value)) / float(w * h)
+                    biggest = max(biggest, min(1.0, frac))
+                out[pg_no + 1] = biggest
+            except Exception:
+                continue
+    finally:
+        try:
+            pdf.close()
+        except Exception:
+            pass
+    return out
+
+
+def pdf_has_text_layer(path, sample_pages=10, min_chars_per_page=100,
+                       retries=1, scan_cover_min=0.5):
     """True if a PDF carries a real embedded text layer (digital) -> OCR not needed.
 
     Samples the document at BOTH ends — a head window and a tail window (sized from the
-    ``pdfinfo`` page count) — and calls it digital only when EVERY sampled window clears
-    ``min_chars_per_page``. This closes the mixed-PDF blind spot: a file that is digital up
-    front but SCANNED in a later section would pass a head-only probe as "digital" and its
-    scanned text would be silently lost (the coverage metric, also pdftotext-based, can't
-    see it either). Any textless window -> OCR the whole doc, the safe/lossless direction.
+    ``pdfinfo`` page count). This closes the mixed-PDF blind spot: a file that is digital
+    up front but SCANNED in a later section would pass a head-only probe as "digital" and
+    its scanned text would be silently lost (the coverage metric, also pdftotext-based,
+    can't see it either). Any scanned window -> OCR the whole doc, the lossless direction.
 
-    Bounded + fast (1-2 pdftotext calls, instant even on 1000+ page PDFs). Falls back to a
-    contiguous head probe when ``pdfinfo`` is unavailable. Asymmetric-safe: a wrong
-    "scanned" only costs OCR time, so on ANY probe failure (after a retry) we return False
-    (-> OCR). 100 cpp cleanly separates the two (digital pages measured 700-2700 cpp;
-    scanned ~0).
+    TWO SIGNALS, because char volume alone misroutes a real class of document. Clearing
+    ``min_chars_per_page`` in every window is digital on the spot, and the expensive
+    step never runs. A THIN window is not yet a scan: measured on the corpus,
+    `pdf/kestrel-dataflow.pdf` holds 79 chars/page against a scan's 0, and both sit
+    under a 100-char threshold. It is a diagram-only digital page — a real text layer,
+    thin because most of the page is vector art — and OCR'ing it re-renders and
+    re-transcribes content the PDF already holds exactly, collapsing its measured
+    losslessness to "no independent text layer to measure against".
+
+    So a thin window is judged by the PDF's own objects (`_page_raster_fracs`): a page
+    whose content is a RASTER covering at least ``scan_cover_min`` of it needs OCR,
+    whatever text it also carries — a scan with a burnt-in header stamp has a few real
+    characters and still needs transcribing. A page thin because it is mostly vector
+    drawing is digital.
+
+    Bounded + fast (1-2 pdftotext calls, instant even on 1000+ page PDFs; the object
+    walk runs only for a thin window). Falls back to a contiguous head probe when
+    ``pdfinfo`` is unavailable. Asymmetric-safe throughout: a wrong "scanned" only
+    costs OCR time while a wrong "digital" loses content silently, so ANY probe failure
+    after a retry — and a missing pypdfium2, which is no evidence rather than evidence
+    of absence — returns False (-> OCR).
     """
     n = _pdf_page_count(path)
     half = max(1, sample_pages // 2)
@@ -209,7 +280,27 @@ def pdf_has_text_layer(path, sample_pages=10, min_chars_per_page=100, retries=1)
     last = None
     for attempt in range(retries + 1):
         try:
-            return all(_window_cpp(path, f, l) >= min_chars_per_page for (f, l) in windows)
+            thin = [(f, l) for (f, l) in windows
+                    if _window_cpp(path, f, l) < min_chars_per_page]
+            if not thin:
+                return True            # obviously digital on the cheap signal alone
+            # A thin window is not yet a scan. Consult the PDF's own objects: a page
+            # whose content is a page-covering RASTER needs OCR, while a page that is
+            # thin because it is mostly vector drawing is digital and OCR'ing it
+            # would discard text the document already holds exactly.
+            #
+            # No evidence is not evidence of absence. With pypdfium2 missing the
+            # probe cannot tell the two apart, and the asymmetry is unchanged: a
+            # wrong "scanned" costs OCR time, a wrong "digital" loses the content
+            # silently. So an empty map keeps the old verdict.
+            fracs = _page_raster_fracs(path)
+            if not fracs:
+                return False
+            for (f, l) in thin:
+                for pg in range(f, l + 1):
+                    if fracs.get(pg, 1.0) >= scan_cover_min:
+                        return False
+            return True
         except Exception as e:
             last = e   # transient (e.g. timeout) -> retry once before giving up
     print("  [auto-ocr] probe failed for %s (%s) -> assuming scanned (OCR)"

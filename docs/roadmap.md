@@ -221,12 +221,37 @@ OCR path measures nothing, and a diagram-only digital PDF misroutes to OCR.
       to agree with, so it uses the independent detector alone — not
       circular, but over-wide, so a swept document reads slightly kinder than
       the same document at convert time.)*
-- [ ] Fix the OCR routing: area-weighted text-layer probe (a diagram-only
-      digital PDF must not trip full-doc OCR); when a thin text layer exists,
-      score the OCR output against it; record RapidOCR per-box confidence
-      (mean/min) so scans get *some* measured signal.
+- [x] Fix the OCR routing: area-weighted text-layer probe (a diagram-only
+      digital PDF must not trip full-doc OCR).
+      *(2026-09-26: `pdf_has_text_layer` now uses TWO signals. Clearing
+      `min_chars_per_page` in every window is digital on the spot and the
+      expensive step never runs; a THIN window is judged by the PDF's own
+      objects (`_page_raster_fracs`) — a page whose content is a raster
+      covering >= `scan_cover_min` needs OCR whatever text it also carries (a
+      scan with a burnt-in header stamp), while a page thin because it is
+      mostly vector art is digital. Measured: dataflow 79 chars/page and 12
+      vector paths, no raster -> digital; the scan 0 chars and a page-sized
+      raster on every page -> OCR; clock-spec unchanged. A missing pypdfium2
+      is NO evidence rather than evidence of absence, so it keeps the old
+      OCR verdict. `pdf/kestrel-dataflow.pdf` now converts through the
+      digital path and its real text layer is measured — but it stays XFAIL,
+      because the routing bug was not its only one: see below.)*
 - [ ] Extract figures on the OCR path (today: none — placeholders bail and
       the images gate degrades spuriously; also a hard prerequisite for M4).
+      *(2026-09-26, widened by measurement: the OCR path is no longer the only
+      gap. `pdf/kestrel-dataflow.pdf` now routes correctly to the DIGITAL path
+      and docling's layout model still finds no picture at all in a vector-only
+      page — 0 images, 0 headings, the whole document 19 tokens of the
+      diagram's labels on one line. A floor may have to come from the PDF's own
+      drawing clusters rather than from docling.)*
+
+- [ ] Stop `images.gate` reading `pass` over ZERO images. Found while fixing
+      the routing above: `pdf/kestrel-dataflow.pdf` reports
+      `images: {referenced: 0, ...}, gate: pass` and `status: ok` on a page
+      that is entirely a diagram nobody extracted. It is exactly the vacuity
+      the office lane already closed by carrying `n_source_tokens` — a gate
+      that cannot tell "all images fine" from "no images looked at" — and it is
+      what keeps that document's XFAIL alive.
 - [ ] Stress fixtures, before the features that fix them: hyphenation +
       ligature doc, per-page-varying footer ("Page 3 of 120"), non-dot-leader
       TOC, and a multi-column reading-order fixture (that one *encodes

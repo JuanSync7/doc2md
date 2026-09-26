@@ -153,8 +153,8 @@
   "coverage_gate": "pass",
   "images_gate": "pass",
   "md_contains": [
-   "## Slide 1 — Kestrel Platform Overview",
-   "## Slide 2 — Why a new interconnect",
+   "## Slide 1 \u2014 Kestrel Platform Overview",
+   "## Slide 2 \u2014 Why a new interconnect",
    "  - arbitration stalls the display pipe",
    "| display read | 40 | fabric team |",
    "### Speaker notes",
@@ -193,19 +193,19 @@
   "images_gate": "pass",
   "_note": "The deck's p:sldIdLst says 1,5,3,4,2 and its slide PARTS are unrenumbered -- what PowerPoint writes every time a user drags a slide. Sorting part names therefore publishes the order the slides were DRAFTED in. The TOKEN gate cannot see that -- it compares multisets, so the wrong order and the right one both measure recall 1.0 / n_source 135 -- and until P9.6 nothing else could either. Now structure_fidelity grades it: injecting the exact bug (the slide order read off the unqualified id attribute) moves block_sequence, heading_path and list_item_words, and the gate fails while recall stays at 1.0. The heading pins below are the second, human-readable half of that check.",
   "md_contains": [
-   "## Slide 1 — Kestrel bring-up sequence",
-   "## Slide 2 — Rollout plan",
-   "## Slide 3 — Silicon back",
-   "## Slide 4 — Board bring-up",
-   "## Slide 5 — Open questions",
+   "## Slide 1 \u2014 Kestrel bring-up sequence",
+   "## Slide 2 \u2014 Rollout plan",
+   "## Slide 3 \u2014 Silicon back",
+   "## Slide 4 \u2014 Board bring-up",
+   "## Slide 5 \u2014 Open questions",
    "- Step two of five in the bring-up sequence",
-   "## Slide 2 — Rollout plan\n\n- Step two of five in the bring-up sequence\n- Tape-in freeze at milestone three\n- Bring-up boards arrive two weeks later\n\n### Speaker notes\n\n2\\. Timing for the rollout slide\n\n- These notes belong to the rollout slide, which is part five and position two.",
+   "## Slide 2 \u2014 Rollout plan\n\n- Step two of five in the bring-up sequence\n- Tape-in freeze at milestone three\n- Bring-up boards arrive two weeks later\n\n### Speaker notes\n\n2\\. Timing for the rollout slide\n\n- These notes belong to the rollout slide, which is part five and position two.",
    "- 1\\. Reset, 2. clocks, 3. fabric traffic",
    "- \\+ 5% timing margin held across the clock tree"
   ],
   "md_not_contains": [
-   "## Slide 2 — Open questions",
-   "## Slide 5 — Rollout plan",
+   "## Slide 2 \u2014 Open questions",
+   "## Slide 5 \u2014 Rollout plan",
    "- 1. Reset, 2. clocks, 3. fabric traffic",
    "- + 5% timing margin held across the clock tree"
   ],
@@ -232,7 +232,7 @@
    "flattened_table_spans"
   ],
   "md_contains": [
-   "## Slide 1 — Kestrel adversarial deck",
+   "## Slide 1 \u2014 Kestrel adversarial deck",
    "| Corner | Owner |  |\n| --- | --- | --- |\n| Bring-up corners | fabric team |  |",
    "1. Reset the clock tree",
    "2. Release fabric traffic\n   - Skipped two levels: no sub-step exists above this",
@@ -240,8 +240,8 @@
    "[the fabric spec](https://nimbus.example/kestrel/fabric-spec)",
    "- Coverage closure is tracked per milestone\n\n  ![",
    "  - The plot above is the last six weekly regressions",
-   "## Slide 5 — Backup pricing",
-   "## Slide (unlisted): slide6 — Cut from the deck",
+   "## Slide 5 \u2014 Backup pricing",
+   "## Slide (unlisted): slide6 \u2014 Cut from the deck",
    "## Comments",
    "## Figures"
   ],
@@ -275,10 +275,10 @@
     "url": "https://nimbus-semi.example/kestrel/pdk-release-notes"
    }
   ],
-  "_note_links": "hyperlink measured to survive the soffice doc round-trip verbatim (text+url character-identical; also true for odt/rtf, probed on .doc as the binary representative). Observed on LibreOffice 6.4.7.2 — if a future soffice normalizes URLs (trailing slash, percent-encoding), this probe names the behavior change; adjust deliberately, never silently.",
+  "_note_links": "hyperlink measured to survive the soffice doc round-trip verbatim (text+url character-identical; also true for odt/rtf, probed on .doc as the binary representative). Observed on LibreOffice 6.4.7.2 \u2014 if a future soffice normalizes URLs (trailing slash, percent-encoding), this probe names the behavior change; adjust deliberately, never silently.",
   "structure_fidelity_compared_min": 11,
   "structure_fidelity_gate": "pass",
-  "_note_fidelity": "pass, not unmeasured: the LibreOffice pre-convert lands on .docx, and the gate follows the EFFECTIVE extension. So a binary .doc is graded structurally too — and the probe proves the round-trip through soffice preserves heading levels, list nesting and table geometry, not merely the words."
+  "_note_fidelity": "pass, not unmeasured: the LibreOffice pre-convert lands on .docx, and the gate follows the EFFECTIVE extension. So a binary .doc is graded structurally too \u2014 and the probe proves the round-trip through soffice preserves heading levels, list nesting and table geometry, not merely the words."
  },
  "legacy/kestrel-clock-spec.rtf": {
   "kind": "bundle",
@@ -396,21 +396,20 @@
    "Confidential"
   ],
   "structure_fidelity_gate": "unmeasured",
-  "_note_fidelity": "unmeasured, not best-effort: there is no second implementation that can read structure out of a PDF, so nothing was graded and the block says so. best-effort would imply a measurement was taken on a best-effort basis. Derived, not observed — the PDF lane needs DOC2MD_PDF_PYTHON, which the office CI job does not set; assemble_bundle with source_structure=None produces exactly this block by construction."
+  "_note_fidelity": "unmeasured, not best-effort: there is no second implementation that can read structure out of a PDF, so nothing was graded and the block says so. best-effort would imply a measurement was taken on a best-effort basis. Derived, not observed \u2014 the PDF lane needs DOC2MD_PDF_PYTHON, which the office CI job does not set; assemble_bundle with source_structure=None produces exactly this block by construction."
  },
  "pdf/kestrel-dataflow.pdf": {
-  "_note": "XFAIL, and the marker is the point: what this document does now is WORSE than what is pinned, in a way that makes the gates read BETTER. It is a DIGITAL diagram-only PDF whose text layer is under pdf_has_text_layer's min_chars_per_page threshold, so the lane misroutes it to OCR. Measured on the pinned toolchain: the whole document comes out as ONE line of 19 tokens, 0 headings, 0 images; docling detects no picture at all, so nothing bails, `images.gate` reads `pass` over zero images and `status` reads `ok`. That is a VACUOUS pass over a diagram that was never extracted. The keys below pin the older, HONEST outcome (degraded, with the bail warnings), which is what this lane must return to -- encoding today's `status: ok, images_gate: pass` would make the eval assert that a destroyed document is fine, which is the one thing it exists to refuse. Fixes, all M1: area-weighted text-layer probe so a diagram-only digital PDF does not trip full-doc OCR; score OCR output against the existing text layer when one exists; extract figures on the OCR path. When any of those lands this row XPASSes, which fails the eval and forces a deliberate re-encode.",
+  "_note": "XFAIL, and the marker is still the point: the ROUTING bug is fixed, the document is not. As of 2026-09-26 `pdf_has_text_layer` judges a thin window by the PDF's own objects, so this diagram-only DIGITAL page (79 chars/page, 12 vector paths, no raster) is no longer misrouted to full-document OCR -- it converts through the digital path and its real text layer is measured (`pdf-text-coverage`, token_recall 1.0 over 13 source tokens, absent 0). That part is now honest. What remains broken is the CONVERSION: docling's layout model finds no picture at all in a vector-only page, so nothing is extracted, `images.gate` reads `pass` over ZERO images, `content.headings` is 0, and the whole document is 19 tokens of the diagram's labels run together as one line. `status: ok` over that is a vacuous pass -- a recall of 1.0 against the 13 tokens the page happens to hold says nothing about the diagram nobody extracted. The keys below therefore pin what this lane MUST return: a document that admits it is degraded and names the figure it could not bring through. Encoding today's `status: ok, images_gate: pass` would make the eval assert that a destroyed document is fine, which is the one thing it exists to refuse. Remaining fixes, both M1: extract figures on a page whose content is vector art (docling's picture detection owns this, and a floor may have to come from the PDF's own drawing clusters); and stop `images.gate` reading `pass` over zero images, which is the same vacuity as a recall of 1.0 over no tokens. When either lands this row XPASSes, which fails the eval and forces a deliberate re-encode.",
   "xfail": true,
   "kind": "bundle",
   "requires": "pdf-lane",
   "lane": "pdf",
   "status": "degraded",
-  "losslessness_method": "pdf-ocr-transcription",
+  "losslessness_method": "pdf-text-coverage",
   "losslessness_gate": "best-effort",
   "images_gate": "degraded",
   "warning_codes": [
    "pdf_toolchain",
-   "ocr_transcription",
    "image_inline_bailed",
    "image_bytes_missing"
   ],
@@ -420,7 +419,7 @@
   "structure_fidelity_gate": "unmeasured"
  },
  "pdf/kestrel-clock-spec-scan.pdf": {
-  "_note": "Scanned (rasterized) PDF: honestly reported as OCR transcription, degraded. The degraded images gate is also truthful current behavior — TODO: the OCR path never extracts figure pixels, so every detected picture placeholder bails (image_inline_bailed + image_bytes_missing).",
+  "_note": "Scanned (rasterized) PDF: honestly reported as OCR transcription, degraded. The degraded images gate is also truthful current behavior \u2014 TODO: the OCR path never extracts figure pixels, so every detected picture placeholder bails (image_inline_bailed + image_bytes_missing).",
   "kind": "bundle",
   "requires": "pdf-lane",
   "lane": "pdf",
@@ -494,8 +493,8 @@
   "kind": "unsupported"
  },
  "office/kestrel-adversarial.docx": {
-  "_note": "The document written to BREAK a naive converter, and it has already earned its place: on first conversion it found a real list-nesting defect (a bullet sub-list under a numbered step, carrying a different w:numId, was promoted to top level) at token_recall 1.0 with structural_errors 0 — invisible to every gate that existed before structure_fidelity. Every probe below is a measured value from a passing run, not a wish.",
-  "_note_renumbering": "It then earned it again. The fixture now carries the five ways a procedure was silently renumbered — a screenshot inside step 2, a paragraph between two steps, a callout text box anchored in a step, a list declared to start at 5 (w:start), and numbering carried by a paragraph STYLE through w:basedOn — plus a table row that begins at grid column 1 (w:gridBefore) and a heading style only w:basedOn identifies. Every one of them used to convert wrong at token_recall 1.0 with structure_fidelity pass; the style-carried list was invisible to BOTH sides at once, which is why the gate agreed.",
+  "_note": "The document written to BREAK a naive converter, and it has already earned its place: on first conversion it found a real list-nesting defect (a bullet sub-list under a numbered step, carrying a different w:numId, was promoted to top level) at token_recall 1.0 with structural_errors 0 \u2014 invisible to every gate that existed before structure_fidelity. Every probe below is a measured value from a passing run, not a wish.",
+  "_note_renumbering": "It then earned it again. The fixture now carries the five ways a procedure was silently renumbered \u2014 a screenshot inside step 2, a paragraph between two steps, a callout text box anchored in a step, a list declared to start at 5 (w:start), and numbering carried by a paragraph STYLE through w:basedOn \u2014 plus a table row that begins at grid column 1 (w:gridBefore) and a heading style only w:basedOn identifies. Every one of them used to convert wrong at token_recall 1.0 with structure_fidelity pass; the style-carried list was invisible to BOTH sides at once, which is why the gate agreed.",
   "kind": "bundle",
   "lane": "office",
   "status": "ok",
