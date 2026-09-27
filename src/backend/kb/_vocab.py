@@ -160,6 +160,14 @@ class Vocabulary(object):
         Without this, every entry in a group that omits ``type`` is silently
         unchecked — which is exactly how 15 of 30 entities in the worked example
         escaped validation.
+
+        RAISES ``VocabularyError`` when the vocabulary declares no ``entity_types``
+        at all, and that is deliberate rather than an oversight: `_lint` catches it
+        to report `vocab-missing` — "this term list could not be consulted" — which
+        is a different finding from "this group is not registered", and blaming the
+        DOCUMENT for a vocabulary gap would send someone to edit the wrong file.
+        Callers that must not abort (the accept path) check `has("entity_types")`
+        first.
         """
         return (self._node("entity_types").get("group_types") or {}).get(group, "")
 

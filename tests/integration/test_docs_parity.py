@@ -570,7 +570,7 @@ def test_the_documented_knowledge_payload_is_one_the_writer_would_accept():
     """
     import sys
     sys.path.insert(0, os.path.join(REPO, "src"))
-    from backend.kb import accept_model_meta, load_vocab
+    from backend.kb import accept_model_meta, load_vocab, PROVENANCE_KEY
 
     doc = _read(os.path.join(REPO, "docs", "design", "output-contract.md"))
     block = re.search(r"## `knowledge\.json`.*?```json\n(.*?)```", doc, re.S)
@@ -587,6 +587,19 @@ def test_the_documented_knowledge_payload_is_one_the_writer_would_accept():
 
     concrete = dict((f, [r for r in v if not _elided(r)])
                     for f, v in payload.items() if isinstance(v, list))
+    # GROUPED fields (`entities`, `links`) come through too, and not as decoration:
+    # a relation's `s`/`o` must name an entity the same payload declares, so a check
+    # that dropped the dict-valued fields could never validate a sample whose
+    # records reference each other — it would report every documented edge as an
+    # endpoint naming nothing, which is a fact about the check, not about the doc.
+    for f, v in payload.items():
+        if not isinstance(v, dict) or f == PROVENANCE_KEY:
+            continue
+        groups = dict((g, [r for r in members if not _elided(r)])
+                      for g, members in v.items() if isinstance(members, list))
+        groups = dict((g, members) for g, members in groups.items() if members)
+        if groups:
+            concrete[f] = groups
     concrete = dict((f, v) for f, v in concrete.items() if v)
     assert concrete, (
         "every record in the documented sample is elided, so the sample makes no "
@@ -594,10 +607,12 @@ def test_the_documented_knowledge_payload_is_one_the_writer_would_accept():
 
     anchors = set()
     for recs in concrete.values():
-        for rec in recs:
-            ref = rec.get("ref") if isinstance(rec, dict) else None
-            if isinstance(ref, str) and ref.startswith("#"):
-                anchors.add(ref[1:])
+        groups = recs.values() if isinstance(recs, dict) else [recs]
+        for members in groups:
+            for rec in members:
+                ref = rec.get("ref") if isinstance(rec, dict) else None
+                if isinstance(ref, str) and ref.startswith("#"):
+                    anchors.add(ref[1:])
 
     verdict = accept_model_meta(concrete, load_vocab(), anchors=anchors)
     assert not verdict["rejected"], (
