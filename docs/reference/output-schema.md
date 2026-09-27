@@ -419,10 +419,31 @@ markup*, which is not a "before" any consumer would have shipped downstream.
 
 ### `images{}` — the pixel-side gate
 
-`referenced` (body `![](images/…)` links, the ground truth), `unique_files`,
-`extracted`, `missing`, `orphans`, `orphans_removed`, `verified` (files re-hashed
-from disk whose `sha16` matches their own name), `gate` (`pass` \| `degraded`). A
-degraded gate degrades `status` but never fails losslessness.
+`referenced` (body `![](images/…)` links), `unique_files`, `extracted`, `missing`,
+`orphans`, `orphans_removed`, `verified` (files re-hashed from disk whose `sha16`
+matches their own name), `source_images`, `gate` (`pass` \| `degraded` \|
+`unmeasured`). A `degraded` gate degrades `status` but never fails losslessness;
+`unmeasured` degrades nothing, because it is a statement about the measurement and
+not about the document.
+
+`source_images` is **the denominator**, and it is the same fix `n_source_tokens` was
+for the text gate: how many body pictures the source is *known* to hold, counted
+converter-blind, or `null` when this lane cannot count them. Without it the block
+could only compare the markdown with itself — so on a PDF page that is entirely a
+vector diagram and converted to zero images, no reference was made, therefore no
+reference failed, therefore `gate: pass` and `status: ok` over a figure nobody
+extracted. With `source_images` unknown *and* nothing referenced, the gate reads
+`unmeasured` rather than claiming a pass over nothing. An **excess** is never loss
+(one source picture can be referenced twice and dedupe to one file), so only a
+shortfall degrades.
+
+Today the PDF lane supplies it on the digital path, from a lower bound over the
+PDF's own drawing objects (`drawn_image_floor`): at most one per page, because five
+boxes of one diagram are one figure and a floor that counted parts would accuse a
+correct conversion. The OCR path and the office lane supply `null` — the office
+lane's only available count comes from the converter's own sentinels, which would
+be circular, so `unmeasured` is the honest reading until a converter-blind picture
+count exists (see `docs/roadmap.md`).
 
 `orphans` is what **remains** after the per-build sweep, so a non-zero value means
 the GC itself failed and the gate says so; `orphans_removed` is how many it took

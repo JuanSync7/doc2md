@@ -39,6 +39,7 @@ from backend.ingest import (doc_id, gate_figures, caption_is_useful,
                             char_ngram_recall, html_to_text, strip_running_lines,
                             words_in_bbox, tokenize, recommend_shards, order_todo,
                             load_source_root, merge_boxes, intersect_boxes,
+                            drawn_image_floor,
                             summarize_routes, normalize_accept, unknown_formats,
                             supported_formats, ROUTE_DOCLING, ROUTE_OOXML,
                             ROUTE_LIBREOFFICE, ROUTE_PASSTHROUGH, ROUTE_FENCE)
@@ -180,6 +181,78 @@ def _window_cpp(path, first, last, timeout=60):
     out = r.stdout.decode("utf-8", "replace")
     pages_read = max(1, out.count("\f"))   # form-feed separates pages
     return len(out.replace("\f", "").strip()) / float(pages_read)
+
+
+def _pdf_drawn_area_fracs(path):
+    """``{page_no: fraction of the page covered by DRAWN objects}``, frames excluded.
+
+    Feeds `drawn_image_floor` — the denominator `images.gate` needs to tell "every
+    picture came through" from "nobody looked for one". Reads the PDF's own objects,
+    so it is converter-blind: docling's opinion about what is a picture plays no part.
+
+    Clusters are merged before summing, or the two paths of one rounded rectangle
+    would count their overlap twice. Page frames and backgrounds (at or above
+    ``image_region_max_frac``) are dropped first: a full-page white rect is not a
+    figure, and left in it would make every page look like one. ``{}`` when
+    pypdfium2 is unavailable, which the caller must treat as "could not count"."""
+    c = _cfg()
+    try:
+        import ctypes
+        import pypdfium2 as pdfium
+        import pypdfium2.raw as pdfium_c
+    except Exception:
+        return {}
+    try:
+        pdf = pdfium.PdfDocument(path)
+    except Exception:
+        return {}
+    out = {}
+    try:
+        for pg_no in range(len(pdf)):
+            try:
+                page = pdf[pg_no]
+                w, h = page.get_size()
+                if w <= 0 or h <= 0:
+                    continue
+                boxes = []
+                for obj in page.get_objects(max_depth=4):
+                    if obj.type not in (pdfium_c.FPDF_PAGEOBJ_PATH,
+                                        pdfium_c.FPDF_PAGEOBJ_IMAGE):
+                        continue
+                    l = ctypes.c_float()
+                    b = ctypes.c_float()
+                    r = ctypes.c_float()
+                    t = ctypes.c_float()
+                    if not pdfium_c.FPDFPageObj_GetBounds(obj.raw, l, b, r, t):
+                        continue
+                    box = (max(0.0, l.value / w), max(0.0, (h - t.value) / h),
+                           min(1.0, r.value / w), min(1.0, (h - b.value) / h))
+                    if (box[2] - box[0]) * (box[3] - box[1]) >= c.image_region_max_frac:
+                        continue                      # page frame / background
+                    boxes.append(box)
+                total = 0.0
+                for box, _n in merge_boxes(boxes, pad=c.image_region_pad):
+                    total += (box[2] - box[0]) * (box[3] - box[1])
+                out[pg_no + 1] = total
+            except Exception:
+                continue
+    finally:
+        try:
+            pdf.close()
+        except Exception:
+            pass
+    return out
+
+
+def _pdf_source_image_floor(path):
+    """Lower bound on the figures a PDF holds, or ``None`` when it cannot be counted.
+
+    ``None`` is not zero: it makes `images.gate` read `unmeasured` instead of
+    claiming a pass over nothing."""
+    fracs = _pdf_drawn_area_fracs(path)
+    if not fracs:
+        return None
+    return drawn_image_floor(fracs)
 
 
 def _page_raster_fracs(path):

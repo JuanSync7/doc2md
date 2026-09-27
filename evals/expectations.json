@@ -72,7 +72,7 @@
   "n_source_tokens_min": 26,
   "coverage_gate": "pass",
   "has_toc": false,
-  "images_gate": "pass",
+  "images_gate": "unmeasured",
   "images_referenced": 0,
   "md_contains": [
    "# Kestrel bring-up quick notes",
@@ -80,7 +80,8 @@
   ],
   "savings_ratio_min": 10.0,
   "structure_fidelity_compared_min": 3,
-  "structure_fidelity_gate": "pass"
+  "structure_fidelity_gate": "pass",
+  "_note": "`images_gate` reads `unmeasured` rather than `pass`, and that is a RATCHET, not a regression: this document carries no images and nothing in the office lane has ever verified that claim. The old `pass` compared the markdown with itself -- no reference was made, so no reference failed -- the same vacuity `n_source_tokens` closed for the text gate, and it read `pass` on a PDF page that was entirely a diagram nobody extracted. `images.source_images` is the denominator now; the office lane cannot supply it yet because its only available count comes from the converter's own sentinels, which would be circular. `unmeasured` degrades nothing and this row flips back to `pass` when a converter-blind picture count lands (docs/roadmap.md)."
  },
  "office/kestrel-adversarial.xlsx": {
   "kind": "bundle",
@@ -90,7 +91,7 @@
   "token_recall_min": 1.0,
   "n_source_tokens_min": 51,
   "coverage_gate": "pass",
-  "images_gate": "pass",
+  "images_gate": "unmeasured",
   "images_referenced": 0,
   "structure_fidelity_gate": "pass",
   "structure_fidelity_compared_min": 6,
@@ -113,7 +114,7 @@
    "SUM(B2:B3)",
    "2026-01-05"
   ],
-  "_note": "The workbook written to make every xlsx policy drop GRADEABLE on a real document. Each md_contains line is a measured loss the gate lets through as policy and a warning names: 46027 is 2026-01-05 held as an Excel serial (unformatted_cell_values); the sparse row renders as |  |  | 0.990 | because the value's ADDRESS is C and nothing counts <c> elements to place it; | Total | 316.25 | publishes a cached result whose =SUM(B2:B3) is gone (dropped_cell_formulas); | Worst |  | is a formula whose cached value was never written, so BOTH halves of the token gate read empty and recall is a vacuous 1.0 over a total that vanished -- the warning is the only receipt. '## Scratch' is a hidden sheet published as a peer of the real ones (hidden_content_published). md_not_contains pins the two losses as losses: neither the expression nor the formatted date is anywhere in the body."
+  "_note": "The workbook written to make every xlsx policy drop GRADEABLE on a real document. Each md_contains line is a measured loss the gate lets through as policy and a warning names: 46027 is 2026-01-05 held as an Excel serial (unformatted_cell_values); the sparse row renders as |  |  | 0.990 | because the value's ADDRESS is C and nothing counts <c> elements to place it; | Total | 316.25 | publishes a cached result whose =SUM(B2:B3) is gone (dropped_cell_formulas); | Worst |  | is a formula whose cached value was never written, so BOTH halves of the token gate read empty and recall is a vacuous 1.0 over a total that vanished -- the warning is the only receipt. '## Scratch' is a hidden sheet published as a peer of the real ones (hidden_content_published). md_not_contains pins the two losses as losses: neither the expression nor the formatted date is anywhere in the body. `images_gate` reads `unmeasured` rather than `pass`, and that is a RATCHET, not a regression: this document carries no images and nothing in the office lane has ever verified that claim. The old `pass` compared the markdown with itself -- no reference was made, so no reference failed -- the same vacuity `n_source_tokens` closed for the text gate, and it read `pass` on a PDF page that was entirely a diagram nobody extracted. `images.source_images` is the denominator now; the office lane cannot supply it yet because its only available count comes from the converter's own sentinels, which would be circular. `unmeasured` degrades nothing and this row flips back to `pass` when a converter-blind picture count lands (docs/roadmap.md)."
  },
  "office/kestrel-registers.xlsx": {
   "kind": "bundle",
@@ -123,7 +124,7 @@
   "token_recall_min": 1.0,
   "n_source_tokens_min": 107,
   "coverage_gate": "pass",
-  "images_gate": "pass",
+  "images_gate": "unmeasured",
   "images_referenced": 0,
   "md_contains": [
    "## RegisterMap",
@@ -141,7 +142,7 @@
   ],
   "structure_fidelity_gate": "pass",
   "structure_fidelity_compared_min": 4,
-  "_note": "P9.4 flipped this from 'unmeasured'. `compared` is pinned because the gate word alone is not a measurement: the workbook exhibits headings, heading_path, tables and block_sequence. strong/em/strike/links stay in structure_fidelity.unmeasured -- the ground truth OMITS them rather than stating zero, because a zero would certify a drop the converter really makes, and dropped_cell_emphasis counts it instead."
+  "_note": "P9.4 flipped this from 'unmeasured'. `compared` is pinned because the gate word alone is not a measurement: the workbook exhibits headings, heading_path, tables and block_sequence. strong/em/strike/links stay in structure_fidelity.unmeasured -- the ground truth OMITS them rather than stating zero, because a zero would certify a drop the converter really makes, and dropped_cell_emphasis counts it instead. `images_gate` reads `unmeasured` rather than `pass`, and that is a RATCHET, not a regression: this document carries no images and nothing in the office lane has ever verified that claim. The old `pass` compared the markdown with itself -- no reference was made, so no reference failed -- the same vacuity `n_source_tokens` closed for the text gate, and it read `pass` on a PDF page that was entirely a diagram nobody extracted. `images.source_images` is the denominator now; the office lane cannot supply it yet because its only available count comes from the converter's own sentinels, which would be circular. `unmeasured` degrades nothing and this row flips back to `pass` when a converter-blind picture count lands (docs/roadmap.md)."
  },
  "office/kestrel-overview.pptx": {
   "kind": "bundle",
@@ -151,7 +152,7 @@
   "token_recall_min": 1.0,
   "n_source_tokens_min": 108,
   "coverage_gate": "pass",
-  "images_gate": "pass",
+  "images_gate": "unmeasured",
   "md_contains": [
    "## Slide 1 \u2014 Kestrel Platform Overview",
    "## Slide 2 \u2014 Why a new interconnect",
@@ -162,7 +163,8 @@
    "- sensor front end"
   ],
   "structure_fidelity_gate": "pass",
-  "structure_fidelity_compared_min": 7
+  "structure_fidelity_compared_min": 7,
+  "_note": "`images_gate` reads `unmeasured` rather than `pass`, and that is a RATCHET, not a regression: this document carries no images and nothing in the office lane has ever verified that claim. The old `pass` compared the markdown with itself -- no reference was made, so no reference failed -- the same vacuity `n_source_tokens` closed for the text gate, and it read `pass` on a PDF page that was entirely a diagram nobody extracted. `images.source_images` is the denominator now; the office lane cannot supply it yet because its only available count comes from the converter's own sentinels, which would be circular. `unmeasured` degrades nothing and this row flips back to `pass` when a converter-blind picture count lands (docs/roadmap.md)."
  },
  "office/kestrel-dataflow.pptx": {
   "kind": "bundle",
@@ -190,8 +192,8 @@
   "token_recall_min": 1.0,
   "n_source_tokens_min": 150,
   "coverage_gate": "pass",
-  "images_gate": "pass",
-  "_note": "The deck's p:sldIdLst says 1,5,3,4,2 and its slide PARTS are unrenumbered -- what PowerPoint writes every time a user drags a slide. Sorting part names therefore publishes the order the slides were DRAFTED in. The TOKEN gate cannot see that -- it compares multisets, so the wrong order and the right one both measure recall 1.0 / n_source 135 -- and until P9.6 nothing else could either. Now structure_fidelity grades it: injecting the exact bug (the slide order read off the unqualified id attribute) moves block_sequence, heading_path and list_item_words, and the gate fails while recall stays at 1.0. The heading pins below are the second, human-readable half of that check.",
+  "images_gate": "unmeasured",
+  "_note": "The deck's p:sldIdLst says 1,5,3,4,2 and its slide PARTS are unrenumbered -- what PowerPoint writes every time a user drags a slide. Sorting part names therefore publishes the order the slides were DRAFTED in. The TOKEN gate cannot see that -- it compares multisets, so the wrong order and the right one both measure recall 1.0 / n_source 135 -- and until P9.6 nothing else could either. Now structure_fidelity grades it: injecting the exact bug (the slide order read off the unqualified id attribute) moves block_sequence, heading_path and list_item_words, and the gate fails while recall stays at 1.0. The heading pins below are the second, human-readable half of that check. `images_gate` reads `unmeasured` rather than `pass`, and that is a RATCHET, not a regression: this document carries no images and nothing in the office lane has ever verified that claim. The old `pass` compared the markdown with itself -- no reference was made, so no reference failed -- the same vacuity `n_source_tokens` closed for the text gate, and it read `pass` on a PDF page that was entirely a diagram nobody extracted. `images.source_images` is the denominator now; the office lane cannot supply it yet because its only available count comes from the converter's own sentinels, which would be circular. `unmeasured` degrades nothing and this row flips back to `pass` when a converter-blind picture count lands (docs/roadmap.md).",
   "md_contains": [
    "## Slide 1 \u2014 Kestrel bring-up sequence",
    "## Slide 2 \u2014 Rollout plan",

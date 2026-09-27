@@ -612,9 +612,12 @@ def build_one(row, soffice, out_root, run_id, token_count=None, token_model=None
     im = rep["images"]
     # `orphans` is what REMAINS after the sweep (the gate's question); `orphans_removed`
     # is how many it took out (the dashboard's question). One number cannot answer both.
+    # `source_images` carried forward from the assembler's block — a rebuild that
+    # dropped it would silently turn a measured denominator back into `unmeasured`.
     rep["images"] = image_report(im["referenced"], im["extracted"], im["unique_files"],
-                                 im["missing"], 0, verified, removed)
-    if rep["images"]["gate"] != "pass" and rep["status"] == "ok":
+                                 im["missing"], 0, verified, removed,
+                                 source_images=im.get("source_images"))
+    if rep["images"]["gate"] == "degraded" and rep["status"] == "ok":
         rep["status"] = "degraded"
 
     # Referenced pictures that never attached to a heading section cannot be captioned

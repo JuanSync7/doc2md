@@ -245,13 +245,39 @@ OCR path measures nothing, and a diagram-only digital PDF misroutes to OCR.
       diagram's labels on one line. A floor may have to come from the PDF's own
       drawing clusters rather than from docling.)*
 
-- [ ] Stop `images.gate` reading `pass` over ZERO images. Found while fixing
-      the routing above: `pdf/kestrel-dataflow.pdf` reports
-      `images: {referenced: 0, ...}, gate: pass` and `status: ok` on a page
-      that is entirely a diagram nobody extracted. It is exactly the vacuity
-      the office lane already closed by carrying `n_source_tokens` — a gate
-      that cannot tell "all images fine" from "no images looked at" — and it is
-      what keeps that document's XFAIL alive.
+- [x] Stop `images.gate` reading `pass` over ZERO images.
+      *(2026-09-27: `images.source_images` is the denominator, and the gate has
+      three states like the losslessness one — source known to hold 0 is
+      `pass`, known to hold more than arrived is `degraded`, unknown is
+      `unmeasured` and degrades nothing. An EXCESS is never loss, since one
+      picture can be referenced twice and dedupe to one file. The PDF lane
+      supplies it on the digital path from `drawn_image_floor` over the PDF's
+      own drawing objects — a LOWER bound, at most one per page, because the
+      dataflow diagram is five two-path rectangles and a floor that counted
+      parts would accuse a correct conversion. `pdf/kestrel-dataflow.pdf` now
+      reads `source_images: 1, gate: degraded, status: degraded`. Its exclusion
+      detector could not supply this: at `image_region_min_paths` 10 every one
+      of those clusters is rejected, correctly, because a two-path cluster must
+      not EXCUSE text sitting over it — counting figures is a weaker question
+      than excusing text and gets a weaker threshold (area >= 5% of a page).)*
+
+- [ ] Give the OFFICE lane a converter-blind picture count. Eight office
+      documents now read `images.gate: unmeasured` because their only
+      available count comes from `ooxml_image_parts`, which reads the
+      CONVERTER's own sentinels — circular, so it cannot be the denominator. A
+      raw `word/media/*` count is not it either: it includes header, footer and
+      theme images the converter deliberately drops, so it would report loss on
+      a correct conversion. The honest count is body-part `<a:blip>` /
+      `<pic:pic>` references taken from the source XML on the ground-truth
+      side. Until then `unmeasured` is the truthful reading and degrades
+      nothing; five eval rows carry a `_note` saying so.
+
+- [ ] Count a scanned page's raster as a figure. `_pdf_drawn_area_fracs` drops
+      page-covering objects as frames, so a scan reads 0 drawn area — right for
+      a white background rect, wrong for the page image that IS the content. The
+      OCR path therefore passes `None` rather than a floor of 0, so it reads
+      `unmeasured` instead of claiming the source held no pictures. Closes
+      together with "extract figures on the OCR path".
 - [ ] Stress fixtures, before the features that fix them: hyphenation +
       ligature doc, per-page-varying footer ("Page 3 of 120"), non-dot-leader
       TOC, and a multi-column reading-order fixture (that one *encodes

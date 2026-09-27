@@ -333,6 +333,18 @@ def build_one(row, conv, ocr_conv, ocr_mode, out_root, run_id, cfg,
               "image_files": len(assets), "images_missing": n_missing,
               "captions_enabled": captions_enabled,
               "image_meta": bb.image_meta_of(assets.items())}
+    # THE DENOMINATOR for `images.gate`, counted from the PDF's own drawing objects
+    # so docling's opinion about what is a picture plays no part. Without it that
+    # gate could only compare the markdown with itself: `pdf/kestrel-dataflow.pdf`
+    # is a page of vector art that converted to zero images, and because no
+    # reference was made no reference failed, so the gate read `pass`.
+    #
+    # Only on the DIGITAL path. The OCR path extracts no figures at all yet, and a
+    # scanned page's raster is dropped as a page-covering background, so a floor
+    # there would read 0 and turn "we do not do this yet" into a claim that the
+    # source held nothing. `None` keeps it `unmeasured`, which is the truth.
+    if lane == "pdf" and not use_ocr:
+        extras["source_images"] = dc._pdf_source_image_floor(row["src"])
     t1 = time.time()
     bundle = assemble_bundle(
         doc_id=row["id"], source_relpath=row["rel"], source_format=row["ext"],
@@ -370,10 +382,14 @@ def build_one(row, conv, ocr_conv, ocr_mode, out_root, run_id, cfg,
             {"code": "orphan_images_removed",
              "detail": "%d stale image file(s) removed on rebuild" % removed})
     im = rep["images"]
+    # `source_images` is carried FORWARD from the assembler's block. A rebuild that
+    # dropped it would silently turn a measured denominator back into `unmeasured`,
+    # which is exactly the vacuity this field exists to close — and it reads as a
+    # gate that simply has nothing to say, so nothing would have flagged it.
     rep["images"] = image_report(im["referenced"], im["extracted"],
                                  im["unique_files"], im["missing"], 0, verified,
-                                 removed)
-    if rep["images"]["gate"] != "pass" and rep["status"] == "ok":
+                                 removed, source_images=im.get("source_images"))
+    if rep["images"]["gate"] == "degraded" and rep["status"] == "ok":
         rep["status"] = "degraded"
 
     attached = bb._count_outline_images(bundle["structure"])

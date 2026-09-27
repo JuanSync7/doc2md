@@ -530,3 +530,57 @@ def test_it_is_symmetric_and_empty_on_nothing():
     a, b = [(1, 0.1, 0.1, 0.5, 0.5)], [(1, 0.2, 0.2, 0.6, 0.6)]
     assert intersect_boxes(a, b) == intersect_boxes(b, a)
     assert intersect_boxes([], []) == []
+
+
+# ================================ a floor for "the source held a picture" (M1)
+#
+# `images.gate` read `pass` over ZERO images on `pdf/kestrel-dataflow.pdf`, a page
+# that is entirely a vector diagram. The block had no denominator, so it could only
+# compare the markdown with itself: no reference was made, so no reference failed.
+#
+# The exclusion detector cannot supply that denominator. Measured on that page, the
+# diagram is five separate rounded rectangles of two paths each, so every cluster
+# falls under `image_region_min_paths` (10) — correctly, because a two-path cluster
+# must not be allowed to EXCUSE text sitting over it. Counting figures is a weaker
+# question than excusing text, and it deserves a weaker threshold.
+#
+# So this answers "does this page hold drawn content the conversion should have
+# represented?" by AREA, and returns a LOWER BOUND — at most one per page, because
+# five boxes of one diagram are one figure, not five, and over-counting would report
+# loss on a document that lost nothing.
+
+def test_a_page_of_vector_art_with_no_image_is_a_floor_of_one():
+    """The measured dataflow page: five clusters of ~0.039 each, ~19% of the page."""
+    from backend.ingest import drawn_image_floor
+    assert drawn_image_floor({1: 0.19}, min_frac=0.05) == 1
+
+
+def test_a_page_with_a_stray_rule_is_not_a_figure():
+    """A table's ruling line or an underline covers almost nothing. Counting it would
+    report a missing image on every document with a horizontal rule in it."""
+    from backend.ingest import drawn_image_floor
+    assert drawn_image_floor({1: 0.004}, min_frac=0.05) == 0
+
+
+def test_each_page_contributes_at_most_one():
+    """A LOWER bound, deliberately. One diagram drawn as five boxes is one figure;
+    a floor that counted parts would degrade a document that emitted the figure
+    correctly, which is the opposite of the failure this exists to catch."""
+    from backend.ingest import drawn_image_floor
+    assert drawn_image_floor({1: 0.9, 2: 0.42, 3: 0.0}, min_frac=0.05) == 2
+
+
+def test_nothing_drawn_is_a_stated_zero_not_an_absence():
+    """`0` here is a claim — "this source holds no drawn content" — and it is what
+    lets `images.gate` say `pass` honestly instead of `unmeasured`."""
+    from backend.ingest import drawn_image_floor
+    assert drawn_image_floor({1: 0.0, 2: 0.0}, min_frac=0.05) == 0
+    assert drawn_image_floor({}, min_frac=0.05) == 0
+
+
+def test_a_page_covering_background_has_already_been_excluded_by_the_caller():
+    """The caller drops page-frame objects before summing, so a fraction at or above
+    1.0 can only mean genuinely drawn content and is clamped rather than treated as
+    an error — this function never sees the object list and must not pretend to."""
+    from backend.ingest import drawn_image_floor
+    assert drawn_image_floor({1: 1.4}, min_frac=0.05) == 1

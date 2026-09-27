@@ -23,7 +23,8 @@ from collections import Counter, namedtuple
 
 __all__ = ["tokenize", "normalize_pdf_text", "coverage", "CoverageReport", "is_lossy", "is_lossy_explained",
            "char_ngram_recall", "html_to_text", "strip_running_lines", "words_in_bbox",
-           "explain_gap", "GapReport", "merge_boxes", "intersect_boxes"]
+           "explain_gap", "GapReport", "merge_boxes", "intersect_boxes",
+           "drawn_image_floor"]
 
 # recall  : n_covered / n_source in [0, 1] (1.0 when the source has no tokens)
 # n_source: total source tokens (multiset size)
@@ -187,6 +188,40 @@ def merge_boxes(boxes, pad=0.01):
                 out.append((box, n))
         clusters = out
     return clusters
+
+
+def drawn_image_floor(page_drawn_frac, min_frac=0.05):
+    # type: (dict, float) -> int
+    """A LOWER BOUND on how many figures a paginated source holds, by drawn area.
+
+    ``page_drawn_frac`` maps page number to the fraction of that page covered by
+    drawn objects, with page frames and backgrounds already removed by the caller
+    (this function never sees the object list and must not pretend to). A page whose
+    drawn area reaches ``min_frac`` contributes ONE.
+
+    THE DENOMINATOR `images.gate` was missing. Without it that gate compared the
+    markdown with itself, so on `pdf/kestrel-dataflow.pdf` — a page that is entirely
+    a vector diagram, converted to 19 tokens and zero images — no reference was made,
+    therefore no reference failed, therefore `gate: pass` and `status: ok`.
+
+    Deliberately NOT the exclusion detector's answer. Measured on that page the
+    diagram is five separate rounded rectangles of two paths each, so every cluster
+    falls under ``image_region_min_paths`` — correctly, because a two-path cluster
+    must not be allowed to EXCUSE text sitting over it. Counting figures is a weaker
+    question than excusing text and deserves a weaker threshold.
+
+    At most ONE per page, on purpose. Five boxes of one diagram are one figure, and a
+    floor that counted parts would report loss on a document that emitted its figure
+    correctly — the opposite of the failure this exists to catch. A lower bound can
+    only ever accuse a conversion of missing something it really did miss."""
+    n = 0
+    for _page, frac in (page_drawn_frac or {}).items():
+        try:
+            if float(frac) >= min_frac:
+                n += 1
+        except (TypeError, ValueError):
+            continue
+    return n
 
 
 def intersect_boxes(claimed, evidence):

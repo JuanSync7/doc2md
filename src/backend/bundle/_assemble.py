@@ -96,7 +96,14 @@ def _images_block(body_md, extras):
     missing = int(ex.get("images_missing", 0))
     orphans = int(ex.get("image_orphans", 0))
     verified = int(ex.get("image_verified", unique_files))
-    return image_report(referenced, extracted, unique_files, missing, orphans, verified)
+    # THE DENOMINATOR, when the writer could count it converter-blind. Absent, the
+    # block says `unmeasured` rather than claiming a pass over nothing — see
+    # `validate.image_report`.
+    source_images = ex.get("source_images")
+    if source_images is not None:
+        source_images = int(source_images)
+    return image_report(referenced, extracted, unique_files, missing, orphans,
+                        verified, source_images=source_images)
 
 
 def _captions_block(images_block, extras):
@@ -249,7 +256,7 @@ def assemble_bundle(doc_id, source_relpath, source_format, lane,
     # A degraded image gate (missing/corrupt/orphaned pixels) is a real loss the
     # token-recall gate cannot see, so it DEGRADES a document that would otherwise be
     # ``ok`` — but it never promotes a ``failed`` doc, and never touches losslessness.
-    if images["gate"] != "pass" and report["status"] == "ok":
+    if images["gate"] == "degraded" and report["status"] == "ok":
         report["status"] = "degraded"
 
     # Same for outline coverage: content lines outside every outline node are a

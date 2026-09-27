@@ -321,3 +321,82 @@ def test_savings_report_empty_edges_never_divide_by_zero():
     # reports a 0 ratio rather than raising.
     b = savings_report(5000, 0)
     assert b["reduction_ratio"] == 0.0
+
+
+# ================================ a pass over nothing is not a pass
+#
+# Found on `pdf/kestrel-dataflow.pdf`: a page that is entirely a vector diagram
+# converted to 19 tokens and ZERO images, and the block read
+# `{referenced: 0, extracted: 0, missing: 0, ...}, gate: pass` — so `status` read
+# `ok` on a document whose only real content was never extracted.
+#
+# It is exactly the vacuity the office text gate already closed by carrying
+# `n_source_tokens`: with no denominator, a gate cannot tell "every image came
+# through" from "nobody looked for one". Three states, not two, and they mirror the
+# losslessness vocabulary this repo already uses:
+#
+#   source known to hold 0   -> `pass`        an honest claim about the document
+#   source known to hold >0  -> `degraded`    something was there and is not here
+#   source count unknown     -> `unmeasured`  a claim about nobody having looked
+
+def test_a_document_with_no_images_and_a_source_that_had_none_still_passes():
+    """The common case must stay cheap and green: a prose document genuinely has no
+    pictures, and saying so is a claim about the document."""
+    b = image_report(referenced=0, extracted=0, unique_files=0, missing=0,
+                     orphans=0, verified=0, source_images=0)
+    assert b["gate"] == "pass" and b["source_images"] == 0
+
+
+def test_zero_images_out_of_a_source_that_had_some_is_degraded():
+    """The dataflow case. Nothing is `missing` by the old definition — no reference
+    was made, so no reference failed — which is precisely why the old gate passed."""
+    b = image_report(referenced=0, extracted=0, unique_files=0, missing=0,
+                     orphans=0, verified=0, source_images=1)
+    assert b["gate"] == "degraded"
+
+
+def test_fewer_images_than_the_source_held_is_degraded_even_when_all_resolved():
+    """Every reference resolving is not the same as every picture arriving. The old
+    block could only compare the markdown against itself."""
+    b = image_report(referenced=2, extracted=2, unique_files=2, missing=0,
+                     orphans=0, verified=2, source_images=5)
+    assert b["gate"] == "degraded"
+
+
+def test_an_unknown_source_count_reads_unmeasured_rather_than_pass():
+    """A lane with no converter-blind way to count the source's pictures must not
+    claim a pass. `unmeasured` is the same word the fidelity gate uses for the same
+    reason, and it does NOT degrade a document — it says nobody could tell."""
+    b = image_report(referenced=0, extracted=0, unique_files=0, missing=0,
+                     orphans=0, verified=0)
+    assert b["gate"] == "unmeasured"
+    assert b["source_images"] is None
+
+
+def test_an_unknown_source_count_still_reports_a_real_defect():
+    """`unmeasured` is about the DENOMINATOR. A picture that was referenced and
+    whose bytes went missing is a defect either way, and must not be softened into
+    "we could not tell"."""
+    b = image_report(referenced=3, extracted=2, unique_files=3, missing=1,
+                     orphans=0, verified=3)
+    assert b["gate"] == "degraded"
+
+
+def test_more_images_than_the_source_held_is_not_a_defect():
+    """One source picture can legitimately be emitted twice (a logo reused in two
+    sections dedupes to one file but two references), so an excess is not loss and
+    must not be reported as one."""
+    b = image_report(referenced=3, extracted=3, unique_files=1, missing=0,
+                     orphans=0, verified=1, source_images=1)
+    assert b["gate"] == "pass"
+
+
+def test_the_denominator_is_stated_in_the_block():
+    """Stated on every document, like `n_source_tokens`: a reader can only judge
+    `referenced: 0` against what the source held, and an absent key is a claim about
+    nobody having looked that reads identically to a zero."""
+    b = image_report(referenced=1, extracted=1, unique_files=1, missing=0,
+                     orphans=0, verified=1, source_images=1)
+    assert list(b) == ["referenced", "unique_files", "extracted", "missing",
+                       "orphans", "orphans_removed", "verified", "source_images",
+                       "gate"]

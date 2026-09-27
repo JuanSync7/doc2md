@@ -563,8 +563,8 @@ def build_report(source_text, md, lane="office", losslessness=None,
 
 
 def image_report(referenced, extracted, unique_files, missing, orphans, verified,
-                 orphans_removed=0):
-    # type: (int, int, int, int, int, int, int) -> dict
+                 orphans_removed=0, source_images=None):
+    # type: (int, int, int, int, int, int, int, int) -> dict
     """The deterministic image-extraction integrity block for ``report.json``.
 
     This is the office text gate's twin, for pixels. Body images are HTML-comment
@@ -588,12 +588,34 @@ def image_report(referenced, extracted, unique_files, missing, orphans, verified
       * ``verified``     — files whose on-disk ``sha256[:16]`` matches their filename
         (content-addressed integrity: the bytes actually landed intact)
 
+      * ``source_images`` — how many body pictures the SOURCE is known to hold,
+        counted converter-blind, or ``None`` when this lane has no way to count
+        them. THE DENOMINATOR, and it is the same fix `n_source_tokens` was for the
+        text gate: without it the block can only compare the markdown against
+        itself, so it cannot tell "every image came through" from "nobody looked
+        for one". Found on `pdf/kestrel-dataflow.pdf` — a page that is entirely a
+        vector diagram converted to 19 tokens and zero images, and this block read
+        `gate: pass` because no reference was made, so no reference failed.
+
     ``gate`` is ``pass`` iff nothing is missing, no orphan files remain, every body
-    reference resolved, AND every expected file is present and content-verified;
-    otherwise ``degraded``. A non-pass here DEGRADES the document status but never
-    fails the losslessness gate — the text is still whole."""
+    reference resolved, every expected file is present and content-verified, AND at
+    least as many pictures arrived as the source is known to hold. An EXCESS is not
+    loss — one source picture can be referenced twice and dedupe to one file — so
+    only a shortfall counts.
+
+    With ``source_images`` unknown the gate reads ``unmeasured`` rather than
+    ``pass`` when there is nothing to judge: the same word the fidelity gate uses,
+    for the same reason, and like that one it does not degrade the document — it
+    says nobody could tell. A real defect (missing bytes, a surviving orphan) is
+    still ``degraded`` whether or not the denominator is known, because that part
+    was never about the denominator.
+
+    A non-pass here DEGRADES the document status but never fails the losslessness
+    gate — the text is still whole."""
     intact = (missing == 0 and orphans == 0 and extracted == referenced
               and verified == unique_files)
+    if intact and source_images is not None and referenced < source_images:
+        intact = False
     b = OrderedDict()
     b["referenced"] = referenced
     b["unique_files"] = unique_files
@@ -602,7 +624,15 @@ def image_report(referenced, extracted, unique_files, missing, orphans, verified
     b["orphans"] = orphans
     b["orphans_removed"] = orphans_removed
     b["verified"] = verified
-    b["gate"] = "pass" if intact else "degraded"
+    b["source_images"] = source_images
+    if not intact:
+        b["gate"] = "degraded"
+    elif source_images is None and referenced == 0 and unique_files == 0:
+        # Nothing arrived and nothing counted what should have: there is no claim to
+        # make here, and `pass` would be one.
+        b["gate"] = "unmeasured"
+    else:
+        b["gate"] = "pass"
     return b
 
 
