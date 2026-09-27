@@ -573,5 +573,43 @@
    "Command transcript",
    "Escalation matrix"
   ]
+ },
+ "office/kestrel-ligature.docx": {
+  "kind": "bundle",
+  "lane": "office",
+  "status": "ok",
+  "losslessness_gate": "pass",
+  "token_recall_min": 1.0,
+  "n_source_tokens_min": 80,
+  "coverage_gate": "pass",
+  "has_toc": false,
+  "images_gate": "unmeasured",
+  "images_referenced": 0,
+  "md_contains": [
+   "# Kestrel character-layer stress notes",
+   "con\ufb01guration",
+   "hyphen\u00adation"
+  ],
+  "structure_fidelity_gate": "pass",
+  "structure_fidelity_compared_min": 3,
+  "_note": "The OFFICE half of the character-layer fixture, and its job is to be BORING. The source holds literal ligature glyphs (U+FB00/FB01/FB02/FB03) and a soft hyphen; the office gate must be blind to all of them, because both its sides read the same OOXML and the shared tokenizer treats a ligature identically wherever it appears. Recall is exactly 1.0 and `normalize_pdf_text` is NOT in this path -- if it ever were, this row is what would notice. `md_contains` asserts the glyphs survive into the markdown VERBATIM: folding them here would be a silent rewrite of the document's own characters, which is Job 1's whole prohibition. The PDF derived from this same file is where the fold earns its keep -- see pdf/kestrel-ligature.pdf."
+ },
+ "pdf/kestrel-ligature.pdf": {
+  "kind": "bundle",
+  "requires": "pdf-lane",
+  "lane": "pdf",
+  "status": "ok",
+  "losslessness_method": "pdf-text-coverage",
+  "losslessness_gate": "best-effort",
+  "token_recall_min": 0.9,
+  "gap_absent_max": 7,
+  "images_gate": "pass",
+  "images_referenced": 0,
+  "md_contains": [
+   "confidential",
+   "flow"
+  ],
+  "structure_fidelity_gate": "unmeasured",
+  "_note": "MEASURED TRUTH, and it pins two different things at once. (1) THE FOLD WORKS: every ligature the source spells with U+FB01 (fi) or U+FB02 (fl) -- configuration, field, confirms, classification, fixed, final, flushes, first, confidential, flow, profiling -- is COVERED, because `normalize_pdf_text` folds both sides before they are compared. Measured on this document with the fold removed, recall is 0.7976 over 84 source tokens; with it, 0.9041 over 73. Without the fold this document sits BELOW `min_recall` (0.8), so the fold is the difference between a document that reports content loss and one that does not. (2) A REAL DOCLING DEFECT, pinned rather than hidden: the 7 tokens still absent are offset x2, offsets, affinity, difficult, efficient, ffer -- every one of them a word the source spells with U+FB00 (ff) or U+FB03 (ffi). docling drops or MISPLACES those glyphs (its markdown reads 'o set flow' and 'hyphen ff ation' where the source reads 'offset flow' and 'hyphenation'), while the fi/fl glyphs come through. `gap_absent_max: 7` is therefore a CEILING on a known converter bug, not a target: it falls when docling handles ff/ffi, and any rise means a new one. The row is not `xfail` -- nothing here is vacuous, the number is honest and the document is otherwise healthy."
  }
 }

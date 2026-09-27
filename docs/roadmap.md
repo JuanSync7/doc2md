@@ -278,20 +278,38 @@ OCR path measures nothing, and a diagram-only digital PDF misroutes to OCR.
       OCR path therefore passes `None` rather than a floor of 0, so it reads
       `unmeasured` instead of claiming the source held no pictures. Closes
       together with "extract figures on the OCR path".
-- [ ] Stress fixtures, before the features that fix them: hyphenation +
-      ligature doc, per-page-varying footer ("Page 3 of 120"), non-dot-leader
-      TOC, and a multi-column reading-order fixture (that one *encodes
-      measured truth* — docling's reading-order model owns the fix; if it
-      falls short it's an xfail with a `_note`, not a slice here).
-      *(2026-09-27, widened by two measured gaps. (a) No corpus document
-      contains a ligature or an invisible mark, so `normalize_pdf_text` is a
-      no-op on all 17 and proven at unit level only. (b) EVERY corpus figure
-      is a decorative colour grid — looked at, one by one — so
-      `figure_text_tokens` is 0 on all 17 and the entire figure-transposition
-      branch has never been exercised on a figure that carries information.
-      The fixture this wants is a page whose diagram holds real labels the
-      text layer can also see, which is what makes the caption precision
-      check below measurable at all.)*
+- [~] Stress fixtures, before the features that fix them.
+      *(2026-09-27: the HYPHENATION + LIGATURE fixture has landed as
+      `office/kestrel-ligature.docx` and its derived `pdf/kestrel-ligature.pdf`,
+      and it pins two things at once. (1) The fold WORKS on a real document:
+      measured with `normalize_pdf_text` removed the PDF scores 0.7976 over 84
+      source tokens, with it 0.9041 over 73 — so without the fold this document
+      sits BELOW `min_recall` and reports content loss it did not suffer. Every
+      U+FB01/U+FB02 word is covered. (2) A real docling defect is now pinned
+      instead of invisible: the 7 tokens still absent are exactly the words the
+      source spells with U+FB00 (ff) or U+FB03 (ffi) — docling drops or
+      MISPLACES those glyphs, emitting `o set flow` and `hyphen ff ation` where
+      the source reads `offset flow` and `hyphenation`, while fi/fl come
+      through. `gap_absent_max: 7` is a CEILING on a known bug, not a target.
+      The office half of the same document is deliberately boring at recall 1.0
+      — both its sides read the same OOXML, so a ligature is invisible to that
+      gate, and `md_contains` asserts the glyphs survive VERBATIM because
+      folding them there would be a silent rewrite of the document's own
+      characters. Corpus generation stays byte-identical on 3.6.8 and 3.12.
+      NOTE, measured: LibreOffice does not auto-ligate, so the font-substitution
+      asymmetry (poppler returning a glyph where docling returns letters) cannot
+      be manufactured from a synthetic source — the literal glyphs are the part
+      that is deterministic on any host.)*
+
+      Still open: a per-page-varying footer ("Page 3 of 120"), a non-dot-leader
+      TOC, a multi-column reading-order fixture (that one *encodes measured
+      truth* — docling's reading-order model owns the fix; if it falls short
+      it's an xfail with a `_note`, not a slice here), and a figure whose
+      diagram holds REAL LABELS the text layer can also see. That last one is
+      the blocker for the caption work below: every figure in the corpus today
+      is a decorative colour grid, so `figure_text_tokens` is 0 on all 19
+      documents and the figure-transposition branch has never been exercised on
+      a figure that carries information.
 
 - [ ] Make `caption_is_useful` mean what a reader assumes. Found by running
       the caption path with Claude as the model, looking at each figure and
