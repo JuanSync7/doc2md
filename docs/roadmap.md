@@ -283,6 +283,35 @@ OCR path measures nothing, and a diagram-only digital PDF misroutes to OCR.
       TOC, and a multi-column reading-order fixture (that one *encodes
       measured truth* — docling's reading-order model owns the fix; if it
       falls short it's an xfail with a `_note`, not a slice here).
+      *(2026-09-27, widened by two measured gaps. (a) No corpus document
+      contains a ligature or an invisible mark, so `normalize_pdf_text` is a
+      no-op on all 17 and proven at unit level only. (b) EVERY corpus figure
+      is a decorative colour grid — looked at, one by one — so
+      `figure_text_tokens` is 0 on all 17 and the entire figure-transposition
+      branch has never been exercised on a figure that carries information.
+      The fixture this wants is a page whose diagram holds real labels the
+      text layer can also see, which is what makes the caption precision
+      check below measurable at all.)*
+
+- [ ] Make `caption_is_useful` mean what a reader assumes. Found by running
+      the caption path with Claude as the model, looking at each figure and
+      writing an honest caption: every corpus image is a decorative colour
+      grid, the captions said so explicitly ("no labels, axes, connectors or
+      text of any kind"), and the run reported **`useful=17 (100%)`,
+      `useless=0`**. The function is honest about what it does — a SHAPE check
+      for length, letter ratio and runaway repetition, built against a CPU
+      VLM's degenerate output — but `useful` then means "the model answered in
+      well-formed prose", while the caption gate reads as "the figure was
+      recovered". Same vacuity family as `token_recall` over no tokens and
+      `images.gate` over no images.
+      The fix is NOT a keyword hack for "decorative": that is a semantic
+      judgement a word list will get wrong in both directions. `end-goal.md`
+      §4 already names the real check — captions "precision-checked against
+      the text layer's region words, burning down `figure_text_tokens`" —
+      which is objective, uses evidence the PDF lane already extracts
+      (`_image_region_text`), and answers the question that matters: did the
+      caption bring back the words trapped in the figure? It needs the fixture
+      above to be measurable, so it is sequenced after it.
 - [ ] HTML lane coverage: a ground truth exists (`_source_text` uses
       `html_to_text`, independent of docling's HTML backend) but nothing
       exercises it — no HTML fixture in the eval corpus, and the
