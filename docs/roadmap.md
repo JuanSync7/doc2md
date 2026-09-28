@@ -322,25 +322,34 @@ OCR path measures nothing, and a diagram-only digital PDF misroutes to OCR.
       truth* — docling's reading-order model owns the fix; if it falls short
       it's an xfail with a `_note`, not a slice here).
 
-- [ ] Make `caption_is_useful` mean what a reader assumes. Found by running
-      the caption path with Claude as the model, looking at each figure and
-      writing an honest caption: every corpus image is a decorative colour
-      grid, the captions said so explicitly ("no labels, axes, connectors or
-      text of any kind"), and the run reported **`useful=17 (100%)`,
-      `useless=0`**. The function is honest about what it does — a SHAPE check
-      for length, letter ratio and runaway repetition, built against a CPU
-      VLM's degenerate output — but `useful` then means "the model answered in
-      well-formed prose", while the caption gate reads as "the figure was
-      recovered". Same vacuity family as `token_recall` over no tokens and
-      `images.gate` over no images.
-      The fix is NOT a keyword hack for "decorative": that is a semantic
-      judgement a word list will get wrong in both directions. `end-goal.md`
-      §4 already names the real check — captions "precision-checked against
-      the text layer's region words, burning down `figure_text_tokens`" —
-      which is objective, uses evidence the PDF lane already extracts
-      (`_image_region_text`), and answers the question that matters: did the
-      caption bring back the words trapped in the figure? It needs the fixture
-      above to be measurable, so it is sequenced after it.
+- [~] Make `caption_is_useful` mean what a reader assumes.
+      *(2026-09-28: `backend.ingest.caption_recovery` is the objective half the
+      charter named — what FRACTION of a figure's own words the caption brought
+      back, graded against text an independent poppler probe recovered rather
+      than against anything the converter or the model said. Measured on
+      `pdf/kestrel-clocktree.pdf` with Claude as the model: a caption written
+      after looking at the diagram scores **1.000**, and the caption of a
+      decorative colour grid scores **0.059** — where `caption_is_useful`
+      scored BOTH as useful, because it is a shape check and says so. `None`
+      when the figure holds no words: a decorative image cannot be graded this
+      way, and scoring it a perfect 1.0 would be the same vacuity again.
+      Deliberately NOT a keyword list for "decorative": that is a semantic
+      judgement a word list gets wrong in both directions, and a wrong USELESS
+      silently discards a real figure's only textual record.
+      Also landed, and it turned out to be a LOSSLESSNESS fix rather than
+      tooling: `losslessness.figure_text` now publishes the words themselves.
+      Measured before it existed, `pdf/kestrel-clocktree.pdf` reported 19
+      figure-text tokens and not one of those 19 words appeared anywhere in its
+      bundle — they are that document's only content, excluded from the body
+      ground truth as figure content, and they existed in no artifact at all.)*
+
+      Still open: wire `caption_recovery` into `caption_report` so the gate
+      carries it per document, and gate it in the eval. That needs a decision
+      the data does not make for us — the figure-word pool is published per
+      DOCUMENT while captions are per IMAGE, so a document with two figures can
+      only be graded against the union until the region-to-image mapping is
+      published too.
+
 - [ ] HTML lane coverage: a ground truth exists (`_source_text` uses
       `html_to_text`, independent of docling's HTML backend) but nothing
       exercises it — no HTML fixture in the eval corpus, and the

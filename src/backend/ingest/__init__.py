@@ -18,7 +18,7 @@ from ._figures import (gate_figures, caption_is_useful, caption_type_is_furnitur
                        figure_outcome, figure_coverage, FigureCoverage,
                        FIG_CAPTURED, FIG_NO_CAPTION, FIG_GATED_TINY, FIG_GATED_DENY,
                        FIG_GATED_CHROME, FIG_GATED_DUP, FIG_GATED_OTHER,
-                       FIG_LOST_BADCROP, FIG_LOST_BAIL)
+                       FIG_LOST_BADCROP, FIG_LOST_BAIL, caption_recovery)
 from ._imageprobe import sniff_image_format, image_dimensions, IMAGE_EXTS
 from ._media import resolve_media_refs, is_body_part
 from ._coverage import (tokenize, normalize_pdf_text, coverage, CoverageReport,
@@ -130,6 +130,7 @@ __all__ = [
     "recommend_shards",
     "gate_figures",
     "caption_is_useful",
+    "caption_recovery",
     "caption_type_is_furniture",
     "caption_cache_key",
     "cache_last_wins",

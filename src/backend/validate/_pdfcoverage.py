@@ -31,6 +31,10 @@ from backend.ingest import (tokenize, coverage, markdown_to_text,
 
 __all__ = ["pdf_coverage_report"]
 
+# How many distinct figure words the block publishes. A bound, not a policy
+# threshold: the pool only has to be big enough to grade a caption against.
+_FIGURE_TEXT_TOP = 200
+
 
 def pdf_coverage_report(src_raw, md, furniture, image_text,
                         header_footer_min_frac, min_recall, min_tokens, content_min):
@@ -91,7 +95,26 @@ def pdf_coverage_report(src_raw, md, furniture, image_text,
     # figure content, not lost body text). Surfaced so the one loss class the text
     # gates cannot recover is VISIBLE per doc: this is exactly what the VLM caption
     # stage exists to bring back.
-    loss["figure_text_tokens"] = len(tokenize(image_text)) if image_text else 0
+    fig_tokens = tokenize(image_text) if image_text else []
+    loss["figure_text_tokens"] = len(fig_tokens)
+    # THE WORDS THEMSELVES, not just how many. Measured on the real corpus:
+    # `pdf/kestrel-clocktree.pdf` reports 19 figure-text tokens, and none of those 19
+    # words appears anywhere in its bundle — not in document.md, not in
+    # structure.json, not here. They are the document's ONLY content, they are
+    # excluded from the body ground truth because they are figure content rather
+    # than lost body text, and they then exist in no artifact at all.
+    #
+    # So publishing them is a LOSSLESSNESS gain before it is tooling: without them
+    # the bundle genuinely loses the document. It also makes the caption stage
+    # gradeable — `backend.ingest.caption_recovery` grades a caption against exactly
+    # this pool, so nothing needs a second notion of what a figure's words are.
+    #
+    # Sorted and deduplicated because it is a POOL, not a transcript, and a stable
+    # order keeps the artifact diff-readable. Bounded, because an unbounded dump
+    # would make a figure-heavy scan's report enormous and the pool only has to be
+    # large enough to grade a caption against. The COUNT above stays truthful
+    # whatever the cap does.
+    loss["figure_text"] = sorted(set(fig_tokens))[:_FIGURE_TEXT_TOP]
     # WHY the recall is what it is. Each missing occurrence is claimed by the FIRST
     # bucket that can explain it, which leaves `absent` as the only one that is real,
     # unexplained content loss. The buckets PARTITION the source, so a reader can

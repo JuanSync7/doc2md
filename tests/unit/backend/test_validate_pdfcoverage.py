@@ -172,7 +172,7 @@ def test_the_block_is_json_shaped_and_key_ordered():
     loss, _ = _report(src, "# T\n\n" + src)
     assert list(loss) == ["method", "token_recall", "content_recall",
                           "n_source_tokens", "missing_tokens", "figure_text_tokens",
-                          "gap", "absent_top", "ocr_used", "gate"]
+                          "figure_text", "gap", "absent_top", "ocr_used", "gate"]
     assert loss["ocr_used"] is False
 
 
@@ -237,3 +237,63 @@ def test_real_loss_still_survives_the_fold():
     kept, lost = "alpha beta gamma delta epsilon ", "zeta eta theta iota kappa "
     loss, real = _report((kept + lost) * 40, "# T\n\n" + kept * 40)
     assert real is True and loss["gap"]["absent"] == 160
+
+
+# ================================ the figure's words, published (roadmap M1)
+#
+# `figure_text_tokens` counted them and nothing recorded them. Measured on the real
+# corpus: `pdf/kestrel-clocktree.pdf` reports 19 figure-text tokens, and searching
+# its whole bundle — document.md, report.json, structure.json — finds NONE of those
+# 19 words. They are the only content in the document, they are excluded from the
+# body ground truth as figure content, and they then exist in no artifact at all.
+#
+# Publishing them is a LOSSLESSNESS gain before it is tooling: without them the
+# bundle genuinely loses the document. With them, the caption stage also becomes
+# gradeable, because `caption_recovery` has something evidence-backed to grade
+# against.
+
+def test_the_figures_own_words_are_published_not_merely_counted():
+    body = "alpha beta gamma delta epsilon " * 40
+    fig = "statemachine idlestate activestate resetstate"
+    loss, _ = _report(body + " " + fig, "# T\n\n" + body, "", fig)
+    assert loss["figure_text_tokens"] == 4
+    assert loss["figure_text"] == ["activestate", "idlestate", "resetstate",
+                                   "statemachine"]
+
+
+def test_the_published_words_are_deduped_and_ordered():
+    """Sorted and deduplicated: this is a POOL to grade a caption against, not a
+    transcript, and a stable order keeps the artifact diff-readable."""
+    body = "alpha beta gamma delta epsilon " * 40
+    loss, _ = _report(body + " zeta zeta alpha", "# T\n\n" + body, "", "zeta zeta alpha")
+    assert loss["figure_text"] == ["alpha", "zeta"]
+
+
+def test_a_document_with_no_figure_text_publishes_an_empty_list():
+    """A stated empty list is a claim about the document; an absent key is a claim
+    about nobody having looked, and the two must not read the same."""
+    src = "alpha beta gamma delta epsilon " * 40
+    loss, _ = _report(src, "# T\n\n" + src)
+    assert loss["figure_text"] == [] and loss["figure_text_tokens"] == 0
+
+
+def test_the_published_words_are_bounded():
+    """An unbounded dump would make a figure-heavy scan's report enormous, and the
+    pool only has to be big enough to grade a caption against."""
+    fig = " ".join("token%03d" % i for i in range(400))
+    body = "alpha beta gamma delta epsilon " * 40
+    loss, _ = _report(body + " " + fig, "# T\n\n" + body, "", fig)
+    assert loss["figure_text_tokens"] == 400          # the COUNT stays truthful
+    assert len(loss["figure_text"]) == 200            # the sample is capped
+
+
+def test_the_published_words_are_what_a_caption_is_graded_against():
+    """The two halves join here: what the report publishes is exactly what
+    `caption_recovery` consumes, so grading needs no second notion of figure text."""
+    from backend.ingest import caption_recovery
+    body = "alpha beta gamma delta epsilon " * 40
+    fig = "statemachine idlestate activestate resetstate"
+    loss, _ = _report(body + " " + fig, "# T\n\n" + body, "", fig)
+    pool = " ".join(loss["figure_text"])
+    assert caption_recovery("The statemachine moves from idlestate to activestate "
+                            "and back via resetstate.", pool) == 1.0
