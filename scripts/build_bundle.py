@@ -491,8 +491,8 @@ def record_stage_run(rep, run, writer=False):
 
 
 def build_one(row, soffice, out_root, run_id, token_count=None, token_model=None,
-              captions_enabled=False, converter="", run=None):
-    # type: (dict, str, str, str, object, str, bool, str, dict) -> dict
+              captions_enabled=False, converter="", run=None, prior_source_sha=""):
+    # type: (dict, str, str, str, object, str, bool, str, dict, str) -> dict
     """Convert + validate + assemble + write one document's bundle.
 
     Returns a manifest row: ``{doc_id, source_relpath, lane, status, markdown_sha256,
@@ -513,6 +513,16 @@ def build_one(row, soffice, out_root, run_id, token_count=None, token_model=None
     # slides were published in). They are built there because that is where `parts`
     # lives, and appended here because this is the stage that owns `decisions[]`.
     decisions.extend(info.get("decisions") or ())
+    if prior_source_sha:
+        # THIS BUNDLE IS A NEW VERSION of one that was already published, and the
+        # artifact says so. A rebuild a downstream holder cannot see is a rebuild it
+        # cannot trust: both hashes are named, so "did this document change, or did
+        # the converter?" is answerable from the report alone.
+        decisions.append(decision(
+            "source_changed", "rebuilt",
+            "the source at this path no longer hashes to the bytes this bundle was "
+            "built from, so the existing bundle was superseded rather than skipped",
+            {"was": prior_source_sha[:12], "now": sha256_file(row["src"])[:12]}))
     if row.get("lane") == oc.ROUTE_LIBREOFFICE:
         decisions.append(decision("preconvert", "soffice", "legacy format converted "
                                   "to its OOXML sibling first",
@@ -662,10 +672,13 @@ def build_one(row, soffice, out_root, run_id, token_count=None, token_model=None
 
 def _done(out_root):
     # type: (str) -> dict
-    """``{doc_id: status}`` for bundles that already exist non-failed (skip unless
-    --force). The STATUS is kept, not just the id, so a run that skips a document can
-    still log what that document is — a run log with a hole where the skips were is
-    not a run log."""
+    """``{doc_id: (status, source_sha256)}`` for bundles that already exist non-failed.
+
+    The STATUS is kept, not just the id, so a run that skips a document can still log
+    what that document is — a run log with a hole where the skips were is not a run
+    log. The SOURCE HASH is kept because existence is not freshness: see
+    `_unchanged` below.
+    """
     done = {}
     try:
         ids = os.listdir(out_root)
@@ -675,12 +688,42 @@ def _done(out_root):
         rp = os.path.join(out_root, did, "report.json")
         try:
             with open(rp, encoding="utf-8") as f:
-                status = json.load(f).get("status")
+                rep = json.load(f)
         except (OSError, ValueError):
             continue
-        if status in ("ok", "degraded"):
-            done[did] = status
+        if rep.get("status") in ("ok", "degraded"):
+            done[did] = (rep.get("status"), rep.get("source_sha256") or "")
     return done
+
+
+def _unchanged(done, row):
+    # type: (dict, dict) -> bool
+    """Is this document's SOURCE the one the existing bundle was built from?
+
+    THE VERSION CHECK. This used to be `row["id"] in done` — existence alone — so a
+    re-run over a corpus where a document had been EDITED printed "already-built=1
+    to-build=0", left the old body published, and logged `action: skipped, status:
+    ok`. A run log that affirms a stale bundle is worse than no run log, and
+    `docs/guide.md` tells the user re-runs are safe.
+
+    `doc_id` is sha1 of the source PATH, so a new version of a document reuses the
+    same bundle directory and no duplicate is ever formed — which is exactly why the
+    builder, not the holder, has to notice that the bytes moved.
+
+    An empty recorded hash means the bundle predates this field: rebuild rather than
+    guess. A source that cannot be hashed (vanished mid-run) is left to the normal
+    conversion path, which reports the failure properly instead of skipping it here.
+    """
+    prior = done.get(row["id"])
+    if prior is None:
+        return False
+    recorded = prior[1]
+    if not recorded:
+        return False
+    try:
+        return sha256_file(row["src"]) == recorded
+    except OSError:
+        return False
 
 
 def main(argv=None):
@@ -727,7 +770,10 @@ def main(argv=None):
 
     os.makedirs(args.out, exist_ok=True)
     done = {} if args.force else _done(args.out)
-    todo_all = [r for r in rows if r["id"] not in done]
+    todo_all = [r for r in rows if not _unchanged(done, r)]
+    # Which of those are REBUILDS of a document whose source moved, as opposed to
+    # first builds. Recorded per document below so the artifact says why it changed.
+    restaled = dict((r["id"], done[r["id"]][1]) for r in todo_all if r["id"] in done)
     todo = todo_all[:args.limit] if args.limit else todo_all
     capped = len(todo_all) - len(todo)
     msg = ("office sources=%d  already-built=%d  to-build=%d"
@@ -775,7 +821,8 @@ def main(argv=None):
 
         for r in todo:
             m = build_one(r, soffice, args.out, run_id, token_count, token_model,
-                          captions_enabled, converter, run_doc)
+                          captions_enabled, converter, run_doc,
+                          prior_source_sha=restaled.get(r["id"], ""))
             log(m, "forced" if args.force else "built")
             if m["status"] == "ok":
                 ok += 1
@@ -789,7 +836,7 @@ def main(argv=None):
                 continue
             action = "skipped" if r["id"] in done else "deferred"
             log({"doc_id": r["id"], "source_relpath": r["rel"], "lane": "office",
-                 "status": done.get(r["id"], ""), "markdown_sha256": "",
+                 "status": (done.get(r["id"]) or ("", ""))[0], "markdown_sha256": "",
                  "source_sha256": "", "error": ""}, action)
 
     run["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())

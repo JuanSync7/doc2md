@@ -371,8 +371,17 @@ question instead of a grep through prose.
 
 Codes: `lane_selected`, `preconvert`, `slide_order`, `ocr_routed`, `body_source`,
 `tokenizer_selected`, `cache_hit`, `gate_coerced`, `empty_source`,
-`captions_carried`, `skipped_existing`, `metadata_tier`, `vocabulary_selected`,
-`identity_namespace`, `permalink_base`.
+`captions_carried`, `skipped_existing`, `source_changed`, `metadata_tier`,
+`vocabulary_selected`, `identity_namespace`, `permalink_base`.
+
+`source_changed` is the one a downstream holder subscribes to. It says the source at
+this path no longer hashes to the bytes this bundle was built from, so the existing
+bundle was **superseded** rather than skipped — a new *version* of a document the
+holder already has, under the same `doc_id`, because `doc_id` is the path and a new
+version must never mint a second bundle. Its `evidence` carries `was` and `now` (the
+12-character `source_sha256` prefixes), which is what makes "did the document change,
+or did the converter?" answerable from the report alone. Its absence on a rebuilt
+bundle means the source was unchanged and the rebuild was forced.
 
 The first two below are the conversion stage's:
 

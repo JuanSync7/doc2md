@@ -479,7 +479,9 @@ def main(argv=None):
 
     os.makedirs(args.out, exist_ok=True)
     done = {} if args.force else bb._done(args.out)
-    todo_all = [r for r in rows if r["id"] not in done]
+    # Existence is not freshness — see build_bundle._unchanged. A PDF whose bytes
+    # moved at the same path is a new VERSION and must be rebuilt, not skipped.
+    todo_all = [r for r in rows if not bb._unchanged(done, r)]
     todo = todo_all[:args.limit] if args.limit else todo_all
     capped = len(todo_all) - len(todo)
     msg = ("docling-lane sources=%d  already-built=%d  to-build=%d"
@@ -496,7 +498,7 @@ def main(argv=None):
             for r in rows:
                 lane_r = "pdf" if r["ext"] == "pdf" else "html"
                 m = {"doc_id": r["id"], "source_relpath": r["rel"], "lane": lane_r,
-                     "status": done.get(r["id"], ""), "markdown_sha256": "",
+                     "status": (done.get(r["id"]) or ("", ""))[0], "markdown_sha256": "",
                      "source_sha256": "", "error": "", "run_id": run_id,
                      "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                      "action": "skipped" if r["id"] in done else "deferred",
@@ -575,7 +577,7 @@ def main(argv=None):
             action = "skipped" if r["id"] in done else "deferred"
             lane_r = "pdf" if r["ext"] == "pdf" else "html"
             log({"doc_id": r["id"], "source_relpath": r["rel"], "lane": lane_r,
-                 "status": done.get(r["id"], ""), "markdown_sha256": "",
+                 "status": (done.get(r["id"]) or ("", ""))[0], "markdown_sha256": "",
                  "source_sha256": "", "error": ""}, action)
 
     run["started_at"] = started
