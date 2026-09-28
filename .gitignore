@@ -33,3 +33,4 @@ vendor/*
 *.db
 slurm-*.out
 nohup.out
+.make/

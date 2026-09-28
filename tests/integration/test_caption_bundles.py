@@ -12,6 +12,8 @@ import zipfile
 
 import pytest
 
+from pngsupport import real_png
+
 pytestmark = pytest.mark.integration
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -35,8 +37,9 @@ def _mod(name):
 
 
 def _png(w, h, tag):
-    ihdr = struct.pack(">II", w, h) + b"\x08\x06\x00\x00\x00"
-    return b"\x89PNG\r\n\x1a\n" + struct.pack(">I", 13) + b"IHDR" + ihdr + b"\x00" * 8 + tag
+    """A REAL PNG (see tests/pngsupport): the old stub was undecodable, so every
+    test here passed only where Pillow was absent."""
+    return real_png(w, h, tag)
 
 
 def _draw(rid):
