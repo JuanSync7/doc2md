@@ -1855,6 +1855,49 @@ def build_adversarial_pptx(path):
                   defaults=(("png", "image/png"), ("svg", "image/svg+xml")))
 
 
+def _clocktree_shapes():
+    # type: () -> list
+    """A DENSE diagram: twelve adjacent labelled boxes forming one block.
+
+    Adjacency is the whole point and it is measured, not guessed. `_pdf_drawn_boxes`
+    merges overlapping drawing objects and keeps a cluster only at
+    ``image_region_min_paths`` (10) or more — correctly, because a two-path cluster
+    must never be allowed to EXCUSE text sitting over it. The dataflow deck's five
+    boxes are far apart, so each stays a two-path cluster and every one is rejected;
+    packed edge to edge, these twelve merge into ONE cluster of twenty-four paths
+    that clears the threshold.
+
+    That is what makes this the first fixture in the corpus with a real
+    ``figure_text_tokens`` debt: the labels live in the PDF's TEXT LAYER, inside a
+    region both detectors agree is a figure, so they are recovered by
+    `_image_region_text`, excluded from the body ground truth as figure content, and
+    counted as the debt the caption stage exists to burn down. Measured end to end:
+    19 tokens, gap.image_text 19, absent 0.
+    """
+    labels = ["clk ref", "pll core", "lock mon", "divider",
+              "gate ctl", "spine", "leaf a", "leaf b",
+              "leaf c", "arbiter", "xbar", "mailbox"]
+    w, h, x0, y0 = 1200000, 500000, 900000, 1200000
+    shapes = []
+    for i, label in enumerate(labels):
+        col, row = i % 4, i // 4
+        shapes.append(_sp(10 + i, "cell%d" % i, [(0, label)],
+                          pos=(x0 + col * w, y0 + row * h, w, h), fill="4F81BD"))
+    return shapes
+
+
+def build_clocktree_pptx(path):
+    # type: (str) -> None
+    """Single slide holding one dense labelled diagram and nothing else.
+
+    The office lane must read all twelve labels as ordinary text (they are shape
+    text, not pixels); the PDF derived from it must read them as FIGURE text. Same
+    words, two lanes, two correct-but-different answers — which is the pair that
+    makes `figure_text_tokens` falsifiable."""
+    _pptx_package(path, [_slide("".join(_clocktree_shapes()))], {},
+                  "Kestrel clock tree diagram", "clock-tree")
+
+
 def build_dataflow_pptx(path):
     # type: (str) -> None
     """Shapes-only single slide: source for the diagram-only PDF edge case."""
@@ -2117,6 +2160,7 @@ HANDBUILT = [
     # defect at token_recall 1.0 with zero structural errors.
     ("office/kestrel-adversarial.docx", build_adversarial_docx),
     ("office/kestrel-ligature.docx", build_ligature_docx),
+    ("office/kestrel-clocktree.pptx", build_clocktree_pptx),
 ]
 
 # (source relpath, soffice target ext, dest relpath)
@@ -2129,6 +2173,7 @@ DERIVED_OFFICE = [
     ("office/kestrel-clock-spec.docx", "pdf", "pdf/kestrel-clock-spec.pdf"),
     ("office/kestrel-dataflow.pptx", "pdf", "pdf/kestrel-dataflow.pdf"),
     ("office/kestrel-ligature.docx", "pdf", "pdf/kestrel-ligature.pdf"),
+    ("office/kestrel-clocktree.pptx", "pdf", "pdf/kestrel-clocktree.pdf"),
 ]
 
 SCANNED_PDF = ("pdf/kestrel-clock-spec.pdf", "pdf/kestrel-clock-spec-scan.pdf")

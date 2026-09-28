@@ -611,5 +611,39 @@
   ],
   "structure_fidelity_gate": "unmeasured",
   "_note": "MEASURED TRUTH, and it pins two different things at once. (1) THE FOLD WORKS: every ligature the source spells with U+FB01 (fi) or U+FB02 (fl) -- configuration, field, confirms, classification, fixed, final, flushes, first, confidential, flow, profiling -- is COVERED, because `normalize_pdf_text` folds both sides before they are compared. Measured on this document with the fold removed, recall is 0.7976 over 84 source tokens; with it, 0.9041 over 73. Without the fold this document sits BELOW `min_recall` (0.8), so the fold is the difference between a document that reports content loss and one that does not. (2) A REAL DOCLING DEFECT, pinned rather than hidden: the 7 tokens still absent are offset x2, offsets, affinity, difficult, efficient, ffer -- every one of them a word the source spells with U+FB00 (ff) or U+FB03 (ffi). docling drops or MISPLACES those glyphs (its markdown reads 'o set flow' and 'hyphen ff ation' where the source reads 'offset flow' and 'hyphenation'), while the fi/fl glyphs come through. `gap_absent_max: 7` is therefore a CEILING on a known converter bug, not a target: it falls when docling handles ff/ffi, and any rise means a new one. The row is not `xfail` -- nothing here is vacuous, the number is honest and the document is otherwise healthy."
+ },
+ "office/kestrel-clocktree.pptx": {
+  "kind": "bundle",
+  "lane": "office",
+  "status": "ok",
+  "losslessness_gate": "pass",
+  "token_recall_min": 1.0,
+  "n_source_tokens_min": 19,
+  "coverage_gate": "pass",
+  "has_toc": false,
+  "images_gate": "unmeasured",
+  "images_referenced": 0,
+  "md_contains": [
+   "- clk ref",
+   "- pll core",
+   "- mailbox"
+  ],
+  "structure_fidelity_gate": "pass",
+  "structure_fidelity_compared_min": 6,
+  "_note": "HALF A PAIR, and the pair is the point. This deck is one dense diagram of twelve labelled boxes and nothing else. In the OFFICE lane those labels are SHAPE TEXT, so all 19 tokens come through as an ordinary list and recall is exactly 1.0 -- the information is fully preserved. The PDF derived from this same file loses every one of them into a rendered image; see pdf/kestrel-clocktree.pdf, where the same 19 tokens appear as `figure_text_tokens`. Same words, two lanes, two correct-but-opposite answers, which is what makes the figure-text debt falsifiable instead of merely published."
+ },
+ "pdf/kestrel-clocktree.pdf": {
+  "kind": "bundle",
+  "requires": "pdf-lane",
+  "lane": "pdf",
+  "status": "ok",
+  "losslessness_method": "pdf-text-coverage",
+  "losslessness_gate": "best-effort",
+  "figure_text_tokens_min": 19,
+  "gap_absent_max": 0,
+  "images_gate": "pass",
+  "images_referenced": 1,
+  "structure_fidelity_gate": "unmeasured",
+  "_note": "THE FIRST DOCUMENT IN THIS CORPUS WITH A REAL FIGURE-TEXT DEBT. Every other figure here is a decorative colour grid, so `figure_text_tokens` was 0 everywhere and the loss class it names had never been exercised. Measured on the pinned toolchain: 19 tokens, gap.image_text 19, absent 0 -- the whole source is accounted for and ALL of it is trapped in the figure. Note `token_recall: 1.0` over `n_source_tokens: 0`: a perfect score against an empty body. That is not a bug in the number, it is the number being honest, and it is readable only because the denominator is published -- exactly what `n_source_tokens` was added for. The cluster threshold is why this fixture had to be DENSE: `_pdf_drawn_boxes` keeps a merged cluster only at `image_region_min_paths` (10) or more, correctly, because a two-path cluster must never be allowed to EXCUSE text sitting over it. The dataflow deck's five boxes are far apart so each stays a rejected two-path cluster; these twelve are packed edge to edge and merge into one cluster of twenty-four. `figure_text_tokens_min` is a FLOOR because a FALL is the dangerous direction -- it would mean the probe stopped seeing the figure, silently returning those words to the body ground truth to be judged as converter loss. It falls legitimately only when a caption stage recovers them, and that is a deliberate re-pin."
  }
 }

@@ -265,3 +265,74 @@ def test_asking_about_a_gap_a_report_does_not_carry_is_a_failure(tmp_path, capsy
     out = capsys.readouterr().out
     assert "gap" in out and "1 fail" in out
     assert rc == 1
+
+
+# ================================ the figure-text debt, gated (roadmap M1)
+#
+# `figure_text_tokens` is the one loss class the TEXT gates cannot recover: words
+# the PDF holds inside a figure region, excluded from the body ground truth because
+# they are figure content rather than lost body text. It is the number the VLM
+# caption stage exists to burn down — and until `office/kestrel-clocktree.pptx`
+# landed it was 0 on every document in the corpus, because every corpus figure was a
+# decorative colour grid.
+#
+# A debt that is published but never asserted is a debt nobody notices paying off,
+# or quietly growing. So it gets a probe, with the same two-sided argument the gap
+# ceiling uses: a MISSING field is a failure, never a silent pass.
+
+def _figtext_harness(tmp_path, tokens, with_field=True):
+    """A bundle whose report carries (or omits) figure_text_tokens."""
+    import os
+    bundles = tmp_path / "bundles"
+    d = bundles / "deadbeefdeadbeef"
+    os.makedirs(str(d))
+    loss = {"method": "pdf-text-coverage", "gate": "best-effort", "token_recall": 1.0}
+    if with_field:
+        loss["figure_text_tokens"] = tokens
+    with open(str(d / "report.json"), "w", encoding="utf-8") as fh:
+        json.dump({"doc_id": "deadbeefdeadbeef", "lane": "pdf",
+                   "source_relpath": "pdf/x.pdf", "status": "ok",
+                   "losslessness": loss, "warnings": []}, fh)
+    return bundles
+
+
+def _place(tmp_path, bundles, rel):
+    from backend.ingest import doc_id
+    os.rename(str(bundles / "deadbeefdeadbeef"), str(bundles / doc_id(rel)))
+
+
+def test_a_figure_text_debt_at_or_above_the_floor_passes(tmp_path, capsys):
+    rel = "pdf/x.pdf"
+    args = _harness(tmp_path, {rel: {"kind": "bundle", "lane": "pdf",
+                                     "figure_text_tokens_min": 19}})
+    _place(tmp_path, _figtext_harness(tmp_path, 19), rel)
+    assert _run_eval().main(args) == 0
+
+
+def test_a_figure_text_debt_that_fell_below_the_floor_fails(tmp_path, capsys):
+    """A FALL is the interesting direction, which is why this is a floor and not a
+    ceiling. These tokens are recovered by an independent text-layer probe, so the
+    count dropping means the probe stopped seeing a figure it used to see — the
+    exclusion silently narrowed and those words are now being judged as body text
+    the converter lost. Nothing else in the report would say so."""
+    rel = "pdf/x.pdf"
+    args = _harness(tmp_path, {rel: {"kind": "bundle", "lane": "pdf",
+                                     "figure_text_tokens_min": 19}})
+    _place(tmp_path, _figtext_harness(tmp_path, 4), rel)
+    rc = _run_eval().main(args)
+    out = capsys.readouterr().out
+    assert rc != 0 and "figure_text_tokens" in out
+
+
+def test_asking_about_a_figure_debt_the_report_does_not_carry_is_a_failure(
+        tmp_path, capsys):
+    """The OCR path publishes no figure-text count at all — there is no independent
+    text layer to recover one from. An expectation asking about it there is mis-set,
+    and answering a mis-set question with silence is the passing-over-nothing this
+    harness exists to refuse."""
+    rel = "pdf/x.pdf"
+    args = _harness(tmp_path, {rel: {"kind": "bundle", "lane": "pdf",
+                                     "figure_text_tokens_min": 1}})
+    _place(tmp_path, _figtext_harness(tmp_path, 0, with_field=False), rel)
+    rc = _run_eval().main(args)
+    assert rc != 0 and "figure_text_tokens" in capsys.readouterr().out

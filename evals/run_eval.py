@@ -140,7 +140,7 @@ _KEYS_BY_KIND = {
     "bundle": _KEYS_ROUTE | frozenset((
         "lane", "status",
         "losslessness_gate", "losslessness_method", "token_recall_min",
-        "n_source_tokens_min", "gap_absent_max",
+        "n_source_tokens_min", "gap_absent_max", "figure_text_tokens_min",
         "structure_fidelity_gate", "structure_fidelity_compared_min",
         "coverage_gate", "toc_lines_min", "has_toc", "max_depth",
         "savings_ratio_min", "content_links_min",
@@ -231,6 +231,35 @@ def check_bundle(rel, exp, bundles_dir):
             c.check(gap.get("absent", -1) <= exp["gap_absent_max"],
                     "losslessness.gap.absent: got %r, want <= %r"
                     % (gap.get("absent"), exp["gap_absent_max"]))
+    if "figure_text_tokens_min" in exp:
+        # THE DEBT, gated rather than merely published. `figure_text_tokens` counts
+        # words the PDF holds INSIDE a figure region: excluded from the body ground
+        # truth because they are figure content, not lost body text, and recovered
+        # by an independent text-layer probe rather than by anything the converter
+        # said. It is the one loss class the text gates cannot see, and the number
+        # the VLM caption stage exists to burn down.
+        #
+        # A FLOOR, not a ceiling, because a FALL is the dangerous direction: it means
+        # the probe stopped seeing a figure it used to see, so those words silently
+        # re-enter the body ground truth and are judged as text the converter lost.
+        # Nothing else in the report would say so. The number falls legitimately only
+        # when a caption stage recovers the words, and that is a deliberate re-pin.
+        #
+        # A MISSING field is a FAIL, never a silent pass: the OCR path publishes no
+        # figure-text count at all, so an expectation asking about one there is
+        # mis-set — and answering a mis-set question with silence is exactly the
+        # passing-over-nothing this harness refuses.
+        got = loss.get("figure_text_tokens")
+        if got is None:
+            c.check(False, "losslessness.figure_text_tokens: absent, but "
+                           "figure_text_tokens_min is set (the OCR path publishes "
+                           "no figure-text count)")
+        else:
+            c.check(isinstance(got, int) and got >= exp["figure_text_tokens_min"],
+                    "losslessness.figure_text_tokens: got %r, want >= %r (a fall "
+                    "means the figure-region probe stopped seeing a figure, so "
+                    "those words are now judged as body text the converter lost)"
+                    % (got, exp["figure_text_tokens_min"]))
     if "coverage_gate" in exp:
         cov = rep.get("structure", {}).get("coverage", {})
         c.eq(cov.get("gate"), exp["coverage_gate"], "structure.coverage.gate")

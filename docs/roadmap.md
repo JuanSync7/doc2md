@@ -301,15 +301,26 @@ OCR path measures nothing, and a diagram-only digital PDF misroutes to OCR.
       be manufactured from a synthetic source — the literal glyphs are the part
       that is deterministic on any host.)*
 
+      *(2026-09-28: the LABELLED FIGURE fixture has landed as
+      `office/kestrel-clocktree.pptx` + derived `pdf/kestrel-clocktree.pdf`,
+      and it is the first document in this corpus with a real figure-text
+      debt. Measured: `figure_text_tokens: 19`, `gap.image_text: 19`,
+      `absent: 0` — the whole source accounted for and ALL of it trapped in the
+      figure, while the office lane reads the same 12 labels as ordinary list
+      text at recall 1.0. Same words, two lanes, two correct-but-opposite
+      answers, which is what makes the debt falsifiable. It had to be DENSE:
+      `_pdf_drawn_boxes` keeps a merged cluster only at
+      `image_region_min_paths` (10) or more, so the dataflow deck's five
+      far-apart boxes each stay a rejected two-path cluster while these twelve,
+      packed edge to edge, merge into one cluster of twenty-four. New eval
+      probe `figure_text_tokens_min` gates it as a FLOOR: a FALL means the
+      figure-region probe stopped seeing a figure, silently returning those
+      words to the body ground truth to be judged as converter loss.)*
+
       Still open: a per-page-varying footer ("Page 3 of 120"), a non-dot-leader
-      TOC, a multi-column reading-order fixture (that one *encodes measured
+      TOC, and a multi-column reading-order fixture (that one *encodes measured
       truth* — docling's reading-order model owns the fix; if it falls short
-      it's an xfail with a `_note`, not a slice here), and a figure whose
-      diagram holds REAL LABELS the text layer can also see. That last one is
-      the blocker for the caption work below: every figure in the corpus today
-      is a decorative colour grid, so `figure_text_tokens` is 0 on all 19
-      documents and the figure-transposition branch has never been exercised on
-      a figure that carries information.
+      it's an xfail with a `_note`, not a slice here).
 
 - [ ] Make `caption_is_useful` mean what a reader assumes. Found by running
       the caption path with Claude as the model, looking at each figure and
