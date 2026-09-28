@@ -2,7 +2,7 @@
 title: Image captioning — one shared tool, every lane
 kind: design
 layer: backend
-status: reviewed
+status: stable
 owner: TBD
 summary: A formula-safe figure gate (evolved from the shipped one) + content-addressed VLM caption tool + an independent second-pass validator, called identically by the docling, office, and standalone-image lanes.
 ---

@@ -475,6 +475,12 @@ def main(argv=None):
                     help="regenerate the corpus even if it exists")
     ap.add_argument("--skip-pdf", action="store_true",
                     help="do not run the PDF lane even if DOC2MD_PDF_PYTHON is set")
+    ap.add_argument("--require", default="",
+                    help="comma-separated corpus AREAS (office, legacy, pdf, text) "
+                         "that MUST produce results; a SKIP in one of them fails the "
+                         "run. An area nobody skipped is silent; an area no "
+                         "expectation mentions is a failure, because a typo here "
+                         "would pass forever over documents nobody is checking.")
     ap.add_argument("--no-lanes", action="store_true",
                     help="skip corpus generation and lane runs; only re-check "
                          "expectations against existing outputs")
@@ -622,7 +628,40 @@ def main(argv=None):
     # XPASS is counted into `fail` as well as named, because the exit code has to be
     # readable off this one line: a census that said `0 fail, 1 xpass` beside exit 1
     # is the same contradiction the FAIL rows were fixed for.
-    census = "eval: %d pass, %d fail, %d skip" % (n_pass, n_fail + n_xpass, n_skip)
+    # A SKIPPED LANE READS LIKE A PASSING ONE. Reproduced with soffice off the PATH:
+    # every derived legacy document is marked not-generated, five SKIP rows print,
+    # the census says `0 fail`, and the process exits 0 — so the day CI's unpinned
+    # `apt-get install libreoffice` breaks, the whole legacy lane vanishes silently.
+    #
+    # It is the same shape the workflow already refuses three times with grep (the
+    # CommonMark differential, the red-direction suite, the Pillow-only branches).
+    # Those work because a suite's skip count is known; a LANE needs the harness to
+    # be told which lanes were supposed to run, because only the caller knows what
+    # this machine was set up to do.
+    # Keyed on the corpus AREA (the top-level directory of the relpath), not on the
+    # report's `lane` field. Those are different things and the difference is the
+    # failure being guarded: `legacy/kestrel-clock-spec.doc` is converted BY the
+    # office lane, so requiring `lane == "legacy"` would match nothing and pass
+    # forever. What vanishes when soffice is missing is the `legacy/` AREA of the
+    # corpus, which is also what a reader would name.
+    required = [x.strip() for x in (args.require or "").split(",") if x.strip()]
+    lane_fail = 0
+    for lane in required:
+        seen = [(v, rel) for v, rel, _d in results if rel.split("/")[0] == lane]
+        if not seen:
+            # A typo must not read as "that lane is fine".
+            print("REQUIRED lane %r is named by no expectation — nothing was "
+                  "checked for it" % lane)
+            lane_fail += 1
+            continue
+        skipped = [rel for v, rel in seen if v == "SKIP"]
+        if skipped:
+            print("REQUIRED lane %r produced %d SKIP row(s): %s"
+                  % (lane, len(skipped), ", ".join(skipped[:4])
+                     + (" ..." if len(skipped) > 4 else "")))
+            lane_fail += 1
+    census = "eval: %d pass, %d fail, %d skip" % (n_pass, n_fail + n_xpass + lane_fail,
+                                                  n_skip)
     if n_xfail or n_xpass:
         census += " (%d xfail, %d xpass)" % (n_xfail, n_xpass)
     print(census)
@@ -631,7 +670,7 @@ def main(argv=None):
     # `1 fail` next to an exit 0 is worse than no eval at all. An XFAIL row is
     # printed and does NOT gate — that is the whole point of the marker — and an
     # XPASS row gates exactly like a FAIL.
-    return 0 if (n_fail + n_xpass) == 0 else 1
+    return 0 if (n_fail + n_xpass + lane_fail) == 0 else 1
 
 
 if __name__ == "__main__":

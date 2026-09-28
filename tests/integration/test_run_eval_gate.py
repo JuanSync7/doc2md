@@ -336,3 +336,94 @@ def test_asking_about_a_figure_debt_the_report_does_not_carry_is_a_failure(
     _place(tmp_path, _figtext_harness(tmp_path, 0, with_field=False), rel)
     rc = _run_eval().main(args)
     assert rc != 0 and "figure_text_tokens" in capsys.readouterr().out
+
+
+# ================================ a skipped LANE reads like a passing one
+#
+# Reproduced with soffice off the PATH: every derived legacy document is marked
+# `{"kind": "skipped", "reason": "libreoffice-unavailable"}` by the generator,
+# run_eval renders five SKIP rows, the census prints `18 pass, 0 fail, 9 skip`, and
+# the process exits 0. CI's eval-office job installs LibreOffice from an unpinned
+# apt and never asserts it arrived — so the day that install breaks, the entire
+# legacy lane vanishes and the job stays green.
+#
+# It is the same shape this repo already refuses three times over (the CommonMark
+# differential, the red-direction suite, the Pillow-only branches): a skip reads
+# exactly like a pass. The difference is that those are asserted in the WORKFLOW
+# with grep, which only works for a suite whose skip count is known; a lane needs
+# the harness itself to know which lanes were supposed to run.
+
+def _lane_harness(tmp_path, rels, reason="libreoffice-unavailable"):
+    """A corpus manifest that marks every named document as not generated."""
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    files = dict((rel, {"kind": "skipped", "reason": reason}) for rel in rels)
+    with open(str(corpus) + ".manifest.json", "w", encoding="utf-8") as fh:
+        json.dump({"files": files}, fh)
+    # `lane` is the CONVERTER lane and is deliberately NOT what --require keys on:
+    # a legacy/*.doc is converted by the office lane. --require names the corpus AREA.
+    exp = dict((rel, {"kind": "bundle", "lane": "office"}) for rel in rels)
+    exp_path = tmp_path / "expectations.json"
+    with open(str(exp_path), "w", encoding="utf-8") as fh:
+        json.dump(exp, fh)
+    return ["--no-lanes", "--corpus", str(corpus),
+            "--bundles", str(tmp_path / "bundles"),
+            "--expectations", str(exp_path), "--skip-pdf"]
+
+
+def test_a_skipped_lane_still_exits_zero_without_the_guard(tmp_path, capsys):
+    """The behaviour being fixed, pinned so the fix is visibly a change."""
+    args = _lane_harness(tmp_path, ["legacy/a.doc", "legacy/b.rtf"])
+    assert _run_eval().main(args) == 0
+    assert "2 skip" in capsys.readouterr().out
+
+
+def test_a_required_lane_that_did_not_run_fails(tmp_path, capsys):
+    args = _lane_harness(tmp_path, ["legacy/a.doc", "legacy/b.rtf"])
+    rc = _run_eval().main(args + ["--require", "legacy"])
+    out = capsys.readouterr().out
+    assert rc != 0
+    assert "legacy" in out and "required" in out.lower()
+
+
+def test_a_lane_that_is_not_required_may_still_skip(tmp_path, capsys):
+    """The guard must name what it needs, not forbid skipping in general — the PDF
+    lane legitimately does not run on a host with no 3.12 interpreter, and that is
+    the whole reason SKIP exists as a verdict. Here `pdf` is required and healthy
+    while `legacy` skips, and the run passes."""
+    from backend.ingest import doc_id
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    with open(str(corpus) + ".manifest.json", "w", encoding="utf-8") as fh:
+        json.dump({"files": {"legacy/a.doc": {"kind": "skipped",
+                                              "reason": "libreoffice-unavailable"}}}, fh)
+    exp = {"legacy/a.doc": {"kind": "bundle", "lane": "office"},
+           "pdf/x.pdf": {"kind": "bundle", "lane": "pdf", "gap_absent_max": 0}}
+    exp_path = tmp_path / "expectations.json"
+    with open(str(exp_path), "w", encoding="utf-8") as fh:
+        json.dump(exp, fh)
+    bundles = _gap_harness(tmp_path, absent=0)
+    os.rename(str(bundles / "deadbeefdeadbeef"), str(bundles / doc_id("pdf/x.pdf")))
+    args = ["--no-lanes", "--corpus", str(corpus), "--bundles", str(bundles),
+            "--expectations", str(exp_path), "--skip-pdf"]
+    assert _run_eval().main(args + ["--require", "pdf"]) == 0
+
+
+def test_requiring_a_lane_that_ran_is_silent(tmp_path, capsys):
+    """No document skipped in a required lane means nothing to say. A guard that
+    printed on success would train a reader to ignore it."""
+    rel = "pdf/x.pdf"
+    args = _harness(tmp_path, {rel: {"kind": "bundle", "lane": "pdf",
+                                     "gap_absent_max": 0}})
+    _place(tmp_path, _gap_harness(tmp_path, absent=0), rel)
+    rc = _run_eval().main(args + ["--require", "pdf"])
+    assert rc == 0 and "required" not in capsys.readouterr().out.lower()
+
+
+def test_requiring_a_lane_no_expectation_mentions_is_itself_a_failure(tmp_path, capsys):
+    """A typo in --require must not read as "that lane is fine". `--require legcy`
+    would otherwise pass forever over a lane nobody is checking, which is the same
+    class of bug as a typo'd expectation key."""
+    args = _lane_harness(tmp_path, ["legacy/a.doc"])
+    rc = _run_eval().main(args + ["--require", "legcy"])
+    assert rc != 0 and "legcy" in capsys.readouterr().out

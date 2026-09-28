@@ -12,6 +12,7 @@
 # on this host.
 #
 #   make verify           the done-gate: everything below, in dependency order
+#   make check            CONVENTIONS.md's own structure/labelling rules
 #   make test             unit + integration suite
 #   make test-ciring      the suite as CI sees it (no PyYAML, no Pillow)
 #   make test-pillow      the suite WITH Pillow, covering branches CI's rings cannot
@@ -53,8 +54,8 @@ CORPUS  ?= data/eval_corpus
 BUNDLES ?= data/eval_bundles
 SCRATCH ?= $(CURDIR)/.make
 
-.PHONY: verify test test-ciring test-pillow corpus eval eval-pdf rubric kb-lint \
-        determinism idempotency clean where
+.PHONY: verify check test test-ciring test-pillow corpus eval eval-pdf rubric \
+        kb-lint determinism idempotency clean where
 
 where:
 	@echo "runner : $(if $(RUN),$(RUN),local (no farm))"
@@ -62,14 +63,19 @@ where:
 	@echo "venv   : $(VENV_PY) $$(test -x $(VENV_PY) && $(VENV_PY) -c 'import sys;print(sys.version.split()[0])' || echo '(absent)')"
 
 # The done-gate. Ordered so the cheapest, most-likely-to-fail thing runs first.
-verify: test test-ciring corpus determinism eval idempotency rubric kb-lint
+verify: check test test-ciring corpus determinism eval idempotency rubric kb-lint
 	@echo
 	@echo "=============================================================="
-	@echo " verify: GREEN — suite, CI ring, corpus determinism, office"
-	@echo " eval, idempotency, rubric and kb-lint all pass."
+	@echo " verify: GREEN — structure, suite, CI ring, corpus determinism,"
+	@echo " office eval, idempotency, rubric and kb-lint all pass."
 	@echo " NOT covered here: the PDF lane (make eval-pdf) needs the 3.12"
 	@echo " venv and the pinned docling weights."
 	@echo "=============================================================="
+
+# CONVENTIONS.md section 6 promises this is "checked, not just documented".
+# It now is. Cheap and dependency-free, so it runs first.
+check:
+	$(PY) scripts/check_structure.py --quiet
 
 test:
 	$(RUN) $(PY) -m pytest -q

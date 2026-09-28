@@ -107,6 +107,11 @@ jobs:
       # Same corpus, same reason as the 3.6 ring above: without it the 30
       # red-direction tests skip and this ring is green over the proof that the
       # structure gate can fail.
+      # CONVENTIONS.md section 6 says the structure rules are "checked, not just
+      # documented". Dependency-free and 3.6-safe, so it runs on the cheapest ring
+      # that has a checkout.
+      - name: The conventions are checked, not just documented
+        run: python3 scripts/check_structure.py --quiet
       - name: Build the hand-built corpus the gate tests convert
         run: python3 evals/gen_corpus.py --handbuilt-only
       - name: The red-direction suite must run, not skip
@@ -155,6 +160,35 @@ jobs:
         run: python3 evals/gen_corpus.py --handbuilt-only
       - run: python -m pytest tests/unit tests/integration -q
 
+  # The tests no ring could run. Measured: 8 tests in tests/e2e/ appear in no CI
+  # invocation at all (every one is `tests/unit tests/integration`), and 14 more are
+  # tool-gated and skip on both test rings, which install neither LibreOffice nor
+  # docling. The jobs that HAVE the tools (eval-office, eval-pdf) run no pytest. So
+  # 22 tests were green-by-absence.
+  tests-with-tools:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install LibreOffice + poppler (the tools the gated tests need)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libreoffice poppler-utils
+      # An unpinned apt install that silently fails would hand this job a full set of
+      # SKIPs and a green tick — the exact failure this job exists to close.
+      - name: The tools must actually be here
+        run: |
+          command -v soffice   || { echo "::error::soffice missing after install"; exit 1; }
+          command -v pdftotext || { echo "::error::pdftotext missing after install"; exit 1; }
+      - run: pip install pytest pillow
+      - name: Build the hand-built corpus
+        run: python3 evals/gen_corpus.py --handbuilt-only
+      - name: Run every test, including the ones only this job can run
+        run: python -m pytest tests/unit tests/integration tests/e2e -q -rs
+
   eval-office:
     # The regression gate: generate the Kestrel corpus, convert through the office +
     # text + legacy lanes, check every expectation. Nonzero exit fails the job.
@@ -174,9 +208,18 @@ jobs:
       # reading the per-check outcomes, so this job needs pytest even though it is
       # not a test ring.
       - run: pip install pytest
+      # --require names the corpus AREAS that must produce results. Without it a
+      # SKIPPED LANE READS LIKE A PASSING ONE: reproduced with soffice off the PATH,
+      # `gen_corpus` marks all five legacy documents not-generated, the eval prints
+      # five SKIP rows, the census says `0 fail`, and the job exits 0. LibreOffice
+      # here comes from an unpinned `apt-get install` with no post-install assertion,
+      # so the day that install breaks the whole legacy lane vanishes silently. This
+      # is the same shape the three grep guards above refuse, applied to a lane.
       - name: Run eval (office + text lanes)
         shell: bash        # explicit bash => -o pipefail: tee must not mask a failed eval
-        run: python3 evals/run_eval.py --skip-pdf | tee eval-office.txt
+        run: |
+          python3 evals/run_eval.py --skip-pdf --require office,legacy,text \
+            | tee eval-office.txt
       - uses: actions/upload-artifact@v4
         if: always()
         with:
