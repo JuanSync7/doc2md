@@ -62,15 +62,17 @@ import docling_convert as dc                     # noqa: E402  (converters + mea
 import build_bundle as bb                        # noqa: E402  (shared writer helpers)
 from backend.provenance import compact_run, decision, stamp_stage  # noqa: E402
 from backend.bundle import assemble_bundle       # noqa: E402  (pure assembler)
-from backend.ingest import (doc_id, tokenize,    # noqa: E402
+# The measurement primitives moved out with the policy: this script now produces
+# the STRINGS (poppler, pypdfium2, docling) and the validator grades them.
+from backend.ingest import (doc_id,               # noqa: E402
                             image_markdown, inline_image_captions,
                             identifier_vocab, repair_split_tokens,
-                            coverage, markdown_to_text, char_ngram_recall,
-                            is_lossy_explained, strip_running_lines,
-                            explain_gap,
+                            normalize_pdf_markdown,
+                            strip_running_lines,
                             pdf_info_meta, load_ingest_config, load_source_root,
                             normalize_accept)
-from backend.validate import image_report, caption_report   # noqa: E402  (report policy)
+from backend.validate import (image_report, caption_report,   # noqa: E402
+                              pdf_coverage_report)          # (report policy)
 
 # This lane's name in `run.entrypoint`, in every `decisions[].stage` and in
 # every manifest row it appends — one string for one thing (see build_bundle).
@@ -173,73 +175,16 @@ def _extract_figures(doc):
 
 def _pdf_losslessness(src_raw, md, furniture, image_text, cfg):
     # type: (str, str, str, str, object) -> tuple
-    """The measured best-effort losslessness block for a digital PDF/HTML doc.
+    """Thin adapter: unpack the lane config and hand the policy to `backend.validate`.
 
-    Same apple-to-apple model as docling_convert's coverage record: token recall of
-    the de-boilerplated source vs the markdown, with docling's own furniture text and
-    figure-region text excluded from the ground truth; char-n-gram content recall as
-    the tokenization-blind second opinion. Returns ``(loss_block, is_real_loss)`` —
-    ``is_real_loss`` is True only under the explained-gap model (low token recall AND
-    low content recall), which is what should degrade the document status.
-
-    ``src_raw`` is the RAW page-delimited extraction, not a de-boilerplated one, and
-    the difference is load-bearing rather than cosmetic. The body metric wants the
-    stripped text, so this strips it here — one place knows the policy. `explain_gap`
-    wants the raw text, because it applies the strip ITSELF in order to also see the
-    SUB-THRESHOLD repeated lines a running footer leaves behind. Hand it text that
-    was already stripped and those repeats are gone, `residual_boiler` reads 0, and
-    every one of those tokens is re-counted as `absent` — the block would overstate
-    loss on exactly the documents it exists to explain. Taking the raw text as the
-    parameter, rather than an optional extra, is what makes that unable to happen."""
-    exclude = (furniture + " " + image_text).strip()
-    md_text = markdown_to_text(md)
-    src_stripped = strip_running_lines(src_raw or "", cfg.header_footer_min_frac)
-    rep = coverage(src_stripped, md_text, exclude=exclude)
-    content = char_ngram_recall(
-        src_stripped, (md_text + " " + exclude) if exclude else md_text)
-    lossy = is_lossy_explained(rep, content, min_recall=cfg.min_recall,
-                               min_tokens=cfg.min_tokens,
-                               content_min=cfg.content_min_recall)
-    loss = OrderedDict()
-    loss["method"] = "pdf-text-coverage"
-    loss["token_recall"] = round(rep.recall, 4)
-    loss["content_recall"] = round(content, 4)
-    loss["n_source_tokens"] = rep.n_source
-    loss["missing_tokens"] = rep.missing_top if lossy else []
-    # Text buried INSIDE figure regions (excluded from the body metric above — it is
-    # figure content, not lost body text). Surfaced so the one loss class the text
-    # gates cannot recover is VISIBLE per doc: this is exactly what the VLM caption
-    # stage exists to bring back.
-    loss["figure_text_tokens"] = len(tokenize(image_text)) if image_text else 0
-    # WHY the recall is what it is. A bare `token_recall: 0.97` is a number nobody can
-    # act on: it does not say whether three words were re-hyphenated across a line
-    # break, a running footer survived the strip, or a paragraph is gone — and those
-    # need three different fixes, one of which is not a fix at all. Each missing
-    # occurrence is claimed by the FIRST bucket that can explain it, which leaves
-    # `absent` as the only one that is real, unexplained content loss.
-    #
-    # The buckets PARTITION the source, so a reader can subtract:
-    #     covered + fused + numeric + image_text + residual_boiler + short + absent
-    #         == gap.n_source
-    #
-    # `gap.n_source` is deliberately NOT `n_source_tokens`. The body metric excludes
-    # furniture and figure text from its ground truth; this one excludes neither, it
-    # BUCKETS them — which is the only way a reader can see how much of the gap each
-    # of them explained. Two denominators, both named, neither blurred into the other.
-    #
-    # Stated on every document, including the clean ones: `absent: 0` is a claim about
-    # the document, while an absent block is a claim about nobody having looked, and
-    # a stated zero is what makes a later non-zero readable.
-    gap = explain_gap(src_raw or "", md_text, cfg.header_footer_min_frac, image_text)
-    loss["gap"] = OrderedDict((
-        ("n_source", gap.n_source), ("covered", gap.covered), ("fused", gap.fused),
-        ("numeric", gap.numeric), ("image_text", gap.image_text),
-        ("residual_boiler", gap.residual_boiler), ("short", gap.short),
-        ("absent", gap.absent)))
-    loss["absent_top"] = [[tok, n] for tok, n in gap.absent_top]
-    loss["ocr_used"] = False
-    loss["gate"] = "best-effort"
-    return loss, lossy
+    The measurement itself is NOT here. It is `pdf_coverage_report`, a pure function
+    in the validator layer, so that the only losslessness statement a non-office
+    document ever gets is unit-testable without loading a script by path. This layer
+    exists solely to turn a config object into the four policy numbers — the
+    validator refuses to default them, so they cannot drift from `ingest.toml`."""
+    return pdf_coverage_report(src_raw, md, furniture, image_text,
+                               cfg.header_footer_min_frac, cfg.min_recall,
+                               cfg.min_tokens, cfg.content_min_recall)
 
 
 def _failure_report(row, lane, error, warnings, run_id="", run=None, decisions=None):
@@ -336,6 +281,14 @@ def build_one(row, conv, ocr_conv, ocr_mode, out_root, run_id, cfg,
                                    % n_missing})
 
     # Losslessness measurement (+ the two convert-time improvements) — digital only.
+    # Make this lane's markdown say what the OFFICE lane says for the same text.
+    # docling emits HTML entities (`R&amp;D`) and escapes intraword underscores
+    # (`clk\_ref\_sel`); the office lane writes `R&D` and `clk_ref_sel` for exactly
+    # that content. The entity form is not merely uglier: `markdown_to_text` does
+    # not decode entities, so the text layer the knowledge linker reads literally
+    # contains "R&amp;D" and a search for "R&D" finds nothing. Applied BEFORE the
+    # measurement below, so what is graded is what is published.
+    md = normalize_pdf_markdown(md)
     src_stripped = ""
     if not use_ocr:
         raw = dc._source_text(row["src"])
@@ -366,7 +319,11 @@ def build_one(row, conv, ocr_conv, ocr_mode, out_root, run_id, cfg,
         furniture = dc._furniture_text(doc)
         image_text = ""
         if lane == "pdf":
-            image_text = dc._image_region_text(row["src"], dc._picture_boxes(doc))
+            # Both detectors must agree a region is a figure before its text leaves
+            # the ground truth — docling's boxes alone would let a misclassified
+            # body block excuse exactly the text it dropped. See dc._figure_regions.
+            image_text = dc._image_region_text(
+                row["src"], dc._figure_regions(row["src"], dc._picture_boxes(doc)))
         loss, real_loss = _pdf_losslessness(raw, md, furniture, image_text, cfg)
     if real_loss:
         warnings.append({"code": "pdf_content_loss",
@@ -385,6 +342,18 @@ def build_one(row, conv, ocr_conv, ocr_mode, out_root, run_id, cfg,
               "image_files": len(assets), "images_missing": n_missing,
               "captions_enabled": captions_enabled,
               "image_meta": bb.image_meta_of(assets.items())}
+    # THE DENOMINATOR for `images.gate`, counted from the PDF's own drawing objects
+    # so docling's opinion about what is a picture plays no part. Without it that
+    # gate could only compare the markdown with itself: `pdf/kestrel-dataflow.pdf`
+    # is a page of vector art that converted to zero images, and because no
+    # reference was made no reference failed, so the gate read `pass`.
+    #
+    # Only on the DIGITAL path. The OCR path extracts no figures at all yet, and a
+    # scanned page's raster is dropped as a page-covering background, so a floor
+    # there would read 0 and turn "we do not do this yet" into a claim that the
+    # source held nothing. `None` keeps it `unmeasured`, which is the truth.
+    if lane == "pdf" and not use_ocr:
+        extras["source_images"] = dc._pdf_source_image_floor(row["src"])
     t1 = time.time()
     bundle = assemble_bundle(
         doc_id=row["id"], source_relpath=row["rel"], source_format=row["ext"],
@@ -422,10 +391,14 @@ def build_one(row, conv, ocr_conv, ocr_mode, out_root, run_id, cfg,
             {"code": "orphan_images_removed",
              "detail": "%d stale image file(s) removed on rebuild" % removed})
     im = rep["images"]
+    # `source_images` is carried FORWARD from the assembler's block. A rebuild that
+    # dropped it would silently turn a measured denominator back into `unmeasured`,
+    # which is exactly the vacuity this field exists to close — and it reads as a
+    # gate that simply has nothing to say, so nothing would have flagged it.
     rep["images"] = image_report(im["referenced"], im["extracted"],
                                  im["unique_files"], im["missing"], 0, verified,
-                                 removed)
-    if rep["images"]["gate"] != "pass" and rep["status"] == "ok":
+                                 removed, source_images=im.get("source_images"))
+    if rep["images"]["gate"] == "degraded" and rep["status"] == "ok":
         rep["status"] = "degraded"
 
     attached = bb._count_outline_images(bundle["structure"])
@@ -515,7 +488,9 @@ def main(argv=None):
 
     os.makedirs(args.out, exist_ok=True)
     done = {} if args.force else bb._done(args.out)
-    todo_all = [r for r in rows if r["id"] not in done]
+    # Existence is not freshness — see build_bundle._unchanged. A PDF whose bytes
+    # moved at the same path is a new VERSION and must be rebuilt, not skipped.
+    todo_all = [r for r in rows if not bb._unchanged(done, r)]
     todo = todo_all[:args.limit] if args.limit else todo_all
     capped = len(todo_all) - len(todo)
     msg = ("docling-lane sources=%d  already-built=%d  to-build=%d"
@@ -532,7 +507,7 @@ def main(argv=None):
             for r in rows:
                 lane_r = "pdf" if r["ext"] == "pdf" else "html"
                 m = {"doc_id": r["id"], "source_relpath": r["rel"], "lane": lane_r,
-                     "status": done.get(r["id"], ""), "markdown_sha256": "",
+                     "status": (done.get(r["id"]) or ("", ""))[0], "markdown_sha256": "",
                      "source_sha256": "", "error": "", "run_id": run_id,
                      "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                      "action": "skipped" if r["id"] in done else "deferred",
@@ -611,7 +586,7 @@ def main(argv=None):
             action = "skipped" if r["id"] in done else "deferred"
             lane_r = "pdf" if r["ext"] == "pdf" else "html"
             log({"doc_id": r["id"], "source_relpath": r["rel"], "lane": lane_r,
-                 "status": done.get(r["id"], ""), "markdown_sha256": "",
+                 "status": (done.get(r["id"]) or ("", ""))[0], "markdown_sha256": "",
                  "source_sha256": "", "error": ""}, action)
 
     run["started_at"] = started

@@ -38,7 +38,8 @@ from backend.ingest import (doc_id, gate_figures, caption_is_useful,
                             front_matter, pdf_info_meta, is_lossy_explained,
                             char_ngram_recall, html_to_text, strip_running_lines,
                             words_in_bbox, tokenize, recommend_shards, order_todo,
-                            load_source_root, merge_boxes,
+                            load_source_root, merge_boxes, intersect_boxes,
+                            drawn_image_floor,
                             summarize_routes, normalize_accept, unknown_formats,
                             supported_formats, ROUTE_DOCLING, ROUTE_OOXML,
                             ROUTE_LIBREOFFICE, ROUTE_PASSTHROUGH, ROUTE_FENCE)
@@ -182,21 +183,164 @@ def _window_cpp(path, first, last, timeout=60):
     return len(out.replace("\f", "").strip()) / float(pages_read)
 
 
-def pdf_has_text_layer(path, sample_pages=10, min_chars_per_page=100, retries=1):
+def _pdf_drawn_area_fracs(path):
+    """``{page_no: fraction of the page covered by DRAWN objects}``, frames excluded.
+
+    Feeds `drawn_image_floor` — the denominator `images.gate` needs to tell "every
+    picture came through" from "nobody looked for one". Reads the PDF's own objects,
+    so it is converter-blind: docling's opinion about what is a picture plays no part.
+
+    Clusters are merged before summing, or the two paths of one rounded rectangle
+    would count their overlap twice. Page frames and backgrounds (at or above
+    ``image_region_max_frac``) are dropped first: a full-page white rect is not a
+    figure, and left in it would make every page look like one. ``{}`` when
+    pypdfium2 is unavailable, which the caller must treat as "could not count"."""
+    c = _cfg()
+    try:
+        import ctypes
+        import pypdfium2 as pdfium
+        import pypdfium2.raw as pdfium_c
+    except Exception:
+        return {}
+    try:
+        pdf = pdfium.PdfDocument(path)
+    except Exception:
+        return {}
+    out = {}
+    try:
+        for pg_no in range(len(pdf)):
+            try:
+                page = pdf[pg_no]
+                w, h = page.get_size()
+                if w <= 0 or h <= 0:
+                    continue
+                boxes = []
+                for obj in page.get_objects(max_depth=4):
+                    if obj.type not in (pdfium_c.FPDF_PAGEOBJ_PATH,
+                                        pdfium_c.FPDF_PAGEOBJ_IMAGE):
+                        continue
+                    l = ctypes.c_float()
+                    b = ctypes.c_float()
+                    r = ctypes.c_float()
+                    t = ctypes.c_float()
+                    if not pdfium_c.FPDFPageObj_GetBounds(obj.raw, l, b, r, t):
+                        continue
+                    box = (max(0.0, l.value / w), max(0.0, (h - t.value) / h),
+                           min(1.0, r.value / w), min(1.0, (h - b.value) / h))
+                    if (box[2] - box[0]) * (box[3] - box[1]) >= c.image_region_max_frac:
+                        continue                      # page frame / background
+                    boxes.append(box)
+                total = 0.0
+                for box, _n in merge_boxes(boxes, pad=c.image_region_pad):
+                    total += (box[2] - box[0]) * (box[3] - box[1])
+                out[pg_no + 1] = total
+            except Exception:
+                continue
+    finally:
+        try:
+            pdf.close()
+        except Exception:
+            pass
+    return out
+
+
+def _pdf_source_image_floor(path):
+    """Lower bound on the figures a PDF holds, or ``None`` when it cannot be counted.
+
+    ``None`` is not zero: it makes `images.gate` read `unmeasured` instead of
+    claiming a pass over nothing."""
+    fracs = _pdf_drawn_area_fracs(path)
+    if not fracs:
+        return None
+    return drawn_image_floor(fracs)
+
+
+def _page_raster_fracs(path):
+    """``{page_no: largest raster object's page-area fraction}`` from the PDF itself.
+
+    The evidence that separates a SCAN from a thin-text digital page. Measured on the
+    corpus: a scanned page is one page-sized image object and no text objects at all
+    (frac 1.000); a diagram-only digital page is vector paths and a handful of text
+    objects (frac 0.000). Char volume cannot tell those apart — 79 chars/page and 0
+    chars/page both sit under a 100-char threshold.
+
+    Rasters only. A vector drawing is not evidence of a scan: it is content the PDF
+    records exactly, and re-rendering it for OCR would throw that exactness away.
+
+    ``{}`` when pypdfium2 is unavailable, which the caller must treat as NO evidence
+    rather than as evidence of absence."""
+    try:
+        import ctypes
+        import pypdfium2 as pdfium
+        import pypdfium2.raw as pdfium_c
+    except Exception:
+        return {}
+    out = {}
+    try:
+        pdf = pdfium.PdfDocument(path)
+    except Exception:
+        return {}
+    try:
+        for pg_no in range(len(pdf)):
+            try:
+                page = pdf[pg_no]
+                w, h = page.get_size()
+                if w <= 0 or h <= 0:
+                    continue
+                biggest = 0.0
+                for obj in page.get_objects(max_depth=4):
+                    if obj.type != pdfium_c.FPDF_PAGEOBJ_IMAGE:
+                        continue
+                    l = ctypes.c_float()
+                    b = ctypes.c_float()
+                    r = ctypes.c_float()
+                    t = ctypes.c_float()
+                    if not pdfium_c.FPDFPageObj_GetBounds(obj.raw, l, b, r, t):
+                        continue
+                    frac = ((r.value - l.value) * (t.value - b.value)) / float(w * h)
+                    biggest = max(biggest, min(1.0, frac))
+                out[pg_no + 1] = biggest
+            except Exception:
+                continue
+    finally:
+        try:
+            pdf.close()
+        except Exception:
+            pass
+    return out
+
+
+def pdf_has_text_layer(path, sample_pages=10, min_chars_per_page=100,
+                       retries=1, scan_cover_min=0.5):
     """True if a PDF carries a real embedded text layer (digital) -> OCR not needed.
 
     Samples the document at BOTH ends — a head window and a tail window (sized from the
-    ``pdfinfo`` page count) — and calls it digital only when EVERY sampled window clears
-    ``min_chars_per_page``. This closes the mixed-PDF blind spot: a file that is digital up
-    front but SCANNED in a later section would pass a head-only probe as "digital" and its
-    scanned text would be silently lost (the coverage metric, also pdftotext-based, can't
-    see it either). Any textless window -> OCR the whole doc, the safe/lossless direction.
+    ``pdfinfo`` page count). This closes the mixed-PDF blind spot: a file that is digital
+    up front but SCANNED in a later section would pass a head-only probe as "digital" and
+    its scanned text would be silently lost (the coverage metric, also pdftotext-based,
+    can't see it either). Any scanned window -> OCR the whole doc, the lossless direction.
 
-    Bounded + fast (1-2 pdftotext calls, instant even on 1000+ page PDFs). Falls back to a
-    contiguous head probe when ``pdfinfo`` is unavailable. Asymmetric-safe: a wrong
-    "scanned" only costs OCR time, so on ANY probe failure (after a retry) we return False
-    (-> OCR). 100 cpp cleanly separates the two (digital pages measured 700-2700 cpp;
-    scanned ~0).
+    TWO SIGNALS, because char volume alone misroutes a real class of document. Clearing
+    ``min_chars_per_page`` in every window is digital on the spot, and the expensive
+    step never runs. A THIN window is not yet a scan: measured on the corpus,
+    `pdf/kestrel-dataflow.pdf` holds 79 chars/page against a scan's 0, and both sit
+    under a 100-char threshold. It is a diagram-only digital page — a real text layer,
+    thin because most of the page is vector art — and OCR'ing it re-renders and
+    re-transcribes content the PDF already holds exactly, collapsing its measured
+    losslessness to "no independent text layer to measure against".
+
+    So a thin window is judged by the PDF's own objects (`_page_raster_fracs`): a page
+    whose content is a RASTER covering at least ``scan_cover_min`` of it needs OCR,
+    whatever text it also carries — a scan with a burnt-in header stamp has a few real
+    characters and still needs transcribing. A page thin because it is mostly vector
+    drawing is digital.
+
+    Bounded + fast (1-2 pdftotext calls, instant even on 1000+ page PDFs; the object
+    walk runs only for a thin window). Falls back to a contiguous head probe when
+    ``pdfinfo`` is unavailable. Asymmetric-safe throughout: a wrong "scanned" only
+    costs OCR time while a wrong "digital" loses content silently, so ANY probe failure
+    after a retry — and a missing pypdfium2, which is no evidence rather than evidence
+    of absence — returns False (-> OCR).
     """
     n = _pdf_page_count(path)
     half = max(1, sample_pages // 2)
@@ -209,7 +353,27 @@ def pdf_has_text_layer(path, sample_pages=10, min_chars_per_page=100, retries=1)
     last = None
     for attempt in range(retries + 1):
         try:
-            return all(_window_cpp(path, f, l) >= min_chars_per_page for (f, l) in windows)
+            thin = [(f, l) for (f, l) in windows
+                    if _window_cpp(path, f, l) < min_chars_per_page]
+            if not thin:
+                return True            # obviously digital on the cheap signal alone
+            # A thin window is not yet a scan. Consult the PDF's own objects: a page
+            # whose content is a page-covering RASTER needs OCR, while a page that is
+            # thin because it is mostly vector drawing is digital and OCR'ing it
+            # would discard text the document already holds exactly.
+            #
+            # No evidence is not evidence of absence. With pypdfium2 missing the
+            # probe cannot tell the two apart, and the asymmetry is unchanged: a
+            # wrong "scanned" costs OCR time, a wrong "digital" loses the content
+            # silently. So an empty map keeps the old verdict.
+            fracs = _page_raster_fracs(path)
+            if not fracs:
+                return False
+            for (f, l) in thin:
+                for pg in range(f, l + 1):
+                    if fracs.get(pg, 1.0) >= scan_cover_min:
+                        return False
+            return True
         except Exception as e:
             last = e   # transient (e.g. timeout) -> retry once before giving up
     print("  [auto-ocr] probe failed for %s (%s) -> assuming scanned (OCR)"
@@ -453,6 +617,46 @@ def _pdf_drawn_boxes(path):
         except Exception:
             pass
     return out
+
+
+def _figure_regions(path, doc_boxes):
+    """Figure regions BOTH detectors agree on, for a PDF; docling's alone otherwise.
+
+    The exclusion set is the most dangerous input to the measurement: whatever
+    decides "this region is a figure" removes that text from the ground truth, so it
+    can delete the evidence of a real loss. Docling's own picture bboxes deciding it
+    alone is circular — a body block it misclassified as a picture would excuse
+    exactly the text it dropped, and the gate would read green over real damage.
+
+    The PDF's own drawing objects are independent, but they cannot own the decision
+    either: measured on `pdf/kestrel-clock-spec.pdf`, the register map's ruling lines
+    form a path cluster, so `_pdf_drawn_boxes` claims the whole table and would take
+    55 tokens of real body text out of the ground truth with it. Swapping one
+    detector for the other trades a circular exclusion for an over-wide one.
+
+    So `intersect_boxes` keeps only what both claim, over their overlap alone. Each
+    detector can then merely SHRINK the exclusion, and any disagreement leaves the
+    text counting against the converter.
+
+    For a non-PDF (HTML) there are no drawing objects to consult, so docling's boxes
+    are all there is and that lane's exclusion stays as circular as it was — recorded
+    in the roadmap rather than papered over here. The detector is not even CALLED for
+    one, so a missing pypdfium2 cannot silently change an HTML document's ground
+    truth."""
+    doc_boxes = list(doc_boxes or [])
+    if path.rsplit(".", 1)[-1].lower() != "pdf":
+        return doc_boxes
+    drawn = _pdf_drawn_boxes(path)
+    # Measure-only sweeps run without a conversion, so there are no docling boxes to
+    # agree with. The independent detector is then the only evidence there is, and
+    # using it alone is this path's pre-existing behaviour — NOT the better answer:
+    # it is the over-wide one, so a swept document reads a little kinder than the
+    # same document does at convert time, where agreement is required. Not circular
+    # (nothing docling said is trusted), but flattering, and the convert-time number
+    # in report.json is the authoritative one. Recorded in the roadmap.
+    if not doc_boxes:
+        return drawn
+    return intersect_boxes(doc_boxes, drawn)
 
 
 def _image_region_text(path, boxes):
@@ -966,9 +1170,7 @@ def _coverage_record(did, rel, path, md, extras=None):
     # Boxes come from docling's layout (convert time) or, when absent (measure-only
     # sweeps), from the INDEPENDENT drawing-object detector — so the apple-to-apple
     # holds without a conversion, and the evidence isn't docling judging itself.
-    boxes = (extras or {}).get("pic_boxes")
-    if not boxes and path.rsplit(".", 1)[-1].lower() == "pdf":
-        boxes = _pdf_drawn_boxes(path)
+    boxes = _figure_regions(path, (extras or {}).get("pic_boxes"))
     image_text = _image_region_text(path, boxes) if boxes else ""
     exclude = (furniture + " " + image_text).strip()
     md_text = markdown_to_text(md)

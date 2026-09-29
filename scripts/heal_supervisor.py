@@ -88,6 +88,23 @@ def _classify_tail(tail):
     return "\n".join(kept)
 
 
+def _mem_total_gb():
+    """Total physical memory, or 0.0 when it cannot be read.
+
+    Distinct from `_mem_avail_gb` and load-bearing: AVAILABLE memory says whether an
+    escalation can run NOW, TOTAL says whether it could EVER run on this machine.
+    Waiting for memory that is merely busy is a queue; waiting for memory the host
+    does not have is a deadlock."""
+    try:
+        with open("/proc/meminfo") as fh:
+            for line in fh:
+                if line.startswith("MemTotal:"):
+                    return int(line.split()[1]) / (1024.0 * 1024.0)
+    except (OSError, ValueError):
+        pass
+    return 0.0
+
+
 def _mem_avail_gb():
     try:
         with open("/proc/meminfo") as fh:
@@ -488,6 +505,26 @@ class Supervisor(object):
         did, need = self.pending_esc[0]
         if self._lane_alive_for(did):
             self.pending_esc.pop(0)
+            return
+        # AN ESCALATION BIGGER THAN THE MACHINE CAN NEVER RUN. The gate below is
+        # `mem_gb >= need` against MemAvailable, so on a host whose TOTAL memory is
+        # under `need` it can never become true: the supervisor drains every worker
+        # to free memory, runs out of workers to drain, and then waits forever.
+        # Found by the tests-with-tools CI job on a 16GB runner against a 24GB
+        # `big_doc_mem_gb` — it passes on a big host and hangs on a small one, which
+        # is why it went unseen for as long as no job ran tests/e2e/.
+        #
+        # A total of 0.0 means /proc/meminfo could not be read. That is "we could not
+        # tell", not "the machine is too small", and treating it as the latter would
+        # blacklist every escalation on any host without procfs.
+        total = _mem_total_gb()
+        if total and need > total:
+            self.pending_esc.pop(0)
+            self._release_claim(did)
+            self.blacklist(did, "escalation needs %.0fGB but this machine has "
+                                "%.0fGB total — it can never be scheduled here; "
+                                "use a larger host or lower big_doc_mem_gb"
+                                % (need, total))
             return
         if mem_gb >= need:
             self.pending_esc.pop(0)

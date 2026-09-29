@@ -128,8 +128,13 @@ is committed and may carry a `README.md`; a dot-dir that holds
 
 ## 6. Enforcement (this is checked, not just documented)
 
-`scripts/check_structure.py` (run via `make check`, in CI, and as a
-pre-commit hook) fails the build if the conventions above drift:
+`scripts/check_structure.py` fails the build if the conventions above
+drift. It runs via **`make check`** (and inside `make verify`, the
+done-gate) and **in CI** on the 3.12 ring. It is stdlib-only and
+3.6-safe on purpose, so it can run before anything is installed.
+
+There is **no pre-commit hook yet** — that is the one part of this
+section still to build, tracked in `docs/roadmap.md` (M6).
 
 | Rule | What it verifies |
 |------|------------------|

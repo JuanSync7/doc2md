@@ -114,7 +114,39 @@ def test_supervisor_heals_corpus_to_done(tmp_path):
     assert status["totals"]["blacklisted"] == 0
 
 
+def _big_doc_mem_gb():
+    from backend.ingest import load_ingest_config
+    return load_ingest_config().big_doc_mem_gb
+
+
+def _mem_total_gb():
+    try:
+        with open("/proc/meminfo") as fh:
+            for line in fh:
+                if line.startswith("MemTotal:"):
+                    return int(line.split()[1]) / (1024.0 * 1024.0)
+    except (OSError, ValueError):
+        pass
+    return 0.0
+
+
 def test_supervisor_escalates_oom_victim_and_recovers(tmp_path):
+    """RECOVERY needs a host that can actually hold the escalation lane.
+
+    The solo lane reserves `big_doc_mem_gb` (24GB by default). On a smaller machine
+    the supervisor now refuses the escalation outright — measured and correct, since
+    waiting for memory the host does not have is a deadlock rather than a queue —
+    but that is a different outcome from the one this test asserts. Skipped with the
+    two numbers rather than silently asserting something the machine cannot do: this
+    test hung for 60s on a 16GB CI runner and passed on a 251GB workstation, and the
+    difference was invisible until a CI job ran it at all.
+    """
+    need, total = _big_doc_mem_gb(), _mem_total_gb()
+    if total and need > total:
+        pytest.skip("escalation reserves %.0fGB and this machine has %.0fGB total — "
+                    "recovery is not schedulable here (see "
+                    "test_an_escalation_larger_than_the_machine_is_refused_not_queued)"
+                    % (need, total))
     src, out, fake = _corpus(tmp_path, n=3)
     with open(os.path.join(out, "_fake_mode.txt"), "w") as f:
         f.write("oom_first")

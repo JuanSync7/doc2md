@@ -270,3 +270,101 @@ def test_an_escaped_empty_comment_is_prose_about_a_comment():
 def test_the_separator_is_invisible_to_the_token_stream():
     from backend.ingest import tokenize
     assert tokenize(markdown_to_text("***alpha***<!---->*beta*")) == ["alphabeta"]
+
+
+# ================================ the PDF lane's markdown, normalised (M1)
+#
+# Measured on the SAME source document converted by both lanes:
+#
+#   office  ... driving \<rst_n> low ...    the R&D bring-up board ...
+#   pdf     ... driving &lt;rst\_n&gt; ...  the R&amp;D bring-up board ...
+#
+# Three defects, all in the PDF lane, none of them named by any warning:
+#
+#  1. HTML ENTITIES survive into the markdown. `markdown_to_text` does not decode
+#     them, so the text layer the knowledge linker and any plain-text consumer read
+#     literally contains "R&amp;D" — and a search for "R&D" returns nothing. The
+#     tokenizer also sees junk words: `&lt;rst\_n&gt;` tokenizes to lt/rst/n/gt.
+#  2. INTRAWORD UNDERSCORES are escaped for no reason. CommonMark already forbids
+#     `_` emphasis inside a word, so `clk\_ref\_sel` buys nothing and costs tokens
+#     (8 vs 6) while breaking an exact-string search for the identifier.
+#  3. Both cost tokens on every embedding, which is the charter's other Job 1 half.
+#
+# The office lane already writes the correct form, so this is making one lane agree
+# with the other rather than inventing a policy.
+
+def test_an_html_entity_becomes_the_character_it_names():
+    from backend.ingest import normalize_pdf_markdown
+    assert normalize_pdf_markdown("the R&amp;D board") == "the R&D board"
+    assert normalize_pdf_markdown("a &quot;quoted&quot; word") == 'a "quoted" word'
+
+
+def test_a_decoded_angle_bracket_is_escaped_not_left_to_open_a_tag():
+    """THE trap. Decoding `&lt;rst_n&gt;` to `<rst_n>` would hand a renderer
+    something that looks like an HTML tag — the entity was at least inert. The
+    office lane writes `\\<rst_n>` for exactly this content, so the correct form is
+    already settled in-repo: escape the opener, leave the closer."""
+    from backend.ingest import normalize_pdf_markdown
+    assert normalize_pdf_markdown("driving &lt;rst_n&gt; low") == \
+        "driving \\<rst_n> low"
+
+
+def test_an_intraword_underscore_escape_is_removed():
+    from backend.ingest import normalize_pdf_markdown
+    assert normalize_pdf_markdown("clk\\_ref\\_sel") == "clk_ref_sel"
+    assert normalize_pdf_markdown("PllLockMon\\_status\\_q") == "PllLockMon_status_q"
+
+
+def test_an_underscore_escape_that_is_doing_work_is_kept():
+    """Not every `\\_` is noise. At a word BOUNDARY the underscore can open
+    emphasis, so the escape is load-bearing and removing it would change what the
+    document means — the one thing a normaliser must never do."""
+    from backend.ingest import normalize_pdf_markdown
+    assert normalize_pdf_markdown("a \\_leading underscore") == "a \\_leading underscore"
+    assert normalize_pdf_markdown("trailing\\_ underscore") == "trailing\\_ underscore"
+
+
+def test_a_code_span_is_left_exactly_as_written():
+    """Inside a code span a backslash is a literal backslash and an entity is
+    literal text. Touching either would change the content, not the encoding."""
+    from backend.ingest import normalize_pdf_markdown
+    src = "use `printf(&quot;%s\\_t&quot;)` here"
+    assert normalize_pdf_markdown(src) == src
+
+
+def test_a_fenced_block_is_left_exactly_as_written():
+    from backend.ingest import normalize_pdf_markdown
+    src = "```c\nchar *s = &quot;a\\_b&quot;;\n```\n"
+    assert normalize_pdf_markdown(src) == src
+
+
+def test_the_result_is_what_the_office_lane_writes_for_the_same_sentence():
+    """The point of the whole exercise, as one assertion: two lanes, one source
+    sentence, one answer."""
+    from backend.ingest import normalize_pdf_markdown
+    pdf = ("The clk\\_ref\\_sel field selects the reference; driving &lt;rst\\_n&gt; "
+           "low forces the safe default, and the R&amp;D board exposes every strap.")
+    office = ("The clk_ref_sel field selects the reference; driving \\<rst_n> "
+              "low forces the safe default, and the R&D board exposes every strap.")
+    assert normalize_pdf_markdown(pdf) == office
+
+
+def test_the_normalised_text_layer_is_searchable():
+    """What the defect actually cost: the knowledge layer and every plain-text
+    consumer read `markdown_to_text`, which does not decode entities."""
+    from backend.ingest import normalize_pdf_markdown, markdown_to_text
+    before = markdown_to_text("the R&amp;D board")
+    after = markdown_to_text(normalize_pdf_markdown("the R&amp;D board"))
+    assert "R&D" not in before and "R&D" in after
+
+
+def test_it_is_idempotent():
+    from backend.ingest import normalize_pdf_markdown
+    once = normalize_pdf_markdown("R&amp;D and clk\\_ref\\_sel and &lt;x&gt;")
+    assert normalize_pdf_markdown(once) == once
+
+
+def test_ordinary_markdown_is_untouched():
+    from backend.ingest import normalize_pdf_markdown
+    src = "# Heading\n\n| a | b |\n| --- | --- |\n\n*emph* and **strong** and a [l](u)\n"
+    assert normalize_pdf_markdown(src) == src

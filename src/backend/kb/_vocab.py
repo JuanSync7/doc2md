@@ -160,8 +160,30 @@ class Vocabulary(object):
         Without this, every entry in a group that omits ``type`` is silently
         unchecked — which is exactly how 15 of 30 entities in the worked example
         escaped validation.
+
+        RAISES ``VocabularyError`` when the vocabulary declares no ``entity_types``
+        at all, and that is deliberate rather than an oversight: `_lint` catches it
+        to report `vocab-missing` — "this term list could not be consulted" — which
+        is a different finding from "this group is not registered", and blaming the
+        DOCUMENT for a vocabulary gap would send someone to edit the wrong file.
+        Callers that must not abort (the accept path) check `has("entity_types")`
+        first.
         """
         return (self._node("entity_types").get("group_types") or {}).get(group, "")
+
+    def group_names(self):
+        # type: () -> list
+        """Every entity GROUP name the registry declares, sorted.
+
+        The counterpart of `group_type`. Acceptance reads a member's type from the
+        group NAME, so a model that is never told these names cannot produce an
+        acceptable entity — which is what happened: keying the groups by entity
+        TYPE (the only list the prompt showed) lost every record to
+        `untyped-member-of-unknown-group`."""
+        node = self._d.get("entity_types")
+        if not isinstance(node, dict):
+            return []
+        return sorted((node.get("group_types") or {}).keys())
 
     def maps_to(self, field, value=None):
         # type: (str, str) -> str

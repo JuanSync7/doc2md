@@ -41,6 +41,7 @@ DECISION_CODES = (
     "empty_source",           # a zero-byte source: vacuously lossless, nothing to lose
     "captions_carried",       # a --force rebuild reused prior captions by image_id
     "skipped_existing",       # an already-built bundle was left alone
+    "source_changed",         # the source moved, so the bundle was superseded
     "metadata_tier",          # enrichment ran with a model, or deterministically
     "vocabulary_selected",    # which term list every value was graded against
     "identity_namespace",     # the namespace meta.id / meta.uid were derived under

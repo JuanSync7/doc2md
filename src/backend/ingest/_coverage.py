@@ -18,11 +18,13 @@ summary: Measure what fraction of a source document's content survived into a ta
 # block actually moves the number — which is what lets it DRIVE the fixes.
 import html as _htmllib
 import re
+import unicodedata
 from collections import Counter, namedtuple
 
-__all__ = ["tokenize", "coverage", "CoverageReport", "is_lossy", "is_lossy_explained",
+__all__ = ["tokenize", "normalize_pdf_text", "coverage", "CoverageReport", "is_lossy", "is_lossy_explained",
            "char_ngram_recall", "html_to_text", "strip_running_lines", "words_in_bbox",
-           "explain_gap", "GapReport", "merge_boxes"]
+           "explain_gap", "GapReport", "merge_boxes", "intersect_boxes",
+           "drawn_image_floor"]
 
 # recall  : n_covered / n_source in [0, 1] (1.0 when the source has no tokens)
 # n_source: total source tokens (multiset size)
@@ -43,6 +45,42 @@ def tokenize(text):
     if not text:
         return []
     return _TOKEN.findall(text.lower())
+
+
+# Characters a PDF's text layer carries that a reader never sees and NFKC does not
+# touch — they are formatting marks, not compatibility equivalents. A soft hyphen
+# left at a line break splits a word for the ASCII tokenizer exactly as a ligature
+# does: `hyphen\xadated` arrives as two tokens, and both are counted as lost.
+_INVISIBLE = re.compile("[\u00ad\u200b\u200c\u200d\u2060\ufeff]")
+
+
+def normalize_pdf_text(text):
+    # type: (str) -> str
+    """Fold the character-level noise a PDF text layer and a converter disagree on.
+
+    THE PDF LANE ONLY. Poppler hands back the ligature glyph the font actually
+    contains (``con\ufb01dential``); docling hands back the two letters a reader sees
+    (``confidential``). The shared tokenizer is ``[a-z0-9]+``, so ``\ufb01`` is not in
+    the class at all: the source word arrives as ``con`` + ``dential``, neither half
+    matches, and a document that lost nothing is reported as having lost two tokens.
+
+    Deliberately NOT inside `tokenize`. The office lane gates at EXACTLY 1.0 against
+    a ground truth read from the same OOXML the converter read, so both sides already
+    agree about characters and nothing there needs this — while a fold in the shared
+    tokenizer would quietly change what that 1.0 means on every office document. If
+    it ever does move into shared code, the full office corpus is re-run first.
+
+    NFKC is a COMPATIBILITY fold, not a transliteration: ``na\u00efve`` stays
+    ``na\u00efve``. Both sides then read the same non-ASCII word, the ASCII tokenizer
+    reads it as two fragments on both sides, and the measurement stays symmetric.
+    Stripping the accent would assert the document said ``naive``, which this function
+    is not entitled to do.
+
+    Applied SYMMETRICALLY to source and markdown, or it is not a fold but a thumb on
+    the scale — `pdf_coverage_report` is the one caller and applies it to both."""
+    if not text:
+        return ""
+    return _INVISIBLE.sub("", unicodedata.normalize("NFKC", text))
 
 
 _HTML_SCRIPT_STYLE = re.compile(r"(?is)<(script|style)\b[^>]*>.*?</\1\s*>")
@@ -150,6 +188,80 @@ def merge_boxes(boxes, pad=0.01):
                 out.append((box, n))
         clusters = out
     return clusters
+
+
+def drawn_image_floor(page_drawn_frac, min_frac=0.05):
+    # type: (dict, float) -> int
+    """A LOWER BOUND on how many figures a paginated source holds, by drawn area.
+
+    ``page_drawn_frac`` maps page number to the fraction of that page covered by
+    drawn objects, with page frames and backgrounds already removed by the caller
+    (this function never sees the object list and must not pretend to). A page whose
+    drawn area reaches ``min_frac`` contributes ONE.
+
+    THE DENOMINATOR `images.gate` was missing. Without it that gate compared the
+    markdown with itself, so on `pdf/kestrel-dataflow.pdf` — a page that is entirely
+    a vector diagram, converted to 19 tokens and zero images — no reference was made,
+    therefore no reference failed, therefore `gate: pass` and `status: ok`.
+
+    Deliberately NOT the exclusion detector's answer. Measured on that page the
+    diagram is five separate rounded rectangles of two paths each, so every cluster
+    falls under ``image_region_min_paths`` — correctly, because a two-path cluster
+    must not be allowed to EXCUSE text sitting over it. Counting figures is a weaker
+    question than excusing text and deserves a weaker threshold.
+
+    At most ONE per page, on purpose. Five boxes of one diagram are one figure, and a
+    floor that counted parts would report loss on a document that emitted its figure
+    correctly — the opposite of the failure this exists to catch. A lower bound can
+    only ever accuse a conversion of missing something it really did miss."""
+    n = 0
+    for _page, frac in (page_drawn_frac or {}).items():
+        try:
+            if float(frac) >= min_frac:
+                n += 1
+        except (TypeError, ValueError):
+            continue
+    return n
+
+
+def intersect_boxes(claimed, evidence):
+    # type: (list, list) -> list
+    """Figure regions TWO independent detectors agree on: ``[(page, x0, y0, x1, y1)]``.
+
+    Text inside a figure region is excluded from the losslessness ground truth,
+    because it is figure content rather than lost body text. That exclusion is the
+    most dangerous line in the measurement — whatever decides "this region is a
+    figure" can delete the evidence of a real loss — so the decider must not be the
+    converter being graded, and must not be naive either. Measured on
+    `pdf/kestrel-clock-spec.pdf`, neither available detector can own the decision:
+
+      * docling's own picture bboxes are SELF-GRADING. A body block it misclassified
+        as a picture would excuse exactly the text it dropped, and the gate would
+        read green over real damage.
+      * the PDF's own drawing objects are INDEPENDENT but naive. The register map's
+        ruling lines are a cluster of vector paths, so that detector claims the whole
+        table — 55 tokens of real body text leave the ground truth with it.
+
+    So a region counts as a figure only where both agree, and only over their
+    OVERLAP. Each detector can then merely shrink the exclusion, never widen it, and
+    any disagreement leaves the text counting against the converter. Symmetric by
+    construction: neither argument is privileged, and the names say only which
+    detector a caller happened to put first.
+
+    A zero-area intersection is not an overlap — it excuses nothing, and returning
+    it would put an empty rectangle in the exclusion set for every abutting pair."""
+    out = []
+    for cpg, cx0, cy0, cx1, cy1 in claimed or []:
+        for epg, ex0, ey0, ex1, ey1 in evidence or []:
+            if cpg != epg:
+                continue
+            x0, y0 = max(cx0, ex0), max(cy0, ey0)
+            x1, y1 = min(cx1, ex1), min(cy1, ey1)
+            if x1 > x0 and y1 > y0:
+                out.append((cpg, x0, y0, x1, y1))
+    # Deterministic, because these boxes reach report.json through the text they
+    # exclude and a reordering would show up as a diff nobody caused.
+    return sorted(set(out))
 
 
 _PAGE_BREAK = "\f"

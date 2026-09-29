@@ -164,32 +164,192 @@ Remaining holes: no NFKC/ligature fold (a residual `ﬁ` fakes loss), the
 exclusion set partly trusts docling's own picture bboxes (self-grading), the
 OCR path measures nothing, and a diagram-only digital PDF misroutes to OCR.
 
-- [ ] Move the gate policy into `src/`: `_pdf_losslessness` →
+- [x] Move the gate policy into `src/`: `_pdf_losslessness` →
       `backend.validate.pdf_coverage_report` (pure strings-in/dict-out, 3.6 +
       stdlib; poppler subprocess calls stay in the script), with a mirrored
       `tests/unit/backend/` file — *before* any policy change, so the office
       coercion invariant (`gate` never `pass` off-lane) is test-protected.
-- [ ] NFKC + ligature normalization applied symmetrically to both sides —
+      *(2026-09-26: done. The script keeps a 3-line adapter that unpacks the
+      config; the validator REFUSES to default its four thresholds, so they
+      cannot drift from `ingest.toml`, and the integration test moves each one
+      alone to prove the argument order. The move also corrected an overstated
+      claim about the raw-text signature: pre-stripping at the same threshold is
+      a no-op, so the real teeth are a caller stripping at its OWN threshold —
+      measured at 0.77 recall against the document and a flattering 1.00 against
+      a pre-stripped copy of it.)*
+- [x] NFKC + ligature normalization applied symmetrically to both sides —
       as a **pdf-lane-only entry point**, not inside the shared `tokenize`
       (office 1.0 gate untouched; if it ever moves into shared code, re-run
       the full office corpus first).
-- [ ] Make the exclusion set converter-blind at convert time: use
+      *(2026-09-26: `backend.ingest.normalize_pdf_text` — NFKC plus the
+      invisible marks NFKC does NOT touch (soft hyphen, ZW\*, word joiner,
+      BOM), which split a word for the ASCII tokenizer exactly as a ligature
+      does. Applied inside `pdf_coverage_report` to source, markdown,
+      furniture and figure text alike, so the symmetry is structural rather
+      than a caller's discipline. The office `tokenize` is untouched and a
+      test asserts it still reads `con\ufb01dential` as two fragments.
+      CAVEAT, measured: no document in the corpus contains a ligature or an
+      invisible mark, so the fold is a no-op on all 17 and is proven at unit
+      level only. The asymmetry it fixes — poppler returning the font's glyph
+      where docling returns the letters — needs a PDF whose font actually
+      ligates, which LibreOffice does not produce deterministically from the
+      synthetic sources. That is the "hyphenation + ligature doc" stress
+      fixture below, and it is a harder fixture than it reads.)*
+- [x] Make the exclusion set converter-blind at convert time: use
       `_pdf_drawn_boxes` (pypdfium2, the PDF's own drawing objects) instead
       of docling's `_picture_boxes` for figure-region text — removes the last
       docling-judges-docling input from the measurement. pypdfium2 stays in
       the PDF-lane script; only its box *output* crosses into the 3.6-stdlib
       validate function.
-- [ ] Fix the OCR routing: area-weighted text-layer probe (a diagram-only
-      digital PDF must not trip full-doc OCR); when a thin text layer exists,
-      score the OCR output against it; record RapidOCR per-box confidence
-      (mean/min) so scans get *some* measured signal.
+      *(2026-09-26: done, but NOT as "instead of" — measurement said that
+      would have been a downgrade. On `pdf/kestrel-clock-spec.pdf` the
+      register map's ruling lines form a path cluster, so `_pdf_drawn_boxes`
+      claims the whole table and 55 tokens of real body text would leave the
+      ground truth with it: swapping one detector for the other trades a
+      circular exclusion for an over-wide one. Implemented instead as
+      `backend.ingest.intersect_boxes` + `dc._figure_regions`: a region is a
+      figure only where BOTH detectors agree, and only over their overlap, so
+      each can merely SHRINK the exclusion and any disagreement leaves the
+      text counting against the converter. Docling's claim is no longer
+      SUFFICIENT to excuse anything, which is the part that mattered.
+      Numerically a no-op on the corpus (clock-spec's agreed regions hold no
+      text, so `figure_text_tokens` was already 0) — this is a guarantee, not
+      a fix, and it is proven by injecting a full-page docling picture claim
+      and showing it buys no exclusion. Two gaps left, both narrower than the
+      original: the HTML lane has no drawing objects to consult, so its
+      exclusion stays circular; and a measure-only sweep has no docling boxes
+      to agree with, so it uses the independent detector alone — not
+      circular, but over-wide, so a swept document reads slightly kinder than
+      the same document at convert time.)*
+- [x] Fix the OCR routing: area-weighted text-layer probe (a diagram-only
+      digital PDF must not trip full-doc OCR).
+      *(2026-09-26: `pdf_has_text_layer` now uses TWO signals. Clearing
+      `min_chars_per_page` in every window is digital on the spot and the
+      expensive step never runs; a THIN window is judged by the PDF's own
+      objects (`_page_raster_fracs`) — a page whose content is a raster
+      covering >= `scan_cover_min` needs OCR whatever text it also carries (a
+      scan with a burnt-in header stamp), while a page thin because it is
+      mostly vector art is digital. Measured: dataflow 79 chars/page and 12
+      vector paths, no raster -> digital; the scan 0 chars and a page-sized
+      raster on every page -> OCR; clock-spec unchanged. A missing pypdfium2
+      is NO evidence rather than evidence of absence, so it keeps the old
+      OCR verdict. `pdf/kestrel-dataflow.pdf` now converts through the
+      digital path and its real text layer is measured — but it stays XFAIL,
+      because the routing bug was not its only one: see below.)*
 - [ ] Extract figures on the OCR path (today: none — placeholders bail and
       the images gate degrades spuriously; also a hard prerequisite for M4).
-- [ ] Stress fixtures, before the features that fix them: hyphenation +
-      ligature doc, per-page-varying footer ("Page 3 of 120"), non-dot-leader
-      TOC, and a multi-column reading-order fixture (that one *encodes
-      measured truth* — docling's reading-order model owns the fix; if it
-      falls short it's an xfail with a `_note`, not a slice here).
+      *(2026-09-26, widened by measurement: the OCR path is no longer the only
+      gap. `pdf/kestrel-dataflow.pdf` now routes correctly to the DIGITAL path
+      and docling's layout model still finds no picture at all in a vector-only
+      page — 0 images, 0 headings, the whole document 19 tokens of the
+      diagram's labels on one line. A floor may have to come from the PDF's own
+      drawing clusters rather than from docling.)*
+
+- [x] Stop `images.gate` reading `pass` over ZERO images.
+      *(2026-09-27: `images.source_images` is the denominator, and the gate has
+      three states like the losslessness one — source known to hold 0 is
+      `pass`, known to hold more than arrived is `degraded`, unknown is
+      `unmeasured` and degrades nothing. An EXCESS is never loss, since one
+      picture can be referenced twice and dedupe to one file. The PDF lane
+      supplies it on the digital path from `drawn_image_floor` over the PDF's
+      own drawing objects — a LOWER bound, at most one per page, because the
+      dataflow diagram is five two-path rectangles and a floor that counted
+      parts would accuse a correct conversion. `pdf/kestrel-dataflow.pdf` now
+      reads `source_images: 1, gate: degraded, status: degraded`. Its exclusion
+      detector could not supply this: at `image_region_min_paths` 10 every one
+      of those clusters is rejected, correctly, because a two-path cluster must
+      not EXCUSE text sitting over it — counting figures is a weaker question
+      than excusing text and gets a weaker threshold (area >= 5% of a page).)*
+
+- [ ] Give the OFFICE lane a converter-blind picture count. Eight office
+      documents now read `images.gate: unmeasured` because their only
+      available count comes from `ooxml_image_parts`, which reads the
+      CONVERTER's own sentinels — circular, so it cannot be the denominator. A
+      raw `word/media/*` count is not it either: it includes header, footer and
+      theme images the converter deliberately drops, so it would report loss on
+      a correct conversion. The honest count is body-part `<a:blip>` /
+      `<pic:pic>` references taken from the source XML on the ground-truth
+      side. Until then `unmeasured` is the truthful reading and degrades
+      nothing; five eval rows carry a `_note` saying so.
+
+- [ ] Count a scanned page's raster as a figure. `_pdf_drawn_area_fracs` drops
+      page-covering objects as frames, so a scan reads 0 drawn area — right for
+      a white background rect, wrong for the page image that IS the content. The
+      OCR path therefore passes `None` rather than a floor of 0, so it reads
+      `unmeasured` instead of claiming the source held no pictures. Closes
+      together with "extract figures on the OCR path".
+- [~] Stress fixtures, before the features that fix them.
+      *(2026-09-27: the HYPHENATION + LIGATURE fixture has landed as
+      `office/kestrel-ligature.docx` and its derived `pdf/kestrel-ligature.pdf`,
+      and it pins two things at once. (1) The fold WORKS on a real document:
+      measured with `normalize_pdf_text` removed the PDF scores 0.7976 over 84
+      source tokens, with it 0.9041 over 73 — so without the fold this document
+      sits BELOW `min_recall` and reports content loss it did not suffer. Every
+      U+FB01/U+FB02 word is covered. (2) A real docling defect is now pinned
+      instead of invisible: the 7 tokens still absent are exactly the words the
+      source spells with U+FB00 (ff) or U+FB03 (ffi) — docling drops or
+      MISPLACES those glyphs, emitting `o set flow` and `hyphen ff ation` where
+      the source reads `offset flow` and `hyphenation`, while fi/fl come
+      through. `gap_absent_max: 7` is a CEILING on a known bug, not a target.
+      The office half of the same document is deliberately boring at recall 1.0
+      — both its sides read the same OOXML, so a ligature is invisible to that
+      gate, and `md_contains` asserts the glyphs survive VERBATIM because
+      folding them there would be a silent rewrite of the document's own
+      characters. Corpus generation stays byte-identical on 3.6.8 and 3.12.
+      NOTE, measured: LibreOffice does not auto-ligate, so the font-substitution
+      asymmetry (poppler returning a glyph where docling returns letters) cannot
+      be manufactured from a synthetic source — the literal glyphs are the part
+      that is deterministic on any host.)*
+
+      *(2026-09-28: the LABELLED FIGURE fixture has landed as
+      `office/kestrel-clocktree.pptx` + derived `pdf/kestrel-clocktree.pdf`,
+      and it is the first document in this corpus with a real figure-text
+      debt. Measured: `figure_text_tokens: 19`, `gap.image_text: 19`,
+      `absent: 0` — the whole source accounted for and ALL of it trapped in the
+      figure, while the office lane reads the same 12 labels as ordinary list
+      text at recall 1.0. Same words, two lanes, two correct-but-opposite
+      answers, which is what makes the debt falsifiable. It had to be DENSE:
+      `_pdf_drawn_boxes` keeps a merged cluster only at
+      `image_region_min_paths` (10) or more, so the dataflow deck's five
+      far-apart boxes each stay a rejected two-path cluster while these twelve,
+      packed edge to edge, merge into one cluster of twenty-four. New eval
+      probe `figure_text_tokens_min` gates it as a FLOOR: a FALL means the
+      figure-region probe stopped seeing a figure, silently returning those
+      words to the body ground truth to be judged as converter loss.)*
+
+      Still open: a per-page-varying footer ("Page 3 of 120"), a non-dot-leader
+      TOC, and a multi-column reading-order fixture (that one *encodes measured
+      truth* — docling's reading-order model owns the fix; if it falls short
+      it's an xfail with a `_note`, not a slice here).
+
+- [~] Make `caption_is_useful` mean what a reader assumes.
+      *(2026-09-28: `backend.ingest.caption_recovery` is the objective half the
+      charter named — what FRACTION of a figure's own words the caption brought
+      back, graded against text an independent poppler probe recovered rather
+      than against anything the converter or the model said. Measured on
+      `pdf/kestrel-clocktree.pdf` with Claude as the model: a caption written
+      after looking at the diagram scores **1.000**, and the caption of a
+      decorative colour grid scores **0.059** — where `caption_is_useful`
+      scored BOTH as useful, because it is a shape check and says so. `None`
+      when the figure holds no words: a decorative image cannot be graded this
+      way, and scoring it a perfect 1.0 would be the same vacuity again.
+      Deliberately NOT a keyword list for "decorative": that is a semantic
+      judgement a word list gets wrong in both directions, and a wrong USELESS
+      silently discards a real figure's only textual record.
+      Also landed, and it turned out to be a LOSSLESSNESS fix rather than
+      tooling: `losslessness.figure_text` now publishes the words themselves.
+      Measured before it existed, `pdf/kestrel-clocktree.pdf` reported 19
+      figure-text tokens and not one of those 19 words appeared anywhere in its
+      bundle — they are that document's only content, excluded from the body
+      ground truth as figure content, and they existed in no artifact at all.)*
+
+      Still open: wire `caption_recovery` into `caption_report` so the gate
+      carries it per document, and gate it in the eval. That needs a decision
+      the data does not make for us — the figure-word pool is published per
+      DOCUMENT while captions are per IMAGE, so a document with two figures can
+      only be graded against the union until the region-to-image mapping is
+      published too.
+
 - [ ] HTML lane coverage: a ground truth exists (`_source_text` uses
       `html_to_text`, independent of docling's HTML backend) but nothing
       exercises it — no HTML fixture in the eval corpus, and the

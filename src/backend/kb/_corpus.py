@@ -42,7 +42,8 @@ from difflib import SequenceMatcher
 from backend.ingest import parse_block, render_block
 
 from ._lint import ERROR, INFO, WARN
-from ._schema import (FIELDS, SCHEMA_VERSION, field, group_vocab, proposed_key,
+from ._schema import (FIELDS, SCHEMA_VERSION, field, group_vocab, norm_key,
+                      proposed_key,
                       record_vocab)
 
 __all__ = ["CorpusFinding", "apply_promotions", "corpus_findings",
@@ -106,20 +107,6 @@ def _f(code, severity, where, message, detail=()):
 
 
 # --------------------------------------------------------------- normalisation
-
-def norm_key(value):
-    # type: (object) -> str
-    """Identity key: casing, separators and punctuation are not distinctions.
-
-    ``RHEL-8``, ``rhel_8`` and ``rhel 8`` are one concept spelled three ways, and a
-    knowledge base that keeps all three has three nodes where it needs one. NFKD
-    folding means an accent is not an identity either (``Café`` == ``cafe``): a
-    corpus that disagrees with itself about a diacritic is the same defect.
-    """
-    text = ("%s" % (value,)).strip().lower()
-    folded = unicodedata.normalize("NFKD", text)
-    return "".join(ch for ch in folded if ch.isalnum())
-
 
 def strip_polarity(value):
     # type: (object) -> str

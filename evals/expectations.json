@@ -72,7 +72,7 @@
   "n_source_tokens_min": 26,
   "coverage_gate": "pass",
   "has_toc": false,
-  "images_gate": "pass",
+  "images_gate": "unmeasured",
   "images_referenced": 0,
   "md_contains": [
    "# Kestrel bring-up quick notes",
@@ -80,7 +80,8 @@
   ],
   "savings_ratio_min": 10.0,
   "structure_fidelity_compared_min": 3,
-  "structure_fidelity_gate": "pass"
+  "structure_fidelity_gate": "pass",
+  "_note": "`images_gate` reads `unmeasured` rather than `pass`, and that is a RATCHET, not a regression: this document carries no images and nothing in the office lane has ever verified that claim. The old `pass` compared the markdown with itself -- no reference was made, so no reference failed -- the same vacuity `n_source_tokens` closed for the text gate, and it read `pass` on a PDF page that was entirely a diagram nobody extracted. `images.source_images` is the denominator now; the office lane cannot supply it yet because its only available count comes from the converter's own sentinels, which would be circular. `unmeasured` degrades nothing and this row flips back to `pass` when a converter-blind picture count lands (docs/roadmap.md)."
  },
  "office/kestrel-adversarial.xlsx": {
   "kind": "bundle",
@@ -90,7 +91,7 @@
   "token_recall_min": 1.0,
   "n_source_tokens_min": 51,
   "coverage_gate": "pass",
-  "images_gate": "pass",
+  "images_gate": "unmeasured",
   "images_referenced": 0,
   "structure_fidelity_gate": "pass",
   "structure_fidelity_compared_min": 6,
@@ -113,7 +114,7 @@
    "SUM(B2:B3)",
    "2026-01-05"
   ],
-  "_note": "The workbook written to make every xlsx policy drop GRADEABLE on a real document. Each md_contains line is a measured loss the gate lets through as policy and a warning names: 46027 is 2026-01-05 held as an Excel serial (unformatted_cell_values); the sparse row renders as |  |  | 0.990 | because the value's ADDRESS is C and nothing counts <c> elements to place it; | Total | 316.25 | publishes a cached result whose =SUM(B2:B3) is gone (dropped_cell_formulas); | Worst |  | is a formula whose cached value was never written, so BOTH halves of the token gate read empty and recall is a vacuous 1.0 over a total that vanished -- the warning is the only receipt. '## Scratch' is a hidden sheet published as a peer of the real ones (hidden_content_published). md_not_contains pins the two losses as losses: neither the expression nor the formatted date is anywhere in the body."
+  "_note": "The workbook written to make every xlsx policy drop GRADEABLE on a real document. Each md_contains line is a measured loss the gate lets through as policy and a warning names: 46027 is 2026-01-05 held as an Excel serial (unformatted_cell_values); the sparse row renders as |  |  | 0.990 | because the value's ADDRESS is C and nothing counts <c> elements to place it; | Total | 316.25 | publishes a cached result whose =SUM(B2:B3) is gone (dropped_cell_formulas); | Worst |  | is a formula whose cached value was never written, so BOTH halves of the token gate read empty and recall is a vacuous 1.0 over a total that vanished -- the warning is the only receipt. '## Scratch' is a hidden sheet published as a peer of the real ones (hidden_content_published). md_not_contains pins the two losses as losses: neither the expression nor the formatted date is anywhere in the body. `images_gate` reads `unmeasured` rather than `pass`, and that is a RATCHET, not a regression: this document carries no images and nothing in the office lane has ever verified that claim. The old `pass` compared the markdown with itself -- no reference was made, so no reference failed -- the same vacuity `n_source_tokens` closed for the text gate, and it read `pass` on a PDF page that was entirely a diagram nobody extracted. `images.source_images` is the denominator now; the office lane cannot supply it yet because its only available count comes from the converter's own sentinels, which would be circular. `unmeasured` degrades nothing and this row flips back to `pass` when a converter-blind picture count lands (docs/roadmap.md)."
  },
  "office/kestrel-registers.xlsx": {
   "kind": "bundle",
@@ -123,7 +124,7 @@
   "token_recall_min": 1.0,
   "n_source_tokens_min": 107,
   "coverage_gate": "pass",
-  "images_gate": "pass",
+  "images_gate": "unmeasured",
   "images_referenced": 0,
   "md_contains": [
    "## RegisterMap",
@@ -141,7 +142,7 @@
   ],
   "structure_fidelity_gate": "pass",
   "structure_fidelity_compared_min": 4,
-  "_note": "P9.4 flipped this from 'unmeasured'. `compared` is pinned because the gate word alone is not a measurement: the workbook exhibits headings, heading_path, tables and block_sequence. strong/em/strike/links stay in structure_fidelity.unmeasured -- the ground truth OMITS them rather than stating zero, because a zero would certify a drop the converter really makes, and dropped_cell_emphasis counts it instead."
+  "_note": "P9.4 flipped this from 'unmeasured'. `compared` is pinned because the gate word alone is not a measurement: the workbook exhibits headings, heading_path, tables and block_sequence. strong/em/strike/links stay in structure_fidelity.unmeasured -- the ground truth OMITS them rather than stating zero, because a zero would certify a drop the converter really makes, and dropped_cell_emphasis counts it instead. `images_gate` reads `unmeasured` rather than `pass`, and that is a RATCHET, not a regression: this document carries no images and nothing in the office lane has ever verified that claim. The old `pass` compared the markdown with itself -- no reference was made, so no reference failed -- the same vacuity `n_source_tokens` closed for the text gate, and it read `pass` on a PDF page that was entirely a diagram nobody extracted. `images.source_images` is the denominator now; the office lane cannot supply it yet because its only available count comes from the converter's own sentinels, which would be circular. `unmeasured` degrades nothing and this row flips back to `pass` when a converter-blind picture count lands (docs/roadmap.md)."
  },
  "office/kestrel-overview.pptx": {
   "kind": "bundle",
@@ -151,10 +152,10 @@
   "token_recall_min": 1.0,
   "n_source_tokens_min": 108,
   "coverage_gate": "pass",
-  "images_gate": "pass",
+  "images_gate": "unmeasured",
   "md_contains": [
-   "## Slide 1 — Kestrel Platform Overview",
-   "## Slide 2 — Why a new interconnect",
+   "## Slide 1 \u2014 Kestrel Platform Overview",
+   "## Slide 2 \u2014 Why a new interconnect",
    "  - arbitration stalls the display pipe",
    "| display read | 40 | fabric team |",
    "### Speaker notes",
@@ -162,7 +163,8 @@
    "- sensor front end"
   ],
   "structure_fidelity_gate": "pass",
-  "structure_fidelity_compared_min": 7
+  "structure_fidelity_compared_min": 7,
+  "_note": "`images_gate` reads `unmeasured` rather than `pass`, and that is a RATCHET, not a regression: this document carries no images and nothing in the office lane has ever verified that claim. The old `pass` compared the markdown with itself -- no reference was made, so no reference failed -- the same vacuity `n_source_tokens` closed for the text gate, and it read `pass` on a PDF page that was entirely a diagram nobody extracted. `images.source_images` is the denominator now; the office lane cannot supply it yet because its only available count comes from the converter's own sentinels, which would be circular. `unmeasured` degrades nothing and this row flips back to `pass` when a converter-blind picture count lands (docs/roadmap.md)."
  },
  "office/kestrel-dataflow.pptx": {
   "kind": "bundle",
@@ -190,22 +192,22 @@
   "token_recall_min": 1.0,
   "n_source_tokens_min": 150,
   "coverage_gate": "pass",
-  "images_gate": "pass",
-  "_note": "The deck's p:sldIdLst says 1,5,3,4,2 and its slide PARTS are unrenumbered -- what PowerPoint writes every time a user drags a slide. Sorting part names therefore publishes the order the slides were DRAFTED in. The TOKEN gate cannot see that -- it compares multisets, so the wrong order and the right one both measure recall 1.0 / n_source 135 -- and until P9.6 nothing else could either. Now structure_fidelity grades it: injecting the exact bug (the slide order read off the unqualified id attribute) moves block_sequence, heading_path and list_item_words, and the gate fails while recall stays at 1.0. The heading pins below are the second, human-readable half of that check.",
+  "images_gate": "unmeasured",
+  "_note": "The deck's p:sldIdLst says 1,5,3,4,2 and its slide PARTS are unrenumbered -- what PowerPoint writes every time a user drags a slide. Sorting part names therefore publishes the order the slides were DRAFTED in. The TOKEN gate cannot see that -- it compares multisets, so the wrong order and the right one both measure recall 1.0 / n_source 135 -- and until P9.6 nothing else could either. Now structure_fidelity grades it: injecting the exact bug (the slide order read off the unqualified id attribute) moves block_sequence, heading_path and list_item_words, and the gate fails while recall stays at 1.0. The heading pins below are the second, human-readable half of that check. `images_gate` reads `unmeasured` rather than `pass`, and that is a RATCHET, not a regression: this document carries no images and nothing in the office lane has ever verified that claim. The old `pass` compared the markdown with itself -- no reference was made, so no reference failed -- the same vacuity `n_source_tokens` closed for the text gate, and it read `pass` on a PDF page that was entirely a diagram nobody extracted. `images.source_images` is the denominator now; the office lane cannot supply it yet because its only available count comes from the converter's own sentinels, which would be circular. `unmeasured` degrades nothing and this row flips back to `pass` when a converter-blind picture count lands (docs/roadmap.md).",
   "md_contains": [
-   "## Slide 1 — Kestrel bring-up sequence",
-   "## Slide 2 — Rollout plan",
-   "## Slide 3 — Silicon back",
-   "## Slide 4 — Board bring-up",
-   "## Slide 5 — Open questions",
+   "## Slide 1 \u2014 Kestrel bring-up sequence",
+   "## Slide 2 \u2014 Rollout plan",
+   "## Slide 3 \u2014 Silicon back",
+   "## Slide 4 \u2014 Board bring-up",
+   "## Slide 5 \u2014 Open questions",
    "- Step two of five in the bring-up sequence",
-   "## Slide 2 — Rollout plan\n\n- Step two of five in the bring-up sequence\n- Tape-in freeze at milestone three\n- Bring-up boards arrive two weeks later\n\n### Speaker notes\n\n2\\. Timing for the rollout slide\n\n- These notes belong to the rollout slide, which is part five and position two.",
+   "## Slide 2 \u2014 Rollout plan\n\n- Step two of five in the bring-up sequence\n- Tape-in freeze at milestone three\n- Bring-up boards arrive two weeks later\n\n### Speaker notes\n\n2\\. Timing for the rollout slide\n\n- These notes belong to the rollout slide, which is part five and position two.",
    "- 1\\. Reset, 2. clocks, 3. fabric traffic",
    "- \\+ 5% timing margin held across the clock tree"
   ],
   "md_not_contains": [
-   "## Slide 2 — Open questions",
-   "## Slide 5 — Rollout plan",
+   "## Slide 2 \u2014 Open questions",
+   "## Slide 5 \u2014 Rollout plan",
    "- 1. Reset, 2. clocks, 3. fabric traffic",
    "- + 5% timing margin held across the clock tree"
   ],
@@ -232,7 +234,7 @@
    "flattened_table_spans"
   ],
   "md_contains": [
-   "## Slide 1 — Kestrel adversarial deck",
+   "## Slide 1 \u2014 Kestrel adversarial deck",
    "| Corner | Owner |  |\n| --- | --- | --- |\n| Bring-up corners | fabric team |  |",
    "1. Reset the clock tree",
    "2. Release fabric traffic\n   - Skipped two levels: no sub-step exists above this",
@@ -240,8 +242,8 @@
    "[the fabric spec](https://nimbus.example/kestrel/fabric-spec)",
    "- Coverage closure is tracked per milestone\n\n  ![",
    "  - The plot above is the last six weekly regressions",
-   "## Slide 5 — Backup pricing",
-   "## Slide (unlisted): slide6 — Cut from the deck",
+   "## Slide 5 \u2014 Backup pricing",
+   "## Slide (unlisted): slide6 \u2014 Cut from the deck",
    "## Comments",
    "## Figures"
   ],
@@ -275,10 +277,10 @@
     "url": "https://nimbus-semi.example/kestrel/pdk-release-notes"
    }
   ],
-  "_note_links": "hyperlink measured to survive the soffice doc round-trip verbatim (text+url character-identical; also true for odt/rtf, probed on .doc as the binary representative). Observed on LibreOffice 6.4.7.2 — if a future soffice normalizes URLs (trailing slash, percent-encoding), this probe names the behavior change; adjust deliberately, never silently.",
+  "_note_links": "hyperlink measured to survive the soffice doc round-trip verbatim (text+url character-identical; also true for odt/rtf, probed on .doc as the binary representative). Observed on LibreOffice 6.4.7.2 \u2014 if a future soffice normalizes URLs (trailing slash, percent-encoding), this probe names the behavior change; adjust deliberately, never silently.",
   "structure_fidelity_compared_min": 11,
   "structure_fidelity_gate": "pass",
-  "_note_fidelity": "pass, not unmeasured: the LibreOffice pre-convert lands on .docx, and the gate follows the EFFECTIVE extension. So a binary .doc is graded structurally too — and the probe proves the round-trip through soffice preserves heading levels, list nesting and table geometry, not merely the words."
+  "_note_fidelity": "pass, not unmeasured: the LibreOffice pre-convert lands on .docx, and the gate follows the EFFECTIVE extension. So a binary .doc is graded structurally too \u2014 and the probe proves the round-trip through soffice preserves heading levels, list nesting and table geometry, not merely the words."
  },
  "legacy/kestrel-clock-spec.rtf": {
   "kind": "bundle",
@@ -371,7 +373,7 @@
   "gap_absent_max": 0,
   "coverage_gate": "pass",
   "has_toc": true,
-  "_note": "`toc_lines_min` is 1 and that is the TRUTH, not the desire. Measured on the pinned toolchain: docling emits the entire Table of Contents as a SINGLE merged line ('Table of Contents 1 Introduction .......... 3 1.1 Scope .......... 3 ...'), so one line is what `is_toc_line` can honestly count -- and the .docx of the same document still meets the floor of 9, which is how we know this is the PDF lane's defect and not the fixture's. The floor is re-encoded rather than the row being marked `xfail`, deliberately: everything else here is healthy (recall 0.9925, images pass over 3 referenced, every md_contains probe holds), and an xfail would switch off twenty live checks to silence one. TOC-shape robustness in `is_toc_line`/`content_start` is roadmap M2; when it lands this floor goes back up, which is a deliberate edit somebody reviews.",
+  "_note": "`toc_lines_min` is 1 and that is the TRUTH, not the desire. Measured on the pinned toolchain: docling emits the entire Table of Contents as a SINGLE merged line ('Table of Contents 1 Introduction .......... 3 1.1 Scope .......... 3 ...'), so one line is what `is_toc_line` can honestly count -- and the .docx of the same document still meets the floor of 9, which is how we know this is the PDF lane's defect and not the fixture's. The floor is re-encoded rather than the row being marked `xfail`, deliberately: everything else here is healthy (recall 0.9925, images pass over 3 referenced, every md_contains probe holds), and an xfail would switch off twenty live checks to silence one. TOC-shape robustness in `is_toc_line`/`content_start` is roadmap M2; when it lands this floor goes back up, which is a deliberate edit somebody reviews. ENTITY AND ESCAPE PARITY WITH THE OFFICE LANE, pinned. docling emitted `R&amp;D`, `&lt;rst\\_n&gt;` and `clk\\_ref\\_sel` where the office lane writes `R&D`, `\\<rst_n>` and `clk_ref_sel` for the SAME source sentence. That was not merely uglier: `markdown_to_text` does not decode entities, so the text layer the knowledge linker and every plain-text consumer read literally contained `R&amp;D` and a search for `R&D` returned nothing -- and the tokenizer saw junk words (lt/rst/n/gt). `md_not_contains` is the half that would silently regress if `normalize_pdf_markdown` were dropped from the lane, since the document would still convert and still gate green.",
   "toc_lines_min": 1,
   "images_gate": "pass",
   "images_referenced": 3,
@@ -390,27 +392,32 @@
    "DmaArbiterUnit_qos_cfg",
    "PllLockMon_status_q",
    "XbarRouteCfg_prio_map",
-   "Timing budget"
+   "Timing budget",
+   "R&D",
+   "clk_ref_sel",
+   "\\<rst_n>"
   ],
   "md_not_contains": [
-   "Confidential"
+   "Confidential",
+   "&amp;",
+   "&lt;",
+   "&gt;"
   ],
   "structure_fidelity_gate": "unmeasured",
-  "_note_fidelity": "unmeasured, not best-effort: there is no second implementation that can read structure out of a PDF, so nothing was graded and the block says so. best-effort would imply a measurement was taken on a best-effort basis. Derived, not observed — the PDF lane needs DOC2MD_PDF_PYTHON, which the office CI job does not set; assemble_bundle with source_structure=None produces exactly this block by construction."
+  "_note_fidelity": "unmeasured, not best-effort: there is no second implementation that can read structure out of a PDF, so nothing was graded and the block says so. best-effort would imply a measurement was taken on a best-effort basis. Derived, not observed \u2014 the PDF lane needs DOC2MD_PDF_PYTHON, which the office CI job does not set; assemble_bundle with source_structure=None produces exactly this block by construction."
  },
  "pdf/kestrel-dataflow.pdf": {
-  "_note": "XFAIL, and the marker is the point: what this document does now is WORSE than what is pinned, in a way that makes the gates read BETTER. It is a DIGITAL diagram-only PDF whose text layer is under pdf_has_text_layer's min_chars_per_page threshold, so the lane misroutes it to OCR. Measured on the pinned toolchain: the whole document comes out as ONE line of 19 tokens, 0 headings, 0 images; docling detects no picture at all, so nothing bails, `images.gate` reads `pass` over zero images and `status` reads `ok`. That is a VACUOUS pass over a diagram that was never extracted. The keys below pin the older, HONEST outcome (degraded, with the bail warnings), which is what this lane must return to -- encoding today's `status: ok, images_gate: pass` would make the eval assert that a destroyed document is fine, which is the one thing it exists to refuse. Fixes, all M1: area-weighted text-layer probe so a diagram-only digital PDF does not trip full-doc OCR; score OCR output against the existing text layer when one exists; extract figures on the OCR path. When any of those lands this row XPASSes, which fails the eval and forces a deliberate re-encode.",
+  "_note": "XFAIL, and the marker is still the point: the ROUTING bug is fixed, the document is not. As of 2026-09-26 `pdf_has_text_layer` judges a thin window by the PDF's own objects, so this diagram-only DIGITAL page (79 chars/page, 12 vector paths, no raster) is no longer misrouted to full-document OCR -- it converts through the digital path and its real text layer is measured (`pdf-text-coverage`, token_recall 1.0 over 13 source tokens, absent 0). That part is now honest. What remains broken is the CONVERSION: docling's layout model finds no picture at all in a vector-only page, so nothing is extracted, `images.gate` reads `pass` over ZERO images, `content.headings` is 0, and the whole document is 19 tokens of the diagram's labels run together as one line. `status: ok` over that is a vacuous pass -- a recall of 1.0 against the 13 tokens the page happens to hold says nothing about the diagram nobody extracted. The keys below therefore pin what this lane MUST return: a document that admits it is degraded and names the figure it could not bring through. Encoding today's `status: ok, images_gate: pass` would make the eval assert that a destroyed document is fine, which is the one thing it exists to refuse. Remaining fixes, both M1: extract figures on a page whose content is vector art (docling's picture detection owns this, and a floor may have to come from the PDF's own drawing clusters); and stop `images.gate` reading `pass` over zero images, which is the same vacuity as a recall of 1.0 over no tokens. When either lands this row XPASSes, which fails the eval and forces a deliberate re-encode.",
   "xfail": true,
   "kind": "bundle",
   "requires": "pdf-lane",
   "lane": "pdf",
   "status": "degraded",
-  "losslessness_method": "pdf-ocr-transcription",
+  "losslessness_method": "pdf-text-coverage",
   "losslessness_gate": "best-effort",
   "images_gate": "degraded",
   "warning_codes": [
    "pdf_toolchain",
-   "ocr_transcription",
    "image_inline_bailed",
    "image_bytes_missing"
   ],
@@ -420,7 +427,7 @@
   "structure_fidelity_gate": "unmeasured"
  },
  "pdf/kestrel-clock-spec-scan.pdf": {
-  "_note": "Scanned (rasterized) PDF: honestly reported as OCR transcription, degraded. The degraded images gate is also truthful current behavior — TODO: the OCR path never extracts figure pixels, so every detected picture placeholder bails (image_inline_bailed + image_bytes_missing).",
+  "_note": "Scanned (rasterized) PDF: honestly reported as OCR transcription, degraded. The degraded images gate is also truthful current behavior \u2014 TODO: the OCR path never extracts figure pixels, so every detected picture placeholder bails (image_inline_bailed + image_bytes_missing).",
   "kind": "bundle",
   "requires": "pdf-lane",
   "lane": "pdf",
@@ -494,8 +501,8 @@
   "kind": "unsupported"
  },
  "office/kestrel-adversarial.docx": {
-  "_note": "The document written to BREAK a naive converter, and it has already earned its place: on first conversion it found a real list-nesting defect (a bullet sub-list under a numbered step, carrying a different w:numId, was promoted to top level) at token_recall 1.0 with structural_errors 0 — invisible to every gate that existed before structure_fidelity. Every probe below is a measured value from a passing run, not a wish.",
-  "_note_renumbering": "It then earned it again. The fixture now carries the five ways a procedure was silently renumbered — a screenshot inside step 2, a paragraph between two steps, a callout text box anchored in a step, a list declared to start at 5 (w:start), and numbering carried by a paragraph STYLE through w:basedOn — plus a table row that begins at grid column 1 (w:gridBefore) and a heading style only w:basedOn identifies. Every one of them used to convert wrong at token_recall 1.0 with structure_fidelity pass; the style-carried list was invisible to BOTH sides at once, which is why the gate agreed.",
+  "_note": "The document written to BREAK a naive converter, and it has already earned its place: on first conversion it found a real list-nesting defect (a bullet sub-list under a numbered step, carrying a different w:numId, was promoted to top level) at token_recall 1.0 with structural_errors 0 \u2014 invisible to every gate that existed before structure_fidelity. Every probe below is a measured value from a passing run, not a wish.",
+  "_note_renumbering": "It then earned it again. The fixture now carries the five ways a procedure was silently renumbered \u2014 a screenshot inside step 2, a paragraph between two steps, a callout text box anchored in a step, a list declared to start at 5 (w:start), and numbering carried by a paragraph STYLE through w:basedOn \u2014 plus a table row that begins at grid column 1 (w:gridBefore) and a heading style only w:basedOn identifies. Every one of them used to convert wrong at token_recall 1.0 with structure_fidelity pass; the style-carried list was invisible to BOTH sides at once, which is why the gate agreed.",
   "kind": "bundle",
   "lane": "office",
   "status": "ok",
@@ -572,5 +579,77 @@
    "Command transcript",
    "Escalation matrix"
   ]
+ },
+ "office/kestrel-ligature.docx": {
+  "kind": "bundle",
+  "lane": "office",
+  "status": "ok",
+  "losslessness_gate": "pass",
+  "token_recall_min": 1.0,
+  "n_source_tokens_min": 80,
+  "coverage_gate": "pass",
+  "has_toc": false,
+  "images_gate": "unmeasured",
+  "images_referenced": 0,
+  "md_contains": [
+   "# Kestrel character-layer stress notes",
+   "con\ufb01guration",
+   "hyphen\u00adation"
+  ],
+  "structure_fidelity_gate": "pass",
+  "structure_fidelity_compared_min": 3,
+  "_note": "The OFFICE half of the character-layer fixture, and its job is to be BORING. The source holds literal ligature glyphs (U+FB00/FB01/FB02/FB03) and a soft hyphen; the office gate must be blind to all of them, because both its sides read the same OOXML and the shared tokenizer treats a ligature identically wherever it appears. Recall is exactly 1.0 and `normalize_pdf_text` is NOT in this path -- if it ever were, this row is what would notice. `md_contains` asserts the glyphs survive into the markdown VERBATIM: folding them here would be a silent rewrite of the document's own characters, which is Job 1's whole prohibition. The PDF derived from this same file is where the fold earns its keep -- see pdf/kestrel-ligature.pdf."
+ },
+ "pdf/kestrel-ligature.pdf": {
+  "kind": "bundle",
+  "requires": "pdf-lane",
+  "lane": "pdf",
+  "status": "ok",
+  "losslessness_method": "pdf-text-coverage",
+  "losslessness_gate": "best-effort",
+  "token_recall_min": 0.9,
+  "gap_absent_max": 7,
+  "images_gate": "pass",
+  "images_referenced": 0,
+  "md_contains": [
+   "confidential",
+   "flow"
+  ],
+  "structure_fidelity_gate": "unmeasured",
+  "_note": "MEASURED TRUTH, and it pins two different things at once. (1) THE FOLD WORKS: every ligature the source spells with U+FB01 (fi) or U+FB02 (fl) -- configuration, field, confirms, classification, fixed, final, flushes, first, confidential, flow, profiling -- is COVERED, because `normalize_pdf_text` folds both sides before they are compared. Measured on this document with the fold removed, recall is 0.7976 over 84 source tokens; with it, 0.9041 over 73. Without the fold this document sits BELOW `min_recall` (0.8), so the fold is the difference between a document that reports content loss and one that does not. (2) A REAL DOCLING DEFECT, pinned rather than hidden: the 7 tokens still absent are offset x2, offsets, affinity, difficult, efficient, ffer -- every one of them a word the source spells with U+FB00 (ff) or U+FB03 (ffi). docling drops or MISPLACES those glyphs (its markdown reads 'o set flow' and 'hyphen ff ation' where the source reads 'offset flow' and 'hyphenation'), while the fi/fl glyphs come through. `gap_absent_max: 7` is therefore a CEILING on a known converter bug, not a target: it falls when docling handles ff/ffi, and any rise means a new one. The row is not `xfail` -- nothing here is vacuous, the number is honest and the document is otherwise healthy."
+ },
+ "office/kestrel-clocktree.pptx": {
+  "kind": "bundle",
+  "lane": "office",
+  "status": "ok",
+  "losslessness_gate": "pass",
+  "token_recall_min": 1.0,
+  "n_source_tokens_min": 19,
+  "coverage_gate": "pass",
+  "has_toc": false,
+  "images_gate": "unmeasured",
+  "images_referenced": 0,
+  "md_contains": [
+   "- clk ref",
+   "- pll core",
+   "- mailbox"
+  ],
+  "structure_fidelity_gate": "pass",
+  "structure_fidelity_compared_min": 6,
+  "_note": "HALF A PAIR, and the pair is the point. This deck is one dense diagram of twelve labelled boxes and nothing else. In the OFFICE lane those labels are SHAPE TEXT, so all 19 tokens come through as an ordinary list and recall is exactly 1.0 -- the information is fully preserved. The PDF derived from this same file loses every one of them into a rendered image; see pdf/kestrel-clocktree.pdf, where the same 19 tokens appear as `figure_text_tokens`. Same words, two lanes, two correct-but-opposite answers, which is what makes the figure-text debt falsifiable instead of merely published."
+ },
+ "pdf/kestrel-clocktree.pdf": {
+  "kind": "bundle",
+  "requires": "pdf-lane",
+  "lane": "pdf",
+  "status": "ok",
+  "losslessness_method": "pdf-text-coverage",
+  "losslessness_gate": "best-effort",
+  "figure_text_tokens_min": 19,
+  "gap_absent_max": 0,
+  "images_gate": "pass",
+  "images_referenced": 1,
+  "structure_fidelity_gate": "unmeasured",
+  "_note": "THE FIRST DOCUMENT IN THIS CORPUS WITH A REAL FIGURE-TEXT DEBT. Every other figure here is a decorative colour grid, so `figure_text_tokens` was 0 everywhere and the loss class it names had never been exercised. Measured on the pinned toolchain: 19 tokens, gap.image_text 19, absent 0 -- the whole source is accounted for and ALL of it is trapped in the figure. Note `token_recall: 1.0` over `n_source_tokens: 0`: a perfect score against an empty body. That is not a bug in the number, it is the number being honest, and it is readable only because the denominator is published -- exactly what `n_source_tokens` was added for. The cluster threshold is why this fixture had to be DENSE: `_pdf_drawn_boxes` keeps a merged cluster only at `image_region_min_paths` (10) or more, correctly, because a two-path cluster must never be allowed to EXCUSE text sitting over it. The dataflow deck's five boxes are far apart so each stays a rejected two-path cluster; these twelve are packed edge to edge and merge into one cluster of twenty-four. `figure_text_tokens_min` is a FLOOR because a FALL is the dangerous direction -- it would mean the probe stopped seeing the figure, silently returning those words to the body ground truth to be judged as converter loss. It falls legitimately only when a caption stage recovers them, and that is a deliberate re-pin."
  }
 }
