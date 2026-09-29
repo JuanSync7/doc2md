@@ -44,6 +44,72 @@ _BR = re.compile(r"(?<!\\)<br\s*/?>", re.I)
 # after it but spaces (CommonMark 4.5). Toggling on either character meant a `~~~`
 # inside a ``` listing ended it, after which the rest of that listing was processed
 # as PROSE — inline markup stripped out of text a renderer shows verbatim.
+# The entities docling emits. NOT a general HTML-entity table: this decodes only
+# what the PDF lane is observed to produce, because a wider table would start
+# rewriting content that legitimately contains an ampersand-word.
+#
+# `<` becomes an ESCAPED `\<`, not a bare one. Decoding `&lt;rst_n&gt;` to
+# `<rst_n>` would hand a renderer something that looks like an HTML tag, where the
+# entity was at least inert — and the office lane writes `\<rst_n>` for exactly
+# this content, so the correct form was already settled in-repo.
+_PDF_ENTITIES = (("&amp;", "&"), ("&lt;", "\\<"), ("&gt;", ">"),
+                 ("&quot;", '"'), ("&#39;", "'"), ("&apos;", "'"))
+
+# `\_` between two word characters. CommonMark does not treat `_` inside a word as
+# emphasis, so the escape buys nothing: it costs tokens (`clk\_ref\_sel` is 8 to
+# `clk_ref_sel`'s 6) and breaks an exact-string search for the identifier. At a word
+# BOUNDARY the same escape IS load-bearing, and is left alone.
+_INTRAWORD_ESC_US = re.compile(r"(?<=\w)\\_(?=\w)")
+
+# A code span or a fenced block, matched so they can be stepped OVER. Inside either,
+# a backslash is a literal backslash and an entity is literal text — changing them
+# would alter the content rather than its encoding.
+_PROTECTED = re.compile(r"(?s)(^```.*?^```|^~~~.*?^~~~|(?<!\\)(`+)(?:.|\n)*?\2)",
+                        re.M)
+
+
+def normalize_pdf_markdown(md):
+    # type: (str) -> str
+    """Make the PDF lane's markdown say what the office lane says for the same text.
+
+    Measured on the same source document converted by both lanes:
+
+        office   ... driving \\<rst_n> low ...     the R&D bring-up board ...
+        pdf      ... driving &lt;rst\\_n&gt; ...   the R&amp;D bring-up board ...
+
+    Two defects, neither named by any warning:
+
+      * HTML ENTITIES survive into the markdown. `markdown_to_text` does not decode
+        them, so the text layer the knowledge linker and every plain-text consumer
+        read literally contains ``R&amp;D`` — and a search for ``R&D`` returns
+        nothing. The tokenizer sees junk words too: ``&lt;rst\\_n&gt;`` tokenizes
+        to lt/rst/n/gt.
+      * INTRAWORD UNDERSCORES are escaped for no reason, costing tokens on every
+        embedding and breaking an exact-string search for the identifier.
+
+    This is one lane being made to agree with the other, not a new policy: the
+    office lane already writes the correct form.
+
+    Code spans and fenced blocks are stepped over untouched, because inside them a
+    backslash is a literal backslash and an entity is literal text.
+    """
+    if not md:
+        return md or ""
+
+    def _fix(chunk):
+        for ent, char in _PDF_ENTITIES:
+            chunk = chunk.replace(ent, char)
+        return _INTRAWORD_ESC_US.sub("_", chunk)
+
+    out, pos = [], 0
+    for m in _PROTECTED.finditer(md):
+        out.append(_fix(md[pos:m.start()]))
+        out.append(m.group(0))                 # protected: verbatim
+        pos = m.end()
+    out.append(_fix(md[pos:]))
+    return "".join(out)
+
+
 _FENCE = re.compile(r"^\s*(`{3,}|~{3,})(.*)$")
 _HR = re.compile(r"^\s*([-*_])(?:\s*\1){2,}\s*$")
 _SETEXT = re.compile(r"^\s*(=+|-+)\s*$")

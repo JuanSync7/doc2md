@@ -6,7 +6,8 @@ summary: Source-text ingestion — doc ids, backend selection (docling/native), 
 """
 # Callers import FROM HERE, never from the private submodules. Keep __all__ tight.
 from ._ids import doc_id
-from ._markdown import markdown_to_text, collapse_table_padding
+from ._markdown import (markdown_to_text, collapse_table_padding,
+                        normalize_pdf_markdown)
 from ._source import SourceText, select_source
 from ._config import (IngestConfig, load_ingest_config, VALID_BACKENDS, recommend_shards,
                       load_source_root)
@@ -120,6 +121,7 @@ __all__ = [
     "OOXML_MAIN_PARTS",
     "doc_id",
     "markdown_to_text",
+    "normalize_pdf_markdown",
     "collapse_table_padding",
     "SourceText",
     "select_source",

@@ -67,6 +67,7 @@ from backend.bundle import assemble_bundle       # noqa: E402  (pure assembler)
 from backend.ingest import (doc_id,               # noqa: E402
                             image_markdown, inline_image_captions,
                             identifier_vocab, repair_split_tokens,
+                            normalize_pdf_markdown,
                             strip_running_lines,
                             pdf_info_meta, load_ingest_config, load_source_root,
                             normalize_accept)
@@ -280,6 +281,14 @@ def build_one(row, conv, ocr_conv, ocr_mode, out_root, run_id, cfg,
                                    % n_missing})
 
     # Losslessness measurement (+ the two convert-time improvements) — digital only.
+    # Make this lane's markdown say what the OFFICE lane says for the same text.
+    # docling emits HTML entities (`R&amp;D`) and escapes intraword underscores
+    # (`clk\_ref\_sel`); the office lane writes `R&D` and `clk_ref_sel` for exactly
+    # that content. The entity form is not merely uglier: `markdown_to_text` does
+    # not decode entities, so the text layer the knowledge linker reads literally
+    # contains "R&amp;D" and a search for "R&D" finds nothing. Applied BEFORE the
+    # measurement below, so what is graded is what is published.
+    md = normalize_pdf_markdown(md)
     src_stripped = ""
     if not use_ocr:
         raw = dc._source_text(row["src"])

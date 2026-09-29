@@ -373,7 +373,7 @@
   "gap_absent_max": 0,
   "coverage_gate": "pass",
   "has_toc": true,
-  "_note": "`toc_lines_min` is 1 and that is the TRUTH, not the desire. Measured on the pinned toolchain: docling emits the entire Table of Contents as a SINGLE merged line ('Table of Contents 1 Introduction .......... 3 1.1 Scope .......... 3 ...'), so one line is what `is_toc_line` can honestly count -- and the .docx of the same document still meets the floor of 9, which is how we know this is the PDF lane's defect and not the fixture's. The floor is re-encoded rather than the row being marked `xfail`, deliberately: everything else here is healthy (recall 0.9925, images pass over 3 referenced, every md_contains probe holds), and an xfail would switch off twenty live checks to silence one. TOC-shape robustness in `is_toc_line`/`content_start` is roadmap M2; when it lands this floor goes back up, which is a deliberate edit somebody reviews.",
+  "_note": "`toc_lines_min` is 1 and that is the TRUTH, not the desire. Measured on the pinned toolchain: docling emits the entire Table of Contents as a SINGLE merged line ('Table of Contents 1 Introduction .......... 3 1.1 Scope .......... 3 ...'), so one line is what `is_toc_line` can honestly count -- and the .docx of the same document still meets the floor of 9, which is how we know this is the PDF lane's defect and not the fixture's. The floor is re-encoded rather than the row being marked `xfail`, deliberately: everything else here is healthy (recall 0.9925, images pass over 3 referenced, every md_contains probe holds), and an xfail would switch off twenty live checks to silence one. TOC-shape robustness in `is_toc_line`/`content_start` is roadmap M2; when it lands this floor goes back up, which is a deliberate edit somebody reviews. ENTITY AND ESCAPE PARITY WITH THE OFFICE LANE, pinned. docling emitted `R&amp;D`, `&lt;rst\\_n&gt;` and `clk\\_ref\\_sel` where the office lane writes `R&D`, `\\<rst_n>` and `clk_ref_sel` for the SAME source sentence. That was not merely uglier: `markdown_to_text` does not decode entities, so the text layer the knowledge linker and every plain-text consumer read literally contained `R&amp;D` and a search for `R&D` returned nothing -- and the tokenizer saw junk words (lt/rst/n/gt). `md_not_contains` is the half that would silently regress if `normalize_pdf_markdown` were dropped from the lane, since the document would still convert and still gate green.",
   "toc_lines_min": 1,
   "images_gate": "pass",
   "images_referenced": 3,
@@ -392,10 +392,16 @@
    "DmaArbiterUnit_qos_cfg",
    "PllLockMon_status_q",
    "XbarRouteCfg_prio_map",
-   "Timing budget"
+   "Timing budget",
+   "R&D",
+   "clk_ref_sel",
+   "\\<rst_n>"
   ],
   "md_not_contains": [
-   "Confidential"
+   "Confidential",
+   "&amp;",
+   "&lt;",
+   "&gt;"
   ],
   "structure_fidelity_gate": "unmeasured",
   "_note_fidelity": "unmeasured, not best-effort: there is no second implementation that can read structure out of a PDF, so nothing was graded and the block says so. best-effort would imply a measurement was taken on a best-effort basis. Derived, not observed \u2014 the PDF lane needs DOC2MD_PDF_PYTHON, which the office CI job does not set; assemble_bundle with source_structure=None produces exactly this block by construction."

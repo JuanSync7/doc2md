@@ -399,6 +399,19 @@ The last four are the enrichment stage's, and each moves a field the rubric grad
 | `identity_namespace` | the namespace, or `(none)` | `namespace` | The prefix `meta.id` and its `uid` alias were derived under. Changing it rewrites every id in the corpus. |
 | `permalink_base` | `absolute` \| `relative` | `base` | Whether `meta.source.url` is a clickable permalink or a relative URI reference. |
 
+**Entity and escape parity across lanes.** The PDF lane's markdown is normalised so
+it says what the office lane says for the same text
+(`backend.ingest.normalize_pdf_markdown`). docling emits HTML entities and escapes
+intraword underscores — `R&amp;D`, `&lt;rst\_n&gt;`, `clk\_ref\_sel` — where the
+office lane writes `R&D`, `\<rst_n>`, `clk_ref_sel` for the identical source
+sentence. That is not a cosmetic difference: `markdown_to_text` does not decode
+entities, so the text layer the knowledge linker and every plain-text consumer read
+literally contained `R&amp;D`, a search for `R&D` returned nothing, and the
+tokenizer saw junk words (`lt`, `gt`). Decoding `&lt;` yields an **escaped** `\<`
+rather than a bare one, because a bare `<` would look like an HTML tag where the
+entity was at least inert. Code spans and fenced blocks are left verbatim, since
+inside them a backslash is a literal backslash and an entity is literal text.
+
 ### `content{}` — what the markdown contains
 
 `chars`, `tokens`, `headings`, `tables`, `images`, `links`, `lists`,
