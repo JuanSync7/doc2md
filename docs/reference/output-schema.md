@@ -402,7 +402,43 @@ The last four are the enrichment stage's, and each moves a field the rubric grad
 ### `content{}` — what the markdown contains
 
 `chars`, `tokens`, `headings`, `tables`, `images`, `links`, `lists`,
-`code_blocks`, `formulas`. Counts, no gate.
+`code_blocks`, `formulas`. Counts, no gate. These are over the **body**, not the
+published file — `document.md` also carries front matter, which `token_split`
+below is the only thing that sees.
+
+#### `content.token_split{}` — where the tokens actually go
+
+`method`, `total`, `frontmatter`, `body`, `prose`, `markup`, `frontmatter_ratio`.
+
+The charter's Job 1 asks for a replica of the source **"without all the extra
+values that cause token bloat"**, and that half of the sentence had no number at
+all. This is it. The parts partition the published file so a reader can subtract:
+
+    frontmatter + body == total          prose + markup == body
+
+`markup` is a **residual** — body tokens minus the tokens of the body rendered to
+text. It counts every syntax character (pipes, hashes, brackets, escapes,
+sentinels) without anyone maintaining a list of what "markup" is, which would go
+stale the moment a converter emitted something new.
+
+`frontmatter_ratio` is the number a retrieval system should care about: a consumer
+that embeds `document.md` **wholesale** pays it on every query. Measured with a
+real subword tokenizer over the 21-document corpus: front matter **39.4%**, prose
+45.3%, body markup 15.3% — and eleven of twenty-one documents are more than half
+front matter, with `pdf/kestrel-dataflow.pdf` at 92.7% (241 front-matter tokens
+around 19 tokens of content). The two sha256 hex strings alone cost 101 tokens per
+document.
+
+**The body is the retrieval unit.** `markdown_sha256` covers the body only —
+everything after the closing `---` — which is exactly the slice a chunker should
+embed. Front matter is metadata *about* the document and is duplicated in
+`report.json`; a consumer that wants it should read it from there rather than pay
+for it in every embedding.
+
+`method` names the counter: `supplied` when a real tokenizer was threaded in,
+`char-estimate/4` otherwise. Take the estimate as an estimate — measured against a
+real subword tokenizer on this corpus it is wrong by −52.9% to +11.8%, worst on
+spreadsheet-heavy documents.
 
 ### `savings{}` — the exchange rate
 

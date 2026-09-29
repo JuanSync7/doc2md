@@ -400,3 +400,86 @@ def test_the_denominator_is_stated_in_the_block():
     assert list(b) == ["referenced", "unique_files", "extracted", "missing",
                        "orphans", "orphans_removed", "verified", "source_images",
                        "gate"]
+
+
+# ================================ token bloat, measured (roadmap M1)
+#
+# The charter's Job 1 is "as close as possible an exact replica of the original but
+# WITHOUT all the extra values that cause token bloat". Half that sentence had no
+# metric, no gate and no rubric row — the word "bloat" appeared nowhere in
+# end-goal.md, roadmap.md, quality-plan.md, README.md or the rubric.
+#
+# Measured with a real subword tokenizer over the 21-document corpus, the answer was
+# not the markdown syntax anyone would have guessed:
+#
+#     front matter 39.4%   prose 45.3%   body markup 15.3%
+#
+# On `pdf/kestrel-dataflow.pdf`, 241 tokens of front matter wrap 19 tokens of
+# content — 92.7%. Eleven of twenty-one documents are more than half front matter.
+# You cannot ratchet what you do not measure, so the split is published per document.
+
+def test_the_token_split_accounts_for_the_whole_file():
+    """The three parts partition the document, so a reader can subtract. If they did
+    not sum, a bucket could absorb bloat and the block would be decoration — the
+    same argument the losslessness gap buckets make."""
+    from backend.validate import token_split
+    doc = ("---\ntitle: T\ndoc_id: abc\n---\n\n# Heading\n\nSome prose here.\n"
+           "\n- a list item\n")
+    s = token_split(doc)
+    assert s["frontmatter"] + s["body"] == s["total"]
+    assert s["prose"] + s["markup"] == s["body"]
+
+
+def test_a_document_that_is_mostly_frontmatter_says_so():
+    """The number that matters for retrieval: a consumer embedding document.md
+    wholesale pays this on every single query."""
+    from backend.validate import token_split
+    doc = ("---\n" + "\n".join("key%02d: %s" % (i, "x" * 40) for i in range(20))
+           + "\n---\n\nhi\n")
+    s = token_split(doc)
+    assert s["frontmatter_ratio"] > 0.8
+
+
+def test_a_document_with_no_frontmatter_is_all_body():
+    from backend.validate import token_split
+    s = token_split("# Just a heading\n\nand prose.\n")
+    assert s["frontmatter"] == 0 and s["frontmatter_ratio"] == 0.0
+    assert s["body"] == s["total"]
+
+
+def test_markup_is_what_the_prose_does_not_account_for():
+    """`markup` is a RESIDUAL, deliberately: it is body tokens minus the tokens of
+    the body rendered to text. That counts every syntax character — pipes, hashes,
+    brackets, escapes, sentinels — without needing a list of what markup is, which
+    would go stale the moment a converter emitted something new."""
+    from backend.validate import token_split
+    plain = token_split("alpha beta gamma delta\n")
+    table = token_split("| alpha | beta |\n| --- | --- |\n| gamma | delta |\n")
+    assert plain["markup"] < table["markup"]
+    assert plain["prose"] == table["prose"]
+
+
+def test_an_empty_document_reports_zeroes_not_a_division_error():
+    from backend.validate import token_split
+    s = token_split("")
+    assert s["total"] == 0 and s["frontmatter_ratio"] == 0.0
+
+
+def test_the_estimator_is_named_so_nobody_reads_it_as_exact():
+    """Without a tokenizer the count is a ~4-chars/token estimate, measured wrong by
+    -52.9% to +11.8% against a real subword tokenizer on this corpus. A number that
+    wrong must say what it is; `method` is how a reader knows whether the budget
+    they are reading is usable."""
+    from backend.validate import token_split
+    assert token_split("hello world")["method"] == "char-estimate/4"
+    assert token_split("hello world", token_count=lambda s: 1)["method"] == "supplied"
+
+
+def test_a_supplied_tokenizer_is_used_for_every_part():
+    """A split where the parts and the total used different counters would not add
+    up, which is the one thing this block must never do."""
+    from backend.validate import token_split
+    one = lambda s: 1 if s.strip() else 0
+    s = token_split("---\na: b\n---\n\nhi there\n", token_count=one)
+    assert s["frontmatter"] + s["body"] == s["total"]
+    assert s["method"] == "supplied"

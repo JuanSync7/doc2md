@@ -60,6 +60,31 @@ targets. Two things are deliberately *not* content:
   projection; we keep the structure (heading levels, table grids, list
   nesting, links), not the styling.
 
+### …and nothing that is not content
+
+The other half of the sentence: the markdown must be as close to an exact replica
+as possible **without the extra values that cause token bloat**. Every token in
+`document.md` is paid again on every embedding, every retrieval and every prompt
+that quotes it, so a faithful conversion that is twice the size it needs to be has
+solved half the problem.
+
+This is measured, not asserted — `content.token_split` publishes where each
+document's tokens went (`frontmatter + body == total`, `prose + markup == body`),
+and rubric row **A6** grades that every document carries it and that the counter
+names itself. An estimate must never be read as exact: measured against a real
+subword tokenizer, the ~4-chars/token fallback is wrong by −52.9% to +11.8% here.
+
+The current number, and it is not what anyone guessed: **front matter is 46% of
+all published tokens on average, and 93% on the worst document.** The markdown
+syntax is 15%. So the bloat to chase is metadata riding inside the document, not
+the converter's escaping — and **the body is the retrieval unit**, which is why
+`markdown_sha256` covers the body alone. A consumer should embed everything after
+the closing `---` and read the metadata from `report.json`, where it already is.
+
+No threshold is gated yet, deliberately: a ratio ceiling invented before anyone
+measured would be a number argued from nothing. The measurement comes first, the
+ratchet follows.
+
 Structure **is** content. A document whose words all survive but whose
 headings flattened, whose table rows scrambled, or whose diagram labels
 vanished into an image placeholder is not lossless in any useful sense. So

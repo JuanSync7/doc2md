@@ -238,6 +238,10 @@ _BLOCK_SECTIONS = {
         ("### `runs[]` — every stage that wrote into this report", _RUN),
     ("report.json", "decisions"): ("### `decisions[]` — what the pipeline chose",),
     ("report.json", "content"): ("### `content{}` — what the markdown contains",),
+    # The only block measured over the PUBLISHED FILE rather than the body, so it
+    # gets its own section and its own row here.
+    ("report.json", "content.token_split"):
+        ("#### `content.token_split{}` — where the tokens actually go",),
     ("report.json", "savings"): ("### `savings{}` — the exchange rate",),
     ("report.json", "structure"):
         ("### `structure{}` — outline summary and the coverage gate",),
