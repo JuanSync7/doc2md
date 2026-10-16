@@ -113,3 +113,21 @@ def test_the_ascii_path_is_unchanged():
     assert slugify("Rev^2 Clock Tree") == "rev-2-clock-tree"
     assert slugify(u"Café Runbook") == "cafe-runbook"
     assert heading_anchor("7.3 Standing rule") == "73-standing-rule"
+
+
+def test_a_keyword_candidate_is_never_a_piece_of_markdown():
+    """Found by running the enricher against a real bundle and reading the prompt it
+    would send: the candidate list offered the model `Dma**ArbiterUnit**` and
+    `\\<rst_n` — converter syntax, not identifiers.
+
+    `identifier_vocab` is contracted for a source's RAW TEXT LAYER, where `*` and
+    `\\` do not occur; handing it a markdown BODY puts emphasis markers and escapes
+    inside the tokens it harvests. A model asked to pick keywords from that list can
+    only either quote the markdown back or silently repair it, and the first is how
+    `Dma**ArbiterUnit**` becomes a permanent label in the keyword registry."""
+    from backend.kb import keyword_candidates
+    body = ("The arbiter Dma**ArbiterUnit** owns it; driving \\<rst_n> low, "
+            "and clk_ref_sel selects the source.")
+    got = keyword_candidates(body)
+    assert got == ["DmaArbiterUnit", "clk_ref_sel"]
+    assert not any("*" in k or "\\" in k for k in got)

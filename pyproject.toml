@@ -9,8 +9,17 @@ version = "0.1.0"
 description = "Deterministic, lossless Office/PDF -> Markdown conversion with an independent second-pass validator."
 readme = "README.md"
 license = { file = "LICENSE" }
+# The holder, stated once. If Sondrel/Aion holds copyright on this work rather
+# than the author personally, THIS line and the one in LICENSE are the two places
+# to change — nothing else derives it.
+authors = [{ name = "Juan Kok" }]
 # The offline pipeline runs under the host's Python 3.6; backend code stays 3.6-safe.
 requires-python = ">=3.6"
+classifiers = [
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3.6",
+  "Programming Language :: Python :: 3.12",
+]
 dependencies = []
 
 [project.optional-dependencies]

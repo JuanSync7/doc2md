@@ -1014,6 +1014,60 @@ def _suite(dim, rid, condition, target, selector):
     return Row(dim, rid, condition, "suite", target, tuple(selector), None)
 
 
+def _a6_token_budget(view):
+    # type: (dict) -> tuple
+    """Token bloat is MEASURED on every published document, and the counter is named.
+
+    The charter's Job 1 asks for a replica of the source "without all the extra
+    values that cause token bloat". Half that sentence had no metric, no gate and no
+    rubric row — the word "bloat" appeared nowhere in the charter, the roadmap, the
+    quality plan or this file — so nothing stopped the output getting fatter.
+
+    This row grades the MEASUREMENT, not a threshold. A ratio ceiling invented today
+    would be a number nobody measured; what is defensible now is that every document
+    publishes where its tokens went, that the parts add up, and that the counter
+    names itself so an estimate is never read as exact. Measured with a real subword
+    tokenizer, the char/4 estimate is wrong by -52.9% to +11.8% on this corpus, so
+    an unnamed count is worse than none.
+
+    The ratio is REPORTED here rather than gated, because that is the number a
+    threshold would eventually be argued from and it should be visible first.
+    """
+    bundles = _all(view)
+    if not bundles:
+        return (FAIL, "no bundles in the corpus under grade")
+    missing, broken, ratios = [], [], []
+    for b in bundles:
+        rel = b.get("report", {}).get("source_relpath", "?")
+        split = (b.get("report", {}).get("content") or {}).get("token_split")
+        if not isinstance(split, dict):
+            missing.append(rel)
+            continue
+        if not split.get("method"):
+            broken.append("%s: no method" % rel)
+            continue
+        parts = (split.get("frontmatter", 0) + split.get("body", 0))
+        if parts != split.get("total"):
+            broken.append("%s: %d + %d != %d" % (rel, split.get("frontmatter", 0),
+                                                 split.get("body", 0),
+                                                 split.get("total")))
+            continue
+        ratios.append((split.get("frontmatter_ratio", 0.0), rel))
+    if missing:
+        return (FAIL, "%d bundle(s) publish no content.token_split, so their token "
+                      "budget is unmeasured: %s"
+                      % (len(missing), ", ".join(sorted(missing)[:3])))
+    if broken:
+        return (FAIL, "token_split does not add up or names no counter: %s"
+                      % "; ".join(sorted(broken)[:3]))
+    ratios.sort(reverse=True)
+    worst_r, worst_rel = ratios[0]
+    mean = sum(r for r, _ in ratios) / float(len(ratios))
+    return (PASS, "token budget published on %d bundle(s); front matter is %.0f%% of "
+                  "tokens on average, worst %.0f%% (%s)"
+                  % (len(ratios), 100 * mean, 100 * worst_r, worst_rel))
+
+
 ROWS = [
     # A. document.md
     _artifact("A", "A1", "structure_fidelity is a second hard gate on the office lane",
@@ -1051,6 +1105,8 @@ ROWS = [
     # least defended, which is backwards. One fixture per graded format, held to
     # `_GRADED_FORMATS` and to what gen_corpus really builds by
     # tests/unit/backend/test_validate_rubric.py.
+    _artifact("A", "A6", "token bloat is measured on every document and the counter is named",
+              _a6_token_budget),
     _suite("A", "A5", "adversarial fixtures are pinned in the eval corpus",
            "evals/run_eval.py", ("office/kestrel-adversarial.docx",
                                  "office/kestrel-adversarial.xlsx",

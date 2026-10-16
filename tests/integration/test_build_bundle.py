@@ -514,3 +514,98 @@ def test_an_empty_source_still_publishes_its_vacuous_bundle_on_a_rebuild(tmp_pat
                     "--force"]) == 0
     assert os.path.isfile(os.path.join(d, "document.md"))
     assert not os.path.exists(os.path.join(d, "document.md.stale"))
+
+
+# ================================ a changed source is a new version (roadmap M1)
+#
+# The user's requirement, verbatim: "putting in a new version can be detected such
+# that no duplicated will be formed".
+#
+# `_done()` decided to skip from `report.json["status"] in ("ok","degraded")` alone.
+# It never opened the source, although `sha256_file` sits in the same module. So a
+# re-run over a corpus where a document had CHANGED printed "already-built=1
+# to-build=0", left the old body published, and logged `action: skipped, status:
+# ok` — a run log that affirms a stale bundle is fine.
+#
+# Detection did exist, in `replay_run.py`, which names the change and exits 3. But
+# that is an audit tool a holder must remember to run; the builder is the thing that
+# runs every day, and `docs/guide.md` tells the user re-runs are safe.
+
+def _versioned_docx(path, body):
+    """A one-paragraph docx whose body text is the caller's, so two revisions of the
+    same path differ in content and in nothing else."""
+    doc = ('<w:document %s><w:body>'
+           '<w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr>'
+           '<w:r><w:t>Release note</w:t></w:r></w:p>'
+           '<w:p><w:r><w:t>%s</w:t></w:r></w:p>'
+           '</w:body></w:document>' % (W, body))
+    styles = ('<w:styles %s><w:style w:type="paragraph" w:styleId="Heading1">'
+              '<w:name w:val="heading 1"/></w:style></w:styles>' % W)
+    _zip(path, {"word/document.xml": doc, "word/styles.xml": styles,
+                "docProps/core.xml": CORE % ("Release note", "A. Engineer")})
+
+
+def _built_bundle(tmp_path, body="ALPHA"):
+    """Build one document, return (out_root, source_path, doc_id, report)."""
+    import json as _json
+    bb = _mod("build_bundle")
+    src = tmp_path / "src" / "office"
+    os.makedirs(str(src))
+    docx = str(src / "note.docx")
+    _versioned_docx(docx, body)
+    out = str(tmp_path / "out")
+    bb.main(["--src", str(tmp_path / "src"), "--out", out, "--run-id", "R1"])
+    did = [d for d in os.listdir(out) if os.path.isdir(os.path.join(out, d))][0]
+    with open(os.path.join(out, did, "report.json"), encoding="utf-8") as fh:
+        return out, docx, did, _json.load(fh)
+
+
+def test_an_unchanged_source_is_still_skipped(tmp_path):
+    """The cheap path must stay cheap: content-checking must not turn every re-run
+    into a full rebuild, or the incremental mode is gone."""
+    bb = _mod("build_bundle")
+    out, _docx, _did, first = _built_bundle(tmp_path)
+    import io as _io
+    import contextlib
+    err = _io.StringIO()
+    with contextlib.redirect_stderr(err):
+        bb.main(["--src", str(tmp_path / "src"), "--out", out, "--run-id", "R2"])
+    assert "already-built=1" in err.getvalue() and "to-build=0" in err.getvalue()
+
+
+def test_a_changed_source_at_the_same_path_is_rebuilt(tmp_path):
+    """THE requirement. Same path, different bytes: that is a new VERSION of a
+    document the holder already has, and the bundle must become the new one."""
+    import json as _json
+    bb = _mod("build_bundle")
+    out, docx, did, first = _built_bundle(tmp_path, body="ALPHA")
+    _versioned_docx(docx, "BRAVO REVISION TWO")
+
+    bb.main(["--src", str(tmp_path / "src"), "--out", out, "--run-id", "R2"])
+
+    with open(os.path.join(out, did, "report.json"), encoding="utf-8") as fh:
+        second = _json.load(fh)
+    assert second["source_sha256"] != first["source_sha256"]
+    assert second["markdown_sha256"] != first["markdown_sha256"]
+    with open(os.path.join(out, did, "document.md"), encoding="utf-8") as fh:
+        assert "REVISION TWO" in fh.read()
+    # ...and no duplicate: doc_id is the PATH, so the new version replaces the old
+    # bundle in place rather than minting a second one beside it.
+    assert len([d for d in os.listdir(out) if os.path.isdir(os.path.join(out, d))]) == 1
+
+
+def test_the_rebuild_is_recorded_as_a_choice_not_an_accident(tmp_path):
+    """A rebuild a holder cannot see is a rebuild it cannot trust. The decision is
+    published with both hashes, so the artifact says WHY it moved."""
+    import json as _json
+    bb = _mod("build_bundle")
+    out, docx, did, first = _built_bundle(tmp_path, body="ALPHA")
+    _versioned_docx(docx, "BRAVO REVISION TWO")
+    bb.main(["--src", str(tmp_path / "src"), "--out", out, "--run-id", "R2"])
+
+    with open(os.path.join(out, did, "report.json"), encoding="utf-8") as fh:
+        rep = _json.load(fh)
+    codes = [d.get("code") for d in rep.get("decisions") or []]
+    assert "source_changed" in codes, codes
+    rec = [d for d in rep["decisions"] if d.get("code") == "source_changed"][0]
+    assert first["source_sha256"][:12] in _json.dumps(rec)

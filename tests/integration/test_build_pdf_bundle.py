@@ -40,58 +40,62 @@ def test_plan_rows_have_stable_ids_and_ext(bpb):
     assert again[0]["id"] == rows[0]["id"]
 
 
-def test_losslessness_block_is_measured_and_never_a_pass_gate(bpb):
+def test_the_losslessness_adapter_delegates_to_the_validator(bpb):
+    """The policy itself now lives in `backend.validate.pdf_coverage_report` and is
+    unit-tested there — gate, buckets, denominators and all. What is left in the
+    script is an ADAPTER, so what this file owns is the WIRING: the same inputs must
+    reach the same verdict through it."""
     from backend.ingest import load_ingest_config
+    from backend.validate import pdf_coverage_report
     cfg = load_ingest_config()
-    src = "alpha beta gamma delta epsilon " * 40          # 200 tokens, > min_tokens
+    src = "alpha beta gamma delta epsilon " * 40           # 200 tokens > min_tokens
     md = "# T\n\n" + src
-    loss, real = bpb._pdf_losslessness(src, md, "", "", cfg)
-    assert loss["method"] == "pdf-text-coverage"
-    assert loss["token_recall"] == 1.0
-    assert loss["gate"] == "best-effort"                   # never "pass", even at 1.0
-    assert real is False and loss["missing_tokens"] == []
+    assert bpb._pdf_losslessness(src, md, "", "", cfg) == pdf_coverage_report(
+        src, md, "", "", cfg.header_footer_min_frac, cfg.min_recall,
+        cfg.min_tokens, cfg.content_min_recall)
 
 
-def test_losslessness_flags_real_content_loss(bpb):
+def test_the_adapter_maps_each_config_field_to_the_right_threshold(bpb):
+    """The refactor's own failure mode: four numbers in a row, and a swapped pair
+    would be invisible in every happy-path assertion — the validator cannot catch it
+    because by then the damage is already in the argument order. So each threshold
+    is moved ALONE to a value that changes the answer.
+
+    `min_tokens` is the readable one: the SAME half-lost document is real loss at a
+    50-token floor and too small to judge at a 500-token one."""
     from backend.ingest import load_ingest_config
+    kept, lost = "alpha beta gamma delta epsilon ", "zeta eta theta iota kappa "
+    src, md = (kept + lost) * 40, "# T\n\n" + kept * 40   # 400 tokens, half dropped
     cfg = load_ingest_config()
-    kept = "alpha beta gamma delta epsilon "
-    lost = "zeta eta theta iota kappa "
-    src = (kept + lost) * 40                               # half the content dropped
-    md = "# T\n\n" + kept * 40
-    loss, real = bpb._pdf_losslessness(src, md, "", "", cfg)
-    assert real is True                                     # explained-gap: BOTH low
-    assert loss["token_recall"] < cfg.min_recall
-    assert loss["missing_tokens"]                           # names what went missing
-    assert loss["gate"] == "best-effort"
 
+    class _Cfg(object):
+        def __init__(self, **kw):
+            for f in ("header_footer_min_frac", "min_recall", "min_tokens",
+                      "content_min_recall"):
+                setattr(self, f, kw.get(f, getattr(cfg, f)))
 
-def test_losslessness_excludes_furniture_and_image_text(bpb):
-    # Furniture (running headers) and figure-region text are NOT body loss: with the
-    # excludes supplied, the same "missing" tokens no longer count against recall.
-    from backend.ingest import load_ingest_config
-    cfg = load_ingest_config()
-    body = "alpha beta gamma delta epsilon " * 40
-    furniture = "CONFIDENTIAL page footer " * 10
-    src = body + furniture
-    md = "# T\n\n" + body
-    loss_blind, _ = bpb._pdf_losslessness(src, md, "", "", cfg)
-    loss_fair, real = bpb._pdf_losslessness(src, md, furniture, "", cfg)
-    assert loss_fair["token_recall"] > loss_blind["token_recall"]
-    assert loss_fair["token_recall"] == 1.0 and real is False
-
-
-def test_losslessness_surfaces_figure_text_debt(bpb):
-    # Text living inside figure regions is excluded from the body metric but must be
-    # VISIBLE: it is the one loss class only the VLM caption stage can recover.
-    from backend.ingest import load_ingest_config
-    cfg = load_ingest_config()
-    body = "alpha beta gamma delta epsilon " * 40
-    fig_text = "state machine IDLE ACTIVE RESET arrows"
-    loss, real = bpb._pdf_losslessness(body + fig_text, "# T\n\n" + body,
-                                       "", fig_text, cfg)
-    assert loss["figure_text_tokens"] == len(fig_text.split())
-    assert loss["token_recall"] == 1.0 and real is False   # excluded, not penalized
+    assert bpb._pdf_losslessness(src, md, "", "", cfg)[1] is True
+    # below the token floor -> the ratio means nothing, so no loss is claimed
+    assert bpb._pdf_losslessness(src, md, "", "", _Cfg(min_tokens=500))[1] is False
+    # a recall floor this document clears -> not loss by the token signal
+    assert bpb._pdf_losslessness(src, md, "", "", _Cfg(min_recall=0.4))[1] is False
+    # a content floor this document clears -> not loss by the second signal
+    assert bpb._pdf_losslessness(
+        src, md, "", "", _Cfg(content_min_recall=0.1))[1] is False
+    # The strip threshold reaches the GAP block rather than the verdict, so it needs
+    # a paged document to bite on: a footer on 4 of 10 pages survives the configured
+    # 0.5 and is BUCKETED as residual boilerplate; at 0.01 it is stripped before the
+    # buckets ever see it, and those tokens leave the denominator entirely.
+    paged = "\f".join("bodyline%d alpha beta gamma\n" % i
+                      + ("kestrel confidential footer\n" if i < 4 else "")
+                      for i in range(10))
+    paged_md = "# T\n\n" + "".join("bodyline%d alpha beta gamma\n" % i
+                                    for i in range(10))
+    at_cfg = bpb._pdf_losslessness(paged, paged_md, "", "", cfg)[0]["gap"]
+    aggressive = bpb._pdf_losslessness(
+        paged, paged_md, "", "", _Cfg(header_footer_min_frac=0.01))[0]["gap"]
+    assert at_cfg["residual_boiler"] == 12 and aggressive["residual_boiler"] == 0
+    assert aggressive["n_source"] < at_cfg["n_source"]
 
 
 def test_failure_report_is_lane_honest_and_failed(bpb):

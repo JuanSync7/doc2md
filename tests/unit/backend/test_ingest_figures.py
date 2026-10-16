@@ -323,3 +323,71 @@ def test_inline_ooxml_images_is_recall_safe_and_idempotent():
 def test_inline_ooxml_images_leaves_unknown_part_intact():
     md = "x %s y" % ooxml_image_sentinel("word/media/i.png")
     assert inline_ooxml_images(md, {"word/media/other.png": "![](images/z.png)"}) == md
+
+
+# ================================ did the caption bring the words back? (M1)
+#
+# `caption_is_useful` is a SHAPE check — length, letter ratio, runaway repetition —
+# built against a CPU VLM's degenerate output. It is honest about that, but the
+# caption gate reads as "the figure was recovered", and measured with Claude as the
+# model over the real corpus it reported `useful=17 (100%)` on captions that
+# explicitly said the image had "no labels, axes, connectors or text of any kind".
+# Well-formed prose about nothing scores the same as a faithful transcription.
+#
+# The charter already names the objective check (end-goal.md section 4): captions
+# "precision-checked against the text layer's region words, burning down
+# figure_text_tokens". That is evidence, not taste — the words are recovered by an
+# independent poppler probe, so the question "did the caption bring them back?" has
+# a measurable answer. A word list for "decorative" never could.
+
+def test_a_caption_that_transcribes_every_label_scores_one():
+    """Measured for real on pdf/kestrel-clocktree.pdf: a caption written after
+    looking at the figure recovered 19 of 19 region tokens."""
+    from backend.ingest import caption_recovery
+    region = "clk ref pll core lock mon divider gate ctl spine leaf a leaf b leaf c arbiter xbar mailbox"
+    caption = ("Twelve rounded blue tiles in a four-by-three grid: the top row holds clk ref, "
+               "pll core, lock mon and divider; the middle row gate ctl, spine, leaf a and "
+               "leaf b; the bottom row leaf c, arbiter, xbar and mailbox.")
+    assert caption_recovery(caption, region) == 1.0
+
+
+def test_well_formed_prose_about_nothing_scores_zero():
+    """THE case the shape check cannot see. This caption passes `caption_is_useful`
+    — it is long, prose, non-repetitive — and recovers none of the figure's words."""
+    from backend.ingest import caption_recovery, caption_is_useful
+    region = "clk ref pll core lock mon divider gate ctl spine arbiter xbar mailbox"
+    caption = ("A rectangular grid of flat colour blocks in blue and grey, arranged in even "
+               "rows and columns with no labels, axes, connectors or text of any kind.")
+    assert caption_is_useful(caption) is True          # the old gate is satisfied...
+    assert caption_recovery(caption, region) == 0.0    # ...and nothing was recovered
+
+
+def test_a_partial_transcription_scores_in_between():
+    """Counted in TOKENS, not in labels: "clk ref" is two words. Six distinct tokens
+    in the region, four recovered."""
+    from backend.ingest import caption_recovery
+    got = caption_recovery("It shows clk ref and pll core.", "clk ref pll core xbar mailbox")
+    assert abs(got - 4 / 6.0) < 1e-9
+
+
+def test_no_figure_text_means_there_is_nothing_to_recover():
+    """A figure with no words in the text layer cannot be graded this way, and the
+    answer is None - "unmeasurable" - never 1.0. Scoring a decorative image a
+    perfect recovery is precisely the vacuity this replaces."""
+    from backend.ingest import caption_recovery
+    assert caption_recovery("A photograph of a circuit board.", "") is None
+    assert caption_recovery("anything", "   ") is None
+
+
+def test_an_empty_caption_recovers_nothing_rather_than_being_unmeasurable():
+    """Distinct from the case above: there ARE words to recover and the caption
+    brought back none of them."""
+    from backend.ingest import caption_recovery
+    assert caption_recovery("", "clk ref xbar") == 0.0
+
+
+def test_recovery_is_blind_to_case_order_and_repetition():
+    """It grades WHICH words came back, not how they were phrased - a caption is
+    prose, not a transcript, and the same word twice is not twice recovered."""
+    from backend.ingest import caption_recovery
+    assert caption_recovery("MAILBOX, xbar; xbar again.", "xbar mailbox") == 1.0

@@ -231,6 +231,13 @@ def keyword_candidates(body_md, limit=0):
     >= 6) rather than inventing a second notion of "looks like a symbol". These
     are CANDIDATES: a settings key or a function name is a real keyword, but
     deciding which ones matter is tier-2 work.
+
+    The body is rendered to TEXT first. ``identifier_vocab`` is contracted for a
+    source's raw text layer, where ``*`` and ``\\`` do not occur; handing it markdown
+    harvested the emphasis markers and escapes along with the name, and offered the
+    model ``Dma**ArbiterUnit**`` as an identifier. A model asked to pick keywords
+    from that list can only quote the markdown back or silently repair it, and the
+    first is how converter syntax becomes a permanent label in the registry.
     """
-    out = sorted(identifier_vocab(body_md or ""))
+    out = sorted(identifier_vocab(markdown_to_text(body_md or "")))
     return out[:limit] if limit else out

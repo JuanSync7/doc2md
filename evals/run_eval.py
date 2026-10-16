@@ -133,12 +133,14 @@ class Checker(object):
 # and `outline_probe` in a bundle one are read by nobody, and a global set called
 # them both fine. Adding a probe means adding its key to the kinds whose checker
 # reads it, in the same change.
-_KEYS_ROUTE = frozenset(("kind", "requires"))            # read by main(), any kind
+# `xfail` is routed, not checked: it changes what a row's VERDICT means rather than
+# what any checker asks, so it belongs to every kind and is read only by main().
+_KEYS_ROUTE = frozenset(("kind", "requires", "xfail"))   # read by main(), any kind
 _KEYS_BY_KIND = {
     "bundle": _KEYS_ROUTE | frozenset((
         "lane", "status",
         "losslessness_gate", "losslessness_method", "token_recall_min",
-        "n_source_tokens_min",
+        "n_source_tokens_min", "gap_absent_max", "figure_text_tokens_min",
         "structure_fidelity_gate", "structure_fidelity_compared_min",
         "coverage_gate", "toc_lines_min", "has_toc", "max_depth",
         "savings_ratio_min", "content_links_min",
@@ -208,6 +210,56 @@ def check_bundle(rel, exp, bundles_dir):
                 "n_source_tokens: got %r, want >= %s (a fall means the ground truth "
                 "stopped reading part of the source, which recall cannot see)"
                 % (got, exp["n_source_tokens_min"]))
+    if "gap_absent_max" in exp:
+        # WHY the recall is not 1.0, gated rather than merely published. `explain_gap`
+        # partitions the source-to-target gap into buckets where each missing
+        # occurrence is claimed by the first one that can explain it, so `absent` is
+        # the only bucket that is real, unexplained content loss. A ceiling of 0 says
+        # "this document's whole shortfall is page numbers and running furniture" —
+        # which is a far stronger statement than a `token_recall_min` floor, because
+        # a floor tolerates real loss as long as there is little of it.
+        #
+        # A MISSING block is a FAIL, never a silent pass: the OCR path publishes no
+        # gap at all (there is no independent text layer to decompose), so an
+        # expectation asking about one there is mis-set, and answering it with
+        # silence is exactly the passing-over-nothing this harness refuses.
+        gap = (rep.get("losslessness") or {}).get("gap")
+        if not isinstance(gap, dict):
+            c.check(False, "losslessness.gap: absent, but gap_absent_max is set "
+                           "(no gap block is published on the OCR path)")
+        else:
+            c.check(gap.get("absent", -1) <= exp["gap_absent_max"],
+                    "losslessness.gap.absent: got %r, want <= %r"
+                    % (gap.get("absent"), exp["gap_absent_max"]))
+    if "figure_text_tokens_min" in exp:
+        # THE DEBT, gated rather than merely published. `figure_text_tokens` counts
+        # words the PDF holds INSIDE a figure region: excluded from the body ground
+        # truth because they are figure content, not lost body text, and recovered
+        # by an independent text-layer probe rather than by anything the converter
+        # said. It is the one loss class the text gates cannot see, and the number
+        # the VLM caption stage exists to burn down.
+        #
+        # A FLOOR, not a ceiling, because a FALL is the dangerous direction: it means
+        # the probe stopped seeing a figure it used to see, so those words silently
+        # re-enter the body ground truth and are judged as text the converter lost.
+        # Nothing else in the report would say so. The number falls legitimately only
+        # when a caption stage recovers the words, and that is a deliberate re-pin.
+        #
+        # A MISSING field is a FAIL, never a silent pass: the OCR path publishes no
+        # figure-text count at all, so an expectation asking about one there is
+        # mis-set — and answering a mis-set question with silence is exactly the
+        # passing-over-nothing this harness refuses.
+        got = loss.get("figure_text_tokens")
+        if got is None:
+            c.check(False, "losslessness.figure_text_tokens: absent, but "
+                           "figure_text_tokens_min is set (the OCR path publishes "
+                           "no figure-text count)")
+        else:
+            c.check(isinstance(got, int) and got >= exp["figure_text_tokens_min"],
+                    "losslessness.figure_text_tokens: got %r, want >= %r (a fall "
+                    "means the figure-region probe stopped seeing a figure, so "
+                    "those words are now judged as body text the converter lost)"
+                    % (got, exp["figure_text_tokens_min"]))
     if "coverage_gate" in exp:
         cov = rep.get("structure", {}).get("coverage", {})
         c.eq(cov.get("gate"), exp["coverage_gate"], "structure.coverage.gate")
@@ -423,6 +475,12 @@ def main(argv=None):
                     help="regenerate the corpus even if it exists")
     ap.add_argument("--skip-pdf", action="store_true",
                     help="do not run the PDF lane even if DOC2MD_PDF_PYTHON is set")
+    ap.add_argument("--require", default="",
+                    help="comma-separated corpus AREAS (office, legacy, pdf, text) "
+                         "that MUST produce results; a SKIP in one of them fails the "
+                         "run. An area nobody skipped is silent; an area no "
+                         "expectation mentions is a failure, because a typo here "
+                         "would pass forever over documents nobody is checking.")
     ap.add_argument("--no-lanes", action="store_true",
                     help="skip corpus generation and lane runs; only re-check "
                          "expectations against existing outputs")
@@ -518,8 +576,42 @@ def main(argv=None):
             fails = check_unsupported(rel, exp, args.bundles, args.text_out)
         else:
             fails = ["unknown expectation kind %r" % kind]
-        if fails:
-            results.append(("FAIL", rel, "; ".join(fails)))
+        # THE EXPECTED-FAILURE MARKER, and the two rules that keep it honest.
+        #
+        # A permanently-red nightly is not a gate: nobody reads the number, so the
+        # day a real regression lands it changes nothing. `xfail: true` keeps the
+        # document GRADED and keeps printing what it really did, and stops the exit
+        # code carrying it.
+        #
+        # (1) It must say WHY. An `xfail` with no `_note` is a silenced check, and
+        #     the note is what a later reader needs to decide whether it still
+        #     applies. A marker nobody can review is how a defect becomes permanent.
+        # (2) An unexpected PASS is a FAILURE. Without that, a marker outlives the
+        #     defect it describes and the expectation quietly stops asserting
+        #     anything — the same vacuous pass `n_source_tokens_min` and the
+        #     stray-key guard exist to prevent. The fix is to re-encode the row,
+        #     which is a deliberate edit somebody reviews.
+        #
+        # Deliberately AFTER the stray-key guard above: `xfail` says the DOCUMENT
+        # behaves in a way nobody wants, and says nothing about the EXPECTATION being
+        # well formed. Letting it swallow a typo would switch off the guard that
+        # stops checks being switched off.
+        xfail = bool(exp.get("xfail"))
+        if xfail and not str(exp.get("_note") or "").strip():
+            results.append(("FAIL", rel,
+                            "xfail with no `_note`: an expected failure has to say "
+                            "why, and what would let the marker be removed"))
+        elif fails:
+            results.append(("XFAIL" if xfail else "FAIL", rel, "; ".join(fails)))
+        elif xfail:
+            # The note is quoted but CAPPED: these run to a paragraph by design (a
+            # marker nobody can review is how a defect becomes permanent), and one
+            # of them printed in full turns the result table into prose.
+            note = str(exp.get("_note") or "").strip()
+            results.append(("XPASS", rel,
+                            "marked xfail and PASSED — re-encode the expectation "
+                            "truthfully and drop the marker (%s)"
+                            % (note[:97] + "..." if len(note) > 100 else note)))
         else:
             results.append(("PASS", rel, "%d check(s)" % max(1, len(exp) - 1)))
 
@@ -530,12 +622,55 @@ def main(argv=None):
     n_pass = sum(1 for v, _, _ in results if v == "PASS")
     n_skip = sum(1 for v, _, _ in results if v == "SKIP")
     n_fail = sum(1 for v, _, _ in results if v == "FAIL")
+    n_xfail = sum(1 for v, _, _ in results if v == "XFAIL")
+    n_xpass = sum(1 for v, _, _ in results if v == "XPASS")
     print("-" * 100)
-    print("eval: %d pass, %d fail, %d skip" % (n_pass, n_fail, n_skip))
+    # XPASS is counted into `fail` as well as named, because the exit code has to be
+    # readable off this one line: a census that said `0 fail, 1 xpass` beside exit 1
+    # is the same contradiction the FAIL rows were fixed for.
+    # A SKIPPED LANE READS LIKE A PASSING ONE. Reproduced with soffice off the PATH:
+    # every derived legacy document is marked not-generated, five SKIP rows print,
+    # the census says `0 fail`, and the process exits 0 — so the day CI's unpinned
+    # `apt-get install libreoffice` breaks, the whole legacy lane vanishes silently.
+    #
+    # It is the same shape the workflow already refuses three times with grep (the
+    # CommonMark differential, the red-direction suite, the Pillow-only branches).
+    # Those work because a suite's skip count is known; a LANE needs the harness to
+    # be told which lanes were supposed to run, because only the caller knows what
+    # this machine was set up to do.
+    # Keyed on the corpus AREA (the top-level directory of the relpath), not on the
+    # report's `lane` field. Those are different things and the difference is the
+    # failure being guarded: `legacy/kestrel-clock-spec.doc` is converted BY the
+    # office lane, so requiring `lane == "legacy"` would match nothing and pass
+    # forever. What vanishes when soffice is missing is the `legacy/` AREA of the
+    # corpus, which is also what a reader would name.
+    required = [x.strip() for x in (args.require or "").split(",") if x.strip()]
+    lane_fail = 0
+    for lane in required:
+        seen = [(v, rel) for v, rel, _d in results if rel.split("/")[0] == lane]
+        if not seen:
+            # A typo must not read as "that lane is fine".
+            print("REQUIRED lane %r is named by no expectation — nothing was "
+                  "checked for it" % lane)
+            lane_fail += 1
+            continue
+        skipped = [rel for v, rel in seen if v == "SKIP"]
+        if skipped:
+            print("REQUIRED lane %r produced %d SKIP row(s): %s"
+                  % (lane, len(skipped), ", ".join(skipped[:4])
+                     + (" ..." if len(skipped) > 4 else "")))
+            lane_fail += 1
+    census = "eval: %d pass, %d fail, %d skip" % (n_pass, n_fail + n_xpass + lane_fail,
+                                                  n_skip)
+    if n_xfail or n_xpass:
+        census += " (%d xfail, %d xpass)" % (n_xfail, n_xpass)
+    print(census)
     # The exit code IS the printed table: every FAIL row gates, and no row can
     # gate that was not printed. CI reads only this number, so a table that says
-    # `1 fail` next to an exit 0 is worse than no eval at all.
-    return 0 if n_fail == 0 else 1
+    # `1 fail` next to an exit 0 is worse than no eval at all. An XFAIL row is
+    # printed and does NOT gate — that is the whole point of the marker — and an
+    # XPASS row gates exactly like a FAIL.
+    return 0 if (n_fail + n_xpass + lane_fail) == 0 else 1
 
 
 if __name__ == "__main__":
