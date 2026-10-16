@@ -12,7 +12,9 @@ from backend.ingest import (docx_markdown, pptx_markdown, xlsx_markdown,
                             docx_source_text, pptx_source_text, xlsx_source_text,
                             ooxml_markdown, ooxml_source_text, furniture_drops,
                             markdown_to_text)
-from backend.validate import conversion_report
+from backend.validate import conversion_report, md_structure
+
+import pytest
 
 W = 'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"'
 A = 'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"'
@@ -638,7 +640,18 @@ def _slide(shapes):
     return ('<p:sld %s><p:cSld><p:spTree>%s</p:spTree></p:cSld></p:sld>' % (P, shapes))
 
 
-def test_pptx_slides_ordered_numerically_with_titles():
+def test_pptx_slides_fall_back_to_numeric_part_order_with_titles():
+    """No `ppt/presentation.xml`, so the deck cannot say what its order is and the
+    parts are sorted numerically — `slide10` after `slide2`, never lexically.
+
+    `## Slide N` counts POSITION in both branches, so `slide10.xml` publishes as
+    `## Slide 3` here. That is a deliberate change from numbering by part name, and
+    the argument is that a heading must mean ONE thing: a reader cannot act on
+    `## Slide 10` without knowing whether it is the tenth slide or merely the tenth
+    file, and in the fallback we do not know the deck's order anyway — claiming ten
+    slides exist when three do is a second guess on top of the first. Every corpus
+    deck numbers its parts 1..n contiguously, so both readings agree there and this
+    changes no shipped byte."""
     parts = {
         "ppt/slides/slide2.xml": _slide(_sp("Second body")),
         "ppt/slides/slide10.xml": _slide(_sp("Tenth body")),
@@ -647,8 +660,9 @@ def test_pptx_slides_ordered_numerically_with_titles():
     }
     md = pptx_markdown(parts)
     assert "## Slide 1 — Widget Power Plan" in md
-    assert md.index("## Slide 1") < md.index("## Slide 2") < md.index("## Slide 10")
-    assert "- Agenda item" in md
+    assert md.index("Agenda item") < md.index("Second body") < md.index("Tenth body")
+    assert [l for l in md.split("\n") if l.startswith("## ")] == [
+        "## Slide 1 — Widget Power Plan", "## Slide 2", "## Slide 3"]
 
 
 def test_pptx_chrome_placeholders_are_dropped_everywhere():
@@ -1477,15 +1491,24 @@ def test_a_delimiter_that_already_flanks_is_left_exactly_where_it_was():
         assert _fidelity(parts)["gate"] == "pass"
 
 
-def test_a_span_of_one_punctuation_character_keeps_its_markers():
-    # The residual, pinned so it is a decision and not a surprise: nothing can move
-    # out of a one-character span without emptying it, so the markers stay and the
-    # fidelity gate reports the loss honestly rather than the converter hiding it.
+def test_a_span_of_one_punctuation_character_now_keeps_its_EMPHASIS():
+    """Was `test_a_span_of_one_punctuation_character_keeps_its_markers`, and it pinned
+    a RESIDUAL: nothing can move out of a one-character span without emptying it, so
+    `**` sat against a letter on one side and a `.` on the other, could not
+    left-flank, and the emphasis was lost — the markers staying as literal text while
+    the fidelity gate reported the loss honestly.
+
+    P9.9 removed the residual rather than the honesty. The separator is exactly the
+    thing the shift could not be: it changes what sits OUTSIDE the delimiter without
+    touching the span's own characters. Measured against marko 2.2.3:
+    `Note**.** end.` is `strong=0` and `Note<!---->**.** end.` is `strong=1`, so the
+    bold the document draws is now the bold the reader sees, and the gate passes
+    because nothing was lost."""
     body = ('<w:p>' + _wrun("Note") + _wrun(".", "<w:b/>") + _wrun(" end.") + '</w:p>')
     parts = {"word/document.xml": _wdoc(body)}
     md, _rep = _graded(parts)
-    assert md == "Note**.** end.\n"
-    assert _fidelity(parts)["gate"] == "fail"
+    assert md == "Note<!---->**.** end.\n"
+    assert _fidelity(parts)["gate"] == "pass"
 
 
 # ------------------------------------------ the bracket rule is about the LINE
@@ -1765,3 +1788,1439 @@ def test_bold_italic_on_one_run_is_shiftable_because_the_asterisks_are_one_run()
     md, _rep = _graded(parts)
     assert md == "The MODE(***2:0)*** end.\n"
     assert _fidelity(parts)["gate"] == "pass"
+
+
+# ============================================================================
+# A block a document never wrote (quality-plan P9.5, defects 3 and 4)
+# ============================================================================
+#
+# `_esc` neutralises INLINE syntax. It does not neutralise the constructs that open
+# a BLOCK, which is what `_esc_lead` is for — and `_esc_lead` was reaching the docx
+# heading and paragraph paths and the chart caption, but none of the eight places a
+# converter puts source text at the start of a block.
+#
+# A list item's content column IS a block start. After `- `, CommonMark will open a
+# heading, a nested list, a blockquote, a fence, a link reference definition or a
+# thematic break exactly as it would at column 0. Measured on the shipped corpus deck
+# with a single bullet's text replaced by `- - -`:
+#
+#     pristine   bullet_items=16  thematic_breaks=0  recall=1.0  valid=True
+#     poisoned   bullet_items=15  thematic_breaks=1  recall=1.0  valid=True
+#
+# The bullet DELETED ITSELF — emitted as `- - - -`, which is a thematic break — and
+# both gates certified it. The failure mode is the worse of the two available: a
+# thematic break carries no tokens for recall to miss and no heading for the fact
+# vector to catch, so the paragraph is simply gone.
+#
+# Every expectation below was checked against marko 2.2.3, a real CommonMark
+# implementation, rather than against this project's own reader — the question
+# "what does this markdown MEAN" is not one the converter's author may answer.
+# The differential test at the end of this section runs that check for real when a
+# reference parser is importable.
+
+def _pptx_graded(parts):
+    """(markdown, conversion_report) for a deck — graded, never asserted alone."""
+    md = pptx_markdown(parts)
+    return md, conversion_report(pptx_source_text(parts), md)
+
+
+# Source texts that open a block, and what each would have become. Kept as one
+# table so a construct added here is automatically demanded of every emission
+# site below, instead of each site growing its own ad-hoc pair.
+_OPENS_A_BLOCK = [
+    ("- - -", "a thematic break: the item vanishes, carrying no tokens with it"),
+    ("---", "a thematic break"),
+    ("## Rollout", "an ATX heading the document never had"),
+    ("15. step", "a nested ordered list whose marker markdown_to_text swallows"),
+    ("1) step", "a nested ordered list under the paren marker"),
+    ("> quote", "a block quote"),
+    ("+ item", "a nested bullet list"),
+    ("[r]: http://x", "a link reference definition: CommonMark eats the whole line"),
+]
+
+
+@pytest.mark.parametrize("text,becomes", _OPENS_A_BLOCK,
+                         ids=[t for t, _ in _OPENS_A_BLOCK])
+def test_a_slide_bullet_never_opens_a_block_it_did_not_write(text, becomes):
+    """The body-placeholder path — the one measured above on the real corpus."""
+    parts = {"ppt/slides/slide1.xml": _slide(_sp("Kept") + _sp(text))}
+    md, rep = _pptx_graded(parts)
+    facts = md_structure(md)
+    assert facts["bullet_items"] == 2, "%r became %s" % (text, becomes)
+    assert facts["thematic_breaks"] == 0
+    assert facts["headings"] == {2: 1}, "only the `## Slide 1` heading is real"
+    assert facts["ordered_items"] == 0
+    assert rep["valid"] and rep["recall"] == 1.0
+
+
+@pytest.mark.parametrize("text,becomes", _OPENS_A_BLOCK,
+                         ids=[t for t, _ in _OPENS_A_BLOCK])
+def test_a_bare_txbody_paragraph_never_opens_a_block_it_did_not_write(text, becomes):
+    """A txBody outside a p:sp — a connector, or an exotic shape type. It renders
+    through a SECOND emission site with the same defect, so fixing only the first
+    would leave the loss reachable by any deck PowerPoint happens to write that way."""
+    body = '<p:txBody><a:p><a:r><a:t>%s</a:t></a:r></a:p></p:txBody>' % text
+    parts = {"ppt/slides/slide1.xml": _slide(_sp("Kept") + body)}
+    md, rep = _pptx_graded(parts)
+    facts = md_structure(md)
+    assert facts["bullet_items"] == 2, "%r became %s" % (text, becomes)
+    assert facts["thematic_breaks"] == 0
+    assert facts["headings"] == {2: 1}
+    assert rep["valid"] and rep["recall"] == 1.0
+
+
+def test_a_speaker_note_title_never_opens_a_block_it_did_not_write():
+    """The notes TITLE lands as a bare paragraph at column zero, where every
+    construct is live — unlike a slide title, which is safe only because
+    `## Slide N — ` is already in front of it.
+
+    No corpus deck reaches this line: the fixtures give their notes shapes
+    `ph="body"`, so the branch that emits a notes title has never once run under
+    test. An emission site nothing exercises is not a site that works."""
+    notes = ('<p:notes %s><p:cSld><p:spTree>%s</p:spTree></p:cSld></p:notes>'
+             % (P, _sp("## Fabricated", ph="title") + _sp("real note")))
+    parts = {"ppt/slides/slide1.xml": _slide(_sp("Body")),
+             "ppt/notesSlides/notesSlide1.xml": notes}
+    md, rep = _pptx_graded(parts)
+    facts = md_structure(md)
+    assert facts["headings"] == {2: 1, 3: 1}, (
+        "`## Slide 1` and `### Speaker notes` are the only real headings; "
+        "the note's own text must not become a third")
+    assert rep["valid"] and rep["recall"] == 1.0
+
+
+def test_a_deck_comment_never_opens_a_block_it_did_not_write():
+    """Comments render as a bullet list, so a comment reading `- - -` deletes
+    itself exactly as a slide bullet does."""
+    cm = ('<p:cmLst %s><p:cm><p:text>- - -</p:text></p:cm>'
+          '<p:cm><p:text>keep this</p:text></p:cm></p:cmLst>' % P)
+    parts = {"ppt/slides/slide1.xml": _slide(_sp("Body")),
+             "ppt/comments/modernComment_1.xml": cm}
+    md, rep = _pptx_graded(parts)
+    facts = md_structure(md)
+    assert facts["thematic_breaks"] == 0
+    assert facts["bullet_items"] == 3, "the body bullet plus BOTH comments"
+    assert rep["valid"] and rep["recall"] == 1.0
+
+
+def test_a_smartart_item_never_opens_a_block_it_did_not_write():
+    """`_diagram_list_md` is reached from all three formats, so one unescaped
+    diagram label is a loss in a deck, a document and a workbook at once."""
+    data = ('<dgm:dataModel xmlns:dgm="urn:d" %s><dgm:ptLst>'
+            '<dgm:pt><dgm:t><a:p><a:r><a:t>- - -</a:t></a:r></a:p></dgm:t></dgm:pt>'
+            '<dgm:pt><dgm:t><a:p><a:r><a:t>kept</a:t></a:r></a:p></dgm:t></dgm:pt>'
+            '</dgm:ptLst></dgm:dataModel>' % A)
+    parts = {"ppt/slides/slide1.xml": _slide(_sp("Body")),
+             "ppt/diagrams/data1.xml": data}
+    md, rep = _pptx_graded(parts)
+    assert md_structure(md)["thematic_breaks"] == 0
+    assert rep["valid"] and rep["recall"] == 1.0
+
+
+def test_a_docx_list_item_never_opens_a_block_it_did_not_write():
+    """The same defect, one format over. The docx HEADING and PARAGRAPH paths call
+    `_esc_lead`; the list-item path never did, so a bulleted `- - -` measured
+    `bullet_items 7 -> 6, thematic_breaks 0 -> 1` on the corpus specification at
+    `recall: 1.0, valid: True`."""
+    parts = {"word/document.xml": _wdoc(_wp("kept", num="1") + _wp("- - -", num="1"))}
+    md, rep = _graded(parts)
+    facts = md_structure(md)
+    assert facts["bullet_items"] == 2
+    assert facts["thematic_breaks"] == 0
+    assert rep["valid"] and rep["recall"] == 1.0
+
+
+def test_a_docx_footnote_never_opens_a_block_it_did_not_write():
+    parts = {"word/document.xml": _wdoc(_wp("Body")),
+             "word/footnotes.xml":
+                 ('<w:footnotes %s><w:footnote w:id="1"><w:p><w:r><w:t>15. step'
+                  '</w:t></w:r></w:p></w:footnote></w:footnotes>' % W)}
+    md, rep = _graded(parts)
+    assert md_structure(md)["ordered_items"] == 0
+    assert rep["valid"] and rep["recall"] == 1.0
+
+
+def test_a_workbook_comment_never_opens_a_block_it_did_not_write():
+    parts = {"xl/workbook.xml": ('<workbook %s><sheets><sheet name="S" sheetId="1"/>'
+                                 '</sheets></workbook>' % S),
+             "xl/comments1.xml": ('<comments %s><commentList><comment ref="A1">'
+                                  '<text><t>- - -</t></text></comment></commentList>'
+                                  '</comments>' % S)}
+    md = xlsx_markdown(parts)
+    rep = conversion_report(xlsx_source_text(parts), md)
+    assert md_structure(md)["thematic_breaks"] == 0
+    assert rep["valid"] and rep["recall"] == 1.0
+
+
+def test_the_escape_is_only_added_where_a_block_could_actually_open():
+    """The other half of the contract, and the reason this is not "escape
+    everything": a backslash a renderer hides is still a byte a BM25 index, an
+    embedder and a human grep can see — `_esc_special` makes that argument for
+    inline escapes and it applies here too. Text that was never at risk stays
+    verbatim, and the cases below are the ones a careless rule would take:
+    `#hashtag` (no space, so not a heading), seven hashes (six is the maximum),
+    a pipe row (GFM needs a delimiter line under it), a version or a temperature
+    range that merely opens with a digit or a dash."""
+    safe = ["#hashtag", "####### seven hashes is not a heading",
+            "| a | b |", "  spaces are stripped before this point", "3.5 volts",
+            "10.0.0.1 is the gateway", "-40C to 125C", "--verbose", "1.2.3-rc1"]
+    parts = {"ppt/slides/slide1.xml": _slide("".join(_sp(t) for t in safe))}
+    md, rep = _pptx_graded(parts)
+    assert "\\" not in md, md
+    assert rep["valid"] and rep["recall"] == 1.0
+
+
+def test_a_line_of_equals_signs_is_escaped_even_though_an_item_cannot_underline():
+    """The one deliberate over-escape, recorded rather than hidden.
+
+    `_LEAD_RULE` escapes a line of `=` because a setext underline turns the line
+    ABOVE it into a heading and takes its own characters out of the render. Inside a
+    list item there is no line above, so `- ===` was never at risk — but the rule
+    stays whole, because `_esc_fig` lead-escapes EVERY line of a multi-line caption
+    and there the line above is real. One rule with one meaning is worth more than a
+    saved backslash on a rare string, and the round trip is unaffected:
+    `markdown_to_text` strips it back off, so no token moves.
+
+    Narrowing this to "first line of a block only" is a real improvement and a
+    separate change — it would move bytes on the docx paragraph path, which no
+    fixture in this slice demands."""
+    parts = {"ppt/slides/slide1.xml": _slide(_sp("==="))}
+    md, rep = _pptx_graded(parts)
+    assert "- \\===" in md
+    assert markdown_to_text(md).strip().endswith("===")
+    assert rep["valid"] and rep["recall"] == 1.0
+
+
+# ------------------------------------------------- the deck's order, not the disk's
+
+# PowerPoint does NOT renumber slide parts when a user drags a slide. It rewrites
+# `p:sldIdLst` in `ppt/presentation.xml` and leaves `ppt/slides/slideN.xml` exactly
+# where it was. So "sort the part names numerically" is not a reading of the deck at
+# all — it is a reading of the ORDER THE SLIDES WERE FIRST CREATED IN, and for any
+# deck anyone has ever reordered the two disagree.
+#
+# Measured before this landed, on the shipped corpus deck: rewriting `sldIdLst` to
+# swap slides 2 and 3 left the markdown BYTE-IDENTICAL. `ppt/presentation.xml` was
+# not even in `OOXML_MAIN_PARTS["pptx"]`, so the converter never received it, and
+# `p:sldIdLst` had zero references anywhere in the module. The xlsx lane in the same
+# file had read `xl/workbook.xml` for sheet order all along.
+#
+# The token gate cannot see it: recall compares MULTISETS, so order is invisible to
+# it by construction. `structure_fidelity` can, since P9.6 gave the deck a truth that
+# derives the order again by its own reader — the graded half of that lives in
+# `tests/integration/test_office_gate_red_direction.py`, over the real corpus deck.
+# These stay unit tests on the emitted markdown, which is the other question: what
+# the heading actually SAYS, and that it means position rather than filename.
+
+def _pres(rels_and_ids, extra=""):
+    """(presentation.xml, its .rels) for a deck whose sldIdLst lists ``rels_and_ids``
+    as (rId, target) pairs in presentation order."""
+    ids = "".join('<p:sldId id="%d" r:id="%s"/>' % (256 + n, rid)
+                  for n, (rid, _t) in enumerate(rels_and_ids))
+    pres = ('<p:presentation %s><p:sldIdLst>%s%s</p:sldIdLst></p:presentation>'
+            % (P, ids, extra))
+    rels = ('<Relationships %s>%s</Relationships>'
+            % (RELS, "".join('<Relationship Id="%s" Type="http://schemas.openxmlformats'
+                             '.org/officeDocument/2006/relationships/slide" '
+                             'Target="%s"/>' % (rid, t) for rid, t in rels_and_ids)))
+    return {"ppt/presentation.xml": pres,
+            "ppt/_rels/presentation.xml.rels": rels}
+
+
+def _deck(order, titles=None):
+    """A deck of len(titles) slide parts, presented in ``order`` (part numbers)."""
+    titles = titles or {}
+    parts = {}
+    for n in sorted(set(list(order) + list(titles))):
+        parts["ppt/slides/slide%d.xml" % n] = _slide(
+            _sp(titles.get(n, "Title %d" % n), ph="title") + _sp("body %d" % n))
+    parts.update(_pres([("rId%d" % (i + 2), "slides/slide%d.xml" % n)
+                        for i, n in enumerate(order)]))
+    return parts
+
+
+def _headings(md):
+    return [l for l in md.split("\n") if l.startswith("## ")]
+
+
+def test_slides_are_emitted_in_the_decks_order_not_the_filename_order():
+    """The drag PowerPoint actually performs: slide 5 moved to position 2, parts
+    left unrenumbered."""
+    parts = _deck([1, 5, 3, 4, 2], {5: "Rollout plan", 1: "Overview"})
+    md = pptx_markdown(parts)
+    assert _headings(md) == ["## Slide 1 — Overview", "## Slide 2 — Rollout plan",
+                             "## Slide 3 — Title 3", "## Slide 4 — Title 4",
+                             "## Slide 5 — Title 2"]
+    assert md.index("body 5") < md.index("body 3") < md.index("body 2")
+
+
+def test_the_slide_number_counts_position_in_the_deck_not_the_part_name():
+    """`## Slide 2` must mean "the second slide you see", which is the only reading
+    a reader of the markdown can act on. Numbering by part name published a deck
+    whose headings claimed an order its own content did not have."""
+    parts = _deck([7, 3], {7: "First", 3: "Second"})
+    md = pptx_markdown(parts)
+    assert _headings(md) == ["## Slide 1 — First", "## Slide 2 — Second"]
+
+
+def test_a_reordered_deck_still_binds_each_slides_own_notes_and_rels():
+    """The trap in this change. Slide POSITION and slide PART NUMBER are now two
+    different numbers, and everything that reaches for a satellite part —
+    `ppt/slides/_rels/slideN.xml.rels`, the `notesSlideN.xml` fallback — must keep
+    using the PART number. Conflating them silently attaches slide 5's speaker
+    notes to whichever slide happens to sit in position 5."""
+    parts = _deck([5, 1], {5: "Fifth", 1: "First"})
+    notes = ('<p:notes %s><p:cSld><p:spTree>%s</p:spTree></p:cSld></p:notes>'
+             % (P, _sp("notes belonging to part five", ph="body")))
+    parts["ppt/notesSlides/notesSlide5.xml"] = notes
+    md = pptx_markdown(parts)
+    first, second = md.index("## Slide 1"), md.index("## Slide 2")
+    assert first < md.index("notes belonging to part five") < second, (
+        "the notes of part 5 must render under the slide that IS part 5, which is "
+        "now position 1")
+
+
+def test_a_deck_with_no_presentation_part_keeps_the_filename_order():
+    """The fallback is the behaviour this change replaces, so it can never make a
+    deck worse than it already was."""
+    parts = {"ppt/slides/slide2.xml": _slide(_sp("B")),
+             "ppt/slides/slide10.xml": _slide(_sp("C")),
+             "ppt/slides/slide1.xml": _slide(_sp("A"))}
+    md = pptx_markdown(parts)
+    assert _headings(md) == ["## Slide 1", "## Slide 2", "## Slide 3"]
+    assert md.index("- A") < md.index("- B") < md.index("- C")
+
+
+def test_an_unparseable_presentation_part_keeps_the_filename_order():
+    parts = _deck([2, 1])
+    parts["ppt/presentation.xml"] = "<p:presentation><unclosed>"
+    assert _headings(pptx_markdown(parts)) == ["## Slide 1 — Title 1",
+                                               "## Slide 2 — Title 2"]
+
+
+def test_an_empty_slide_id_list_keeps_the_filename_order():
+    parts = _deck([2, 1])
+    parts["ppt/presentation.xml"] = '<p:presentation %s><p:sldIdLst/></p:presentation>' % P
+    assert _headings(pptx_markdown(parts)) == ["## Slide 1 — Title 1",
+                                               "## Slide 2 — Title 2"]
+
+
+def test_missing_presentation_rels_keeps_the_filename_order():
+    parts = _deck([2, 1])
+    del parts["ppt/_rels/presentation.xml.rels"]
+    assert _headings(pptx_markdown(parts)) == ["## Slide 1 — Title 1",
+                                               "## Slide 2 — Title 2"]
+
+
+def test_a_dangling_slide_id_is_skipped_and_its_slide_still_publishes():
+    """A relationship id nothing resolves cannot say where its slide goes — but it
+    must not be able to make the slide vanish either. Token recall demands 1.0, so
+    a dropped slide fails the whole document; publishing it after the ordered ones
+    keeps every word and says plainly that the deck did not place it."""
+    parts = _deck([1, 2])
+    parts["ppt/presentation.xml"] = parts["ppt/presentation.xml"].replace(
+        'r:id="rId3"', 'r:id="rIdMissing"')
+    md = pptx_markdown(parts)
+    assert "## Slide 1 — Title 1" in md
+    assert "body 2" in md and "Title 2" in md
+    assert conversion_report(pptx_source_text(parts), md)["recall"] == 1.0
+
+
+def test_a_slide_part_the_deck_never_lists_still_publishes():
+    """A deleted-but-not-purged slide. It is not in the presentation, so it has no
+    position — but its words are still in the package, and the gate counts them."""
+    parts = _deck([1])
+    parts["ppt/slides/slide9.xml"] = _slide(_sp("orphaned copy"))
+    md = pptx_markdown(parts)
+    assert "## Slide 1 — Title 1" in md
+    assert "orphaned copy" in md
+    assert "## Slide 2" not in md, (
+        "an unlisted part has no position in the deck and must not claim one")
+    assert conversion_report(pptx_source_text(parts), md)["recall"] == 1.0
+
+
+def test_a_slide_listed_twice_is_published_once():
+    """Two sldId entries pointing at one part is a malformed deck; publishing the
+    slide twice would double every one of its tokens against a ground truth that
+    read the part once."""
+    parts = _deck([1, 2])
+    parts.update(_pres([("rId2", "slides/slide1.xml"),
+                        ("rId3", "slides/slide2.xml"),
+                        ("rId4", "slides/slide1.xml")]))
+    md = pptx_markdown(parts)
+    assert _headings(md) == ["## Slide 1 — Title 1", "## Slide 2 — Title 2"]
+    assert md.count("- body 1") == 1
+
+
+@pytest.mark.parametrize("target", ["slides/slide2.xml", "../slides/slide2.xml",
+                                    "/ppt/slides/slide2.xml", "./slides/slide2.xml",
+                                    "ppt/slides/slide2.xml"])
+def test_every_spec_legal_relationship_target_form_resolves(target):
+    """A Target is a URI reference relative to the part that holds it, and real
+    producers write all of these. A form this misses reads as a dangling id and
+    silently drops the deck back to filename order."""
+    parts = _deck([2, 1])
+    parts.update(_pres([("rId2", target), ("rId3", "slides/slide1.xml")]))
+    assert _headings(pptx_markdown(parts)) == ["## Slide 1 — Title 2",
+                                               "## Slide 2 — Title 1"]
+
+
+def test_a_sldid_pointing_at_something_that_is_not_a_slide_is_ignored():
+    parts = _deck([1, 2])
+    parts.update(_pres([("rId2", "notesSlides/notesSlide1.xml"),
+                        ("rId3", "slides/slide2.xml"),
+                        ("rId4", "slides/slide1.xml")]))
+    md = pptx_markdown(parts)
+    assert _headings(md) == ["## Slide 1 — Title 2", "## Slide 2 — Title 1"]
+
+
+def test_pptx_slide_order_is_public_and_reports_the_order_it_read():
+    """`scripts/` records which order it published under, and a script may never
+    reach into a private module to find out (CLAUDE.md, the `__init__` boundary).
+    An empty result is the honest answer for "this deck could not tell me", and is
+    what the caller turns into the `part-name` decision."""
+    from backend.ingest import pptx_slide_order
+    assert pptx_slide_order(_deck([1, 5, 3])) == ["ppt/slides/slide1.xml",
+                                                  "ppt/slides/slide5.xml",
+                                                  "ppt/slides/slide3.xml"]
+    assert pptx_slide_order({"ppt/slides/slide1.xml": _slide(_sp("x"))}) == []
+    assert pptx_slide_order({}) == []
+
+
+# ------------------------------------------- a block that needs TWO lines to open
+
+def test_svg_figure_labels_never_fabricate_a_table():
+    """`svg_text` joins every <text> label of one image with newlines, so a figure's
+    labels arrive as adjacent BARE lines in a single block — and a GFM table needs
+    exactly that: a delimiter row directly under a line holding a pipe.
+
+    `_esc_lead` cannot see this one, because the danger is a property of the PAIR of
+    lines rather than of either alone. Measured before the fix, on a drawing whose
+    three labels happen to spell a table: `md_structure` reported
+    `tables: [{rows: 2, cols: 2, has_header: True}]` at token recall 1.0 — a
+    two-column table fabricated out of a picture, which is a silent structural
+    invention for a deck and, where the fact is graded, a false FAILURE for a
+    document."""
+    svg = ('<svg xmlns="http://www.w3.org/2000/svg">'
+           '<text>| Path | Cycles |</text><text>| --- | --- |</text>'
+           '<text>| display read | 40 |</text></svg>')
+    parts = {"word/document.xml": _wdoc(_wp("Body.")), "word/media/image1.svg": svg}
+    md = ooxml_markdown("docx", parts)
+    rep = conversion_report(ooxml_source_text("docx", parts), md)
+    assert md_structure(md)["tables"] == [], md
+    assert rep["valid"] and rep["recall"] == 1.0
+    assert _fidelity(parts)["gate"] == "pass"
+
+
+def test_a_delimiter_row_is_escaped_wherever_it_lands():
+    """The one rule in `_esc_block_start` that does not ask what the line says on its
+    own, because it cannot: a table needs a delimiter row directly under a line
+    holding a pipe, so the hazard belongs to a PAIR of lines and no emitter can see
+    its own neighbour. `svg_text` joins a figure's labels with newlines and
+    `_join_blocks` stacks consecutive list items with a single newline — both put two
+    pieces of source text on adjacent lines, and the bulleted form is the worse of
+    the two because `md_structure` does not see the table at all (marko builds
+    `ul,li,table,thead,…`; the fact vector reports `tables: 0`).
+
+    A first line is escaped too. It is a delimiter row for whatever comes after it,
+    and the emitter does not know what that is."""
+    svg = ('<svg xmlns="http://www.w3.org/2000/svg">'
+           '<text>--- | ---</text><text>sensor front end</text></svg>')
+    parts = {"word/document.xml": _wdoc(_wp("Body.")), "word/media/image1.svg": svg}
+    md = ooxml_markdown("docx", parts)
+    assert "\\--- | ---" in md
+    assert md_structure(md)["tables"] == []
+    assert conversion_report(ooxml_source_text("docx", parts), md)["valid"]
+
+
+def test_the_delimiter_rule_fires_only_on_table_punctuation():
+    """A line matching it is made ONLY of dashes, colons, pipes and spaces, so it
+    carries no token and escaping it costs nothing worth having. Anything with a
+    word in it is ordinary text and keeps its bytes."""
+    labels = ["a | b", "up-to-date", "3 - 5 V", "range: -40 to 125",
+              "path/to/-file", "|pipe start", "end pipe|"]
+    svg = ('<svg xmlns="http://www.w3.org/2000/svg">%s</svg>'
+           % "".join("<text>%s</text>" % l for l in labels))
+    parts = {"word/document.xml": _wdoc(_wp("Body.")), "word/media/image1.svg": svg}
+    md = ooxml_markdown("docx", parts)
+    assert "\\" not in md.split("## Figures")[1], md
+    assert conversion_report(ooxml_source_text("docx", parts), md)["valid"]
+
+
+def test_bulleted_labels_never_build_a_table_between_two_items():
+    """The site the pair-rule version missed: consecutive list items are joined with
+    a single newline, so item two is directly under item one exactly as two bare
+    lines are."""
+    items = ["| Path | Cycles |", "| --- | --- |", "| display read | 40 |"]
+    parts = {"ppt/slides/slide1.xml": _slide("".join(_sp(t) for t in items))}
+    md, rep = _pptx_graded(parts)
+    assert md_structure(md)["tables"] == [], md
+    assert md_structure(md)["bullet_items"] == 3
+    assert rep["valid"] and rep["recall"] == 1.0
+
+
+# The site matters more than the string here. A bullet's leading `- ` is itself a
+# list marker, so `markdown_to_text` strips THAT and leaves whatever follows alone —
+# which means a bullet can never expose a disagreement about what counts as an
+# ordered marker. Only text at COLUMN ZERO can. The first version of this test used a
+# pptx bullet and was green while the paragraph path was broken.
+_MARKER_SITES = ["docx_paragraph", "docx_heading", "pptx_bullet"]
+
+
+def _at_site(site, text):
+    """The same source text, emitted at one of the places a converter puts it."""
+    if site == "pptx_bullet":
+        parts = {"ppt/slides/slide1.xml": _slide(_sp("kept") + _sp(text))}
+        return pptx_markdown(parts), pptx_source_text(parts)
+    body = '<w:p><w:r><w:t xml:space="preserve">%s</w:t></w:r></w:p>' % text
+    parts = {"word/document.xml": _wdoc(_wp("kept") + body)}
+    if site == "docx_heading":
+        parts = {"word/document.xml": _wdoc(
+                     _wp("kept")
+                     + '<w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr>'
+                       '<w:r><w:t xml:space="preserve">%s</w:t></w:r></w:p>' % text),
+                 "word/styles.xml":
+                     '<w:styles %s><w:style w:styleId="Heading1" w:type="paragraph">'
+                     '<w:name w:val="heading 1"/></w:style></w:styles>' % W}
+    return docx_markdown(parts), docx_source_text(parts)
+
+
+@pytest.mark.parametrize("site", _MARKER_SITES)
+@pytest.mark.parametrize("text", ["1234567890. bill of materials",
+                                  "12345678901234567890. serial",
+                                  "20240931123. lot"])
+def test_an_ordered_marker_longer_than_commonmark_allows_round_trips(site, text):
+    """CommonMark caps an ordered marker at NINE digits, so a ten-digit opener is
+    ordinary prose and must not be escaped — the same argument `_esc_special` makes
+    about brackets and underscores.
+
+    But THREE regexes read a marker, and they have to agree or the document is
+    caught between them: `_ooxml_md._LEAD_LIST_NUM` decides what to escape,
+    `_mdstructure._ORDERED` decides what the structure gate sees, and
+    `_markdown._LIST` decides what the TOKEN gate sees. Capping only the first two
+    left the third stripping a marker no renderer would form, so
+    `1234567890. bill of materials` came out unescaped, lost its number on the way
+    back through `markdown_to_text`, and the document REFUSED TO PUBLISH at
+    `recall: 0.833, missing: [('1234567890', 1)]` — a faithful document failing."""
+    md, src = _at_site(site, text)
+    rep = conversion_report(src, md)
+    assert "\\." not in md, "%r is not a marker and must not be escaped: %r" % (text, md)
+    assert rep["valid"] and rep["recall"] == 1.0, rep
+
+
+@pytest.mark.parametrize("site", _MARKER_SITES)
+def test_a_marker_commonmark_does_accept_is_still_escaped(site):
+    """The other side of the cap: nine digits IS a marker, at every site."""
+    md, src = _at_site(site, "123456789. still a marker")
+    rep = conversion_report(src, md)
+    assert "123456789\\. still a marker" in md, md
+    assert rep["valid"] and rep["recall"] == 1.0
+
+
+def test_a_list_marker_with_no_content_at_all_still_deletes_itself():
+    """The subtlest case in this slice, and the one that caught a bad measurement.
+
+    A bullet whose ENTIRE text is `15.` emits `- 15.`, and CommonMark reads that as a
+    bullet holding an EMPTY nested ordered list: the characters are gone from the
+    render, while `markdown_to_text` still reports them, so the token gate says
+    `recall: 1.0, valid: True`. Measured through marko 2.2.3 on real converter output:
+
+        - alpha / - 15. / - beta   renders as   "alpha beta"
+
+    `_LEAD_LIST_NUM` and `_LEAD_MARK` both required a SPACE after the marker, so none
+    of `15.`, `10)`, `1.`, `1)` or `+` was escaped. (`-` alone is caught by
+    `_LEAD_RULE` and `*` alone by `_esc`, which is why `+` was the only bullet marker
+    left uncovered.)
+
+    The first pass of this measurement concluded the opposite, because it rendered
+    `"- 15."` with no trailing newline — and marko parses that as literal text. Real
+    converter output always ends in a newline. Any check of what markdown MEANS has to
+    be made on the bytes the converter actually emits."""
+    bare = ("15.", "10)", "1.", "1)", "+")
+    parts = {"ppt/slides/slide1.xml":
+             _slide(_sp("alpha") + "".join(_sp(t) for t in bare) + _sp("beta"))}
+    md, rep = _pptx_graded(parts)
+    facts = md_structure(md)
+    assert facts["ordered_items"] == 0, md
+    assert facts["bullet_items"] == len(bare) + 2
+    assert facts["list_items"] == {0: len(bare) + 2}, "nothing nests inside anything"
+    assert rep["valid"] and rep["recall"] == 1.0
+    for t in bare:
+        assert markdown_to_text(md).find(t) >= 0
+
+
+# --------------------------------------- a heading that eats its own last character
+
+@pytest.mark.parametrize("text", ["Drain procedure #", "Rev ##", "Section # ", "###"])
+def test_a_heading_keeps_a_trailing_hash_the_document_wrote(text):
+    """CommonMark lets an ATX heading end with an optional CLOSING SEQUENCE of `#`s
+    and deletes it from the render. A heading whose own text ends in a hash — a
+    revision marker, an issue reference — therefore comes out one character short,
+    and BOTH gates certify it: `#` carries no token, so recall stays 1.0, and the
+    heading is still a heading of the same level, so no fact moves.
+
+    Measured through marko 2.2.3: `# Drain procedure #` renders the words
+    `['Drain', 'procedure']`."""
+    styles = ('<w:styles %s><w:style w:styleId="Heading1" w:type="paragraph">'
+              '<w:name w:val="heading 1"/></w:style></w:styles>' % W)
+    body = ('<w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr>'
+            '<w:r><w:t xml:space="preserve">%s</w:t></w:r></w:p>' % text)
+    parts = {"word/document.xml": _wdoc(body), "word/styles.xml": styles}
+    md, rep = _graded(parts)
+    assert "\\#" in md, md
+    assert markdown_to_text(md).strip() == text.strip()
+    assert rep["valid"] and rep["recall"] == 1.0
+    assert md_structure(md)["headings"] == {1: 1}
+
+
+# `# leading` is deliberately absent: a heading whose TEXT starts with a hash is
+# escaped by `_esc_lead`, which is a different rule with a different reason, and
+# folding the two into one assertion would hide either one breaking.
+@pytest.mark.parametrize("text", ["Bug #42", "C# guide", "no hash here",
+                                  "issue #7 and #8", "F#"])
+def test_a_heading_without_a_closing_sequence_keeps_its_bytes(text):
+    """A `#` that is not a trailing run preceded by whitespace was never at risk."""
+    styles = ('<w:styles %s><w:style w:styleId="Heading1" w:type="paragraph">'
+              '<w:name w:val="heading 1"/></w:style></w:styles>' % W)
+    body = ('<w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr>'
+            '<w:r><w:t xml:space="preserve">%s</w:t></w:r></w:p>' % text)
+    parts = {"word/document.xml": _wdoc(body), "word/styles.xml": styles}
+    md, rep = _graded(parts)
+    assert "\\#" not in md, md
+    assert rep["valid"] and rep["recall"] == 1.0
+
+
+def test_a_sheet_named_with_a_trailing_hash_keeps_it():
+    parts = {"xl/workbook.xml": ('<workbook %s><sheets>'
+                                 '<sheet name="Rev #" sheetId="1"/></sheets>'
+                                 '</workbook>' % S)}
+    md = xlsx_markdown(parts)
+    assert md.strip() == "## Rev \\#"
+    assert markdown_to_text(md).strip() == "Rev #"
+
+
+def test_a_slide_titled_with_a_trailing_hash_keeps_it():
+    parts = {"ppt/slides/slide1.xml": _slide(_sp("Errata #", ph="title"))}
+    md, rep = _pptx_graded(parts)
+    assert "## Slide 1 — Errata \\#" in md
+    assert rep["valid"] and rep["recall"] == 1.0
+
+
+# ------------------------------- who escapes an embedded section's text
+
+@pytest.mark.parametrize("text,fact", [("- - -", "thematic_breaks"),
+                                       ("## H2", "headings"),
+                                       ("- + nested", "bullet_items")])
+def test_a_text_box_never_opens_a_block_it_did_not_write(text, fact):
+    """`_embedded_sections` used to decide whether a value was a pre-formatted
+    bullet list by asking whether it STARTED WITH `- ` — a guess, and wrong for
+    exactly the text that matters. A drawing whose whole content is `- - -` was
+    taken for a list, passed through unescaped and published as a thematic break:
+    the text box gone from the document at recall 1.0, gate pass.
+
+    Each renderer now escapes its own text, because only it knows what it built."""
+    draw = ('<xdr:wsDr xmlns:xdr="urn:x" %s><xdr:sp><xdr:txBody>'
+            '<a:p><a:r><a:t>%s</a:t></a:r></a:p></xdr:txBody></xdr:sp></xdr:wsDr>'
+            % (A, text))
+    parts = {"xl/workbook.xml": ('<workbook %s><sheets>'
+                                 '<sheet name="S" sheetId="1"/></sheets></workbook>' % S),
+             "xl/drawings/drawing1.xml": draw}
+    md = xlsx_markdown(parts)
+    rep = conversion_report(xlsx_source_text(parts), md)
+    facts = md_structure(md)
+    assert facts["thematic_breaks"] == 0
+    assert facts["headings"] == {2: 2}, "the sheet and the section, and nothing else"
+    assert rep["valid"] and rep["recall"] == 1.0
+
+
+def test_a_smartart_bullet_list_is_still_passed_through_as_a_list():
+    """The other direction: removing the guess must not stop a renderer that really
+    did build a bullet list from emitting one."""
+    data = ('<dgm:dataModel xmlns:dgm="urn:d" %s><dgm:ptLst>'
+            '<dgm:pt><dgm:t><a:p><a:r><a:t>first node</a:t></a:r></a:p></dgm:t></dgm:pt>'
+            '<dgm:pt><dgm:t><a:p><a:r><a:t>second node</a:t></a:r></a:p></dgm:t></dgm:pt>'
+            '</dgm:ptLst></dgm:dataModel>' % A)
+    parts = {"word/document.xml": _wdoc(_wp("Body.")), "word/diagrams/data1.xml": data}
+    md, rep = _graded(parts)
+    assert "- first node\n- second node" in md
+    assert md_structure(md)["bullet_items"] == 2
+    assert rep["valid"] and rep["recall"] == 1.0
+
+
+# ----------------------------------------- a deck that lies about its own order
+
+# The contract for every one of these is the same and is not negotiable: the reader
+# NEVER raises, and no slide's TEXT is ever dropped. A dropped slide fails token
+# recall outright — measured at 0.72 on a five-slide deck — so a malformed ordering
+# record must cost ORDER and nothing else.
+_MALFORMED = [
+    ("no sldId at all", "", ""),
+    ("sldId carrying no r:id", '<p:sldId id="256"/>', ""),
+    ("a dangling relationship id", '<p:sldId id="256" r:id="rNope"/>', ""),
+    ("an empty target", '<p:sldId id="256" r:id="rId2"/>', ""),
+    ("a percent-encoded target", '<p:sldId id="256" r:id="rId2"/>', "slides%2fslide1.xml"),
+    ("an absolute url target", '<p:sldId id="256" r:id="rId2"/>', "http://x/slides/slide1.xml"),
+    ("a backslashed target", '<p:sldId id="256" r:id="rId2"/>', "slides\\slide1.xml"),
+    ("a target escaping the package", '<p:sldId id="256" r:id="rId2"/>', "../../etc/passwd"),
+    ("a target naming the presentation", '<p:sldId id="256" r:id="rId2"/>', "presentation.xml"),
+    ("a sldIdLst buried in a wrapper", "", ""),
+]
+
+
+@pytest.mark.parametrize("label,ids,target", _MALFORMED,
+                         ids=[m[0].replace(" ", "_") for m in _MALFORMED])
+def test_a_malformed_ordering_record_costs_order_and_never_text(label, ids, target):
+    parts = {"ppt/slides/slide1.xml": _slide(_sp("alpha")),
+             "ppt/slides/slide2.xml": _slide(_sp("beta"))}
+    body = '<p:sldIdLst>%s</p:sldIdLst>' % ids
+    if label.startswith("a sldIdLst buried"):
+        body = '<p:x>%s</p:x>' % body
+    parts["ppt/presentation.xml"] = '<p:presentation %s>%s</p:presentation>' % (P, body)
+    parts["ppt/_rels/presentation.xml.rels"] = (
+        '<Relationships %s>%s</Relationships>'
+        % (RELS, ('<Relationship Id="rId2" Type="t" Target="%s"/>' % target)
+           if target else ""))
+    md, rep = _pptx_graded(parts)
+    assert rep["recall"] == 1.0 and rep["valid"], md
+    assert "alpha" in md and "beta" in md
+
+
+def test_a_relationship_target_that_is_not_a_slide_is_not_ordered():
+    """Slide-ness is decided in ONE place — `_SLIDE_PART`, the same predicate the
+    notes binding and the rels lookup use. Ordering a part the rest of the lane does
+    not recognise would put it in the sequence and nowhere else, and the part number
+    the heading needs would not exist to be read."""
+    from backend.ingest import pptx_slide_order
+    parts = {"ppt/slides/slide1.xml": _slide(_sp("one")),
+             "ppt/slides/notslide1.xml": _slide(_sp("not a slide part")),
+             "ppt/presentation.xml":
+                 '<p:presentation %s><p:sldIdLst><p:sldId id="256" r:id="rId2"/>'
+                 '</p:sldIdLst></p:presentation>' % P,
+             "ppt/_rels/presentation.xml.rels":
+                 '<Relationships %s><Relationship Id="rId2" Type="t" '
+                 'Target="slides/notslide1.xml"/></Relationships>' % RELS}
+    assert pptx_slide_order(parts) == []
+    md, rep = _pptx_graded(parts)
+    assert "## Slide 1" in md and rep["valid"]
+
+
+def test_the_same_slide_listed_five_thousand_times_publishes_once():
+    parts = {"ppt/slides/slide1.xml": _slide(_sp("only body")),
+             "ppt/presentation.xml":
+                 '<p:presentation %s><p:sldIdLst>%s</p:sldIdLst></p:presentation>'
+                 % (P, '<p:sldId id="256" r:id="rId2"/>' * 5000),
+             "ppt/_rels/presentation.xml.rels":
+                 '<Relationships %s><Relationship Id="rId2" Type="t" '
+                 'Target="slides/slide1.xml"/></Relationships>' % RELS}
+    md, rep = _pptx_graded(parts)
+    assert md.count("- only body") == 1
+    assert rep["recall"] == 1.0
+
+
+# ------------------------------------- a deck's table states its own column count
+#
+# DrawingML spells a merge as ATTRIBUTES on `a:tc`: the origin carries `gridSpan`
+# (or `rowSpan`) and every position it covers is still present, marked `hMerge` (or
+# `vMerge`) and EMPTY. GFM has no colspan, so the emptiness is right — but an
+# always-empty TRAILING column looks exactly like the styled-but-valueless one
+# `_gfm_table` trims, and trimming it loses a column the deck declares.
+
+def _tc(text, attrs=""):
+    return ('<a:tc%s><a:txBody><a:p><a:r><a:t>%s</a:t></a:r></a:p></a:txBody>'
+            '<a:tcPr/></a:tc>' % (attrs, text))
+
+
+def _tbl(rows, cols, inner=""):
+    """A graphicFrame table declaring ``cols`` columns; ``rows`` is a list of rows,
+    each a list of (text, tc-attributes)."""
+    grid = "".join('<a:gridCol w="100"/>' for _ in range(cols))
+    trs = "".join('<a:tr h="1">%s</a:tr>'
+                  % ("".join(_tc(t, at) for t, at in row) + inner) for row in rows)
+    return ('<p:graphicFrame><a:graphic><a:graphicData><a:tbl>'
+            '<a:tblGrid>%s</a:tblGrid>%s</a:tbl></a:graphicData></a:graphic>'
+            '</p:graphicFrame>' % (grid, trs))
+
+
+def test_a_span_in_the_last_column_does_not_narrow_a_slide_table():
+    """Measured before the floor landed: a two-column table published as ONE, and
+    the loss is invisible to every other signal — the covered cell is empty, so it
+    carries no token for recall to miss and the markdown is well-formed GFM."""
+    parts = {"ppt/slides/slide1.xml": _slide(_tbl(
+        [[("Owner", ' gridSpan="2"'), ("", ' hMerge="1"')],
+         [("fabric team", ""), ("", "")]], 2))}
+    md, rep = _pptx_graded(parts)
+    assert rep["recall"] == 1.0
+    assert md_structure(md)["tables"][0]["cols"] == 2
+
+
+def test_a_column_the_grid_declares_but_nothing_fills_is_still_a_column():
+    """The same rule, and it has to be the same rule: a deck STATES its grid, so a
+    width is read rather than inferred. Inferring made an emptied column and a
+    span-covered one indistinguishable."""
+    parts = {"ppt/slides/slide1.xml": _slide(_tbl(
+        [[("a", ""), ("b", ""), ("", "")], [("c", ""), ("d", ""), ("", "")]], 3))}
+    assert md_structure(pptx_markdown(parts))["tables"][0]["cols"] == 3
+
+
+def test_a_table_nested_in_a_cell_does_not_widen_its_owner():
+    """A nested table declares a grid of its own. Counting every `a:gridCol` in the
+    subtree made the owner as wide as both put together, and GFM has no cell that
+    can hold a table anyway — the inner rows flatten into the owning cell."""
+    inner = ('<a:tbl><a:tblGrid><a:gridCol w="1"/><a:gridCol w="1"/></a:tblGrid>'
+             '<a:tr h="1">%s%s</a:tr></a:tbl>' % (_tc("in1"), _tc("in2")))
+    parts = {"ppt/slides/slide1.xml": _slide(
+        _tbl([[("outer", "")]], 1, inner=""))}
+    parts["ppt/slides/slide1.xml"] = _slide(
+        '<p:graphicFrame><a:graphic><a:graphicData><a:tbl>'
+        '<a:tblGrid><a:gridCol w="1"/></a:tblGrid><a:tr h="1">'
+        '<a:tc><a:txBody><a:p><a:r><a:t>outer</a:t></a:r></a:p></a:txBody>%s</a:tc>'
+        '</a:tr></a:tbl></a:graphicData></a:graphic></p:graphicFrame>' % inner)
+    md, rep = _pptx_graded(parts)
+    assert rep["recall"] == 1.0
+    assert md_structure(md)["tables"][0]["cols"] == 1
+
+
+# ------------------------------------ a bullet may not be indented onto thin air
+#
+# CommonMark nests a child item only under a parent that EXISTS. A deck's outline
+# level is a free integer, so `"  " * lvl` can indent an item for a depth nothing
+# opened — and past its parent's content column by four, an indent stops making a
+# list item at all. docx grew the clamp for this in P0.1 (`_list_indent`); the deck
+# path did not, and the three measurements below are what that cost.
+
+def _body(*levelled):
+    paras = "".join('<a:p>%s<a:r><a:t>%s</a:t></a:r></a:p>'
+                    % ('<a:pPr lvl="%d"/>' % lvl if lvl else "", text)
+                    for lvl, text in levelled)
+    return ('<p:sp><p:nvSpPr><p:nvPr><p:ph type="body" idx="1"/></p:nvPr>'
+            '</p:nvSpPr><p:txBody>%s</p:txBody></p:sp>' % paras)
+
+
+def test_a_bullet_two_levels_below_its_parent_is_clamped_to_the_open_level():
+    parts = {"ppt/slides/slide1.xml": _slide(_body((0, "top"), (2, "skipped")))}
+    md, rep = _pptx_graded(parts)
+    assert rep["recall"] == 1.0
+    assert md_structure(md)["list_items"] == {0: 1, 1: 1}
+
+
+def test_a_bullet_three_levels_below_its_parent_is_not_swallowed_by_it():
+    """The worst of the three, because nothing in the report moves. Six columns of
+    indent under a parent whose content column is two is a LAZY CONTINUATION: the
+    item's text is absorbed into the paragraph above it, the item stops existing,
+    and every token is still present — so `recall` reads 1.0 and the bullet is
+    simply gone. Measured: `list_items {0: 2}` for a slide holding three."""
+    parts = {"ppt/slides/slide1.xml":
+             _slide(_body((0, "top"), (3, "swallowed"), (0, "home")))}
+    md, rep = _pptx_graded(parts)
+    assert rep["recall"] == 1.0
+    assert md_structure(md)["list_items"] == {0: 2, 1: 1}
+
+
+def test_a_slide_whose_first_bullet_is_deep_does_not_open_a_code_block():
+    """With no ancestor at all the deepest markdown can put an item is depth 0.
+    Indenting it four columns made the `- ` marker literal text inside an indented
+    CODE BLOCK — a listing the deck never wrote, and no list item at all."""
+    parts = {"ppt/slides/slide1.xml": _slide(_body((2, "starts deep"), (0, "home")))}
+    md, rep = _pptx_graded(parts)
+    assert rep["recall"] == 1.0
+    facts = md_structure(md)
+    assert facts["code_blocks"] == 0
+    assert facts["list_items"] == {0: 2}
+
+
+def test_a_block_between_two_items_restarts_the_nesting():
+    """A table ends the list, so the item after it has no open ancestor however
+    deep the deck says it is. The clamp is per-list, not per-slide."""
+    parts = {"ppt/slides/slide1.xml": _slide(
+        _body((0, "before")) + _tbl([[("cell", "")]], 1) + _body((1, "after")))}
+    md = pptx_markdown(parts)
+    assert md_structure(md)["list_items"] == {0: 2}
+
+
+def test_the_deck_ground_truth_agrees_with_every_clamped_case():
+    from backend.ingest import pptx_source_structure
+    from backend.validate import structure_fidelity_report
+    """The clamp is a fact about MARKDOWN, so both readers must reach it — the
+    converter by indenting, the ground truth by counting open ancestors — and the
+    gate is what proves they did."""
+    for shapes in (_body((0, "top"), (2, "skipped")),
+                   _body((0, "top"), (3, "swallowed"), (0, "home")),
+                   _body((2, "starts deep"), (0, "home")),
+                   _body((0, "a"), (1, "b"), (2, "c"), (0, "d"), (2, "e"))):
+        parts = {"ppt/slides/slide1.xml": _slide(shapes)}
+        verdict = structure_fidelity_report(md_structure(pptx_markdown(parts)),
+                                            pptx_source_structure(parts))
+        assert verdict["gate"] == "pass", (shapes, verdict["deltas"])
+
+
+# ------------------------------- a picture must not renumber the steps after it
+#
+# `_join_blocks` separates any non-`li` block with a blank line, so a column-0
+# sentinel CLOSES the list it interrupts and every item after it restarts at depth
+# 0. docx already indents a picture that shares a step's paragraph (`item_pad`,
+# added when a screenshot renumbered a runbook); a picture in a paragraph of its
+# OWN, and every deck picture, went out at column 0. Both are ordinary documents —
+# a screenshot between a step and its sub-step is what a runbook looks like — and
+# `build_bundle.py` always converts with images ON, so the loss is live, not
+# hypothetical. Measured on a two-item nested list with one picture between them:
+#
+#     emit_images=False   list_items {0: 1, 1: 1}   gate pass
+#     emit_images=True    list_items {0: 2}         gate FAIL
+#
+# A faithful conversion of a real document, refusing to publish, in both formats.
+
+def _pic_rels(part="ppt/media/image1.png", rid="rId9"):
+    return ('<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/'
+            'relationships"><Relationship Id="%s" Type="http://schemas.'
+            'openxmlformats.org/officeDocument/2006/relationships/image" '
+            'Target="../media/%s"/></Relationships>'
+            % (rid, part.rsplit("/", 1)[-1]))
+
+
+def test_a_slide_picture_between_two_bullets_keeps_the_nesting():
+    pic = ('<p:pic><p:nvPicPr><p:cNvPr id="9" name="pic"/></p:nvPicPr>'
+           '<p:blipFill><a:blip r:embed="rId9"/></p:blipFill></p:pic>')
+    parts = {"ppt/slides/slide1.xml":
+             _slide(_body((0, "parent")) + pic + _body((1, "child"))),
+             "ppt/slides/_rels/slide1.xml.rels": _pic_rels(),
+             "ppt/media/image1.png": "PNG"}
+    facts = md_structure(pptx_markdown(parts, emit_images=True))
+    assert facts["list_items"] == {0: 1, 1: 1}
+
+
+def test_a_slide_picture_outside_a_list_is_still_at_column_zero():
+    """The indent is a continuation of an OPEN item, never decoration: with no list
+    open the sentinel sits where it always did."""
+    pic = ('<p:pic><p:nvPicPr><p:cNvPr id="9" name="pic"/></p:nvPicPr>'
+           '<p:blipFill><a:blip r:embed="rId9"/></p:blipFill></p:pic>')
+    parts = {"ppt/slides/slide1.xml": _slide(pic),
+             "ppt/slides/_rels/slide1.xml.rels": _pic_rels(),
+             "ppt/media/image1.png": "PNG"}
+    md = pptx_markdown(parts, emit_images=True)
+    assert "\n<!-- ooxml-image:ppt/media/image1.png -->" in md
+    assert "\n  <!-- ooxml-image" not in md
+
+
+def test_a_slide_table_after_a_bullet_still_ends_the_list():
+    """A table is a block of its own — it really does end the list — so the picture
+    after it must NOT be indented onto an item that has closed."""
+    pic = ('<p:pic><p:nvPicPr><p:cNvPr id="9" name="pic"/></p:nvPicPr>'
+           '<p:blipFill><a:blip r:embed="rId9"/></p:blipFill></p:pic>')
+    parts = {"ppt/slides/slide1.xml":
+             _slide(_body((0, "before")) + _tbl([[("cell", "")]], 1) + pic),
+             "ppt/slides/_rels/slide1.xml.rels": _pic_rels(),
+             "ppt/media/image1.png": "PNG"}
+    md = pptx_markdown(parts, emit_images=True)
+    assert "\n<!-- ooxml-image:ppt/media/image1.png -->" in md
+
+
+def test_a_deck_with_a_picture_inside_a_list_passes_its_own_gate():
+    from backend.ingest import pptx_source_structure
+    from backend.validate import structure_fidelity_report
+    pic = ('<p:pic><p:nvPicPr><p:cNvPr id="9" name="pic"/></p:nvPicPr>'
+           '<p:blipFill><a:blip r:embed="rId9"/></p:blipFill></p:pic>')
+    parts = {"ppt/slides/slide1.xml":
+             _slide(_body((0, "parent")) + pic + _body((1, "child"), (0, "next"))),
+             "ppt/slides/_rels/slide1.xml.rels": _pic_rels(),
+             "ppt/media/image1.png": "PNG"}
+    for flag in (False, True):
+        verdict = structure_fidelity_report(
+            md_structure(pptx_markdown(parts, emit_images=flag)),
+            pptx_source_structure(parts))
+        assert verdict["gate"] == "pass", (flag, verdict["deltas"])
+
+
+def test_a_picture_in_its_own_docx_paragraph_keeps_the_nesting():
+    """The docx half of the same defect. `item_pad` covers a picture that shares a
+    step's paragraph; a picture in a paragraph of its own — which is how Word
+    documents actually carry a screenshot — went out at column 0 and closed the
+    list underneath it."""
+    from backend.ingest import docx_source_structure
+    from backend.validate import structure_fidelity_report
+    body = (_wp("parent", num="1", ilvl=0)
+            + '<w:p><w:r><w:drawing xmlns:r="http://schemas.openxmlformats.org'
+              '/officeDocument/2006/relationships"><wp:inline xmlns:wp="wp">'
+              '<a:graphic xmlns:a="a"><a:graphicData><pic:pic xmlns:pic="pic">'
+              '<pic:blipFill><a:blip r:embed="rId9"/></pic:blipFill>'
+              '</pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing>'
+              '</w:r></w:p>'
+            + _wp("child", num="1", ilvl=1))
+    parts = {"word/document.xml": _wdoc(body),
+             "word/numbering.xml": NUMBERING,
+             "word/_rels/document.xml.rels":
+             '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/'
+             'relationships"><Relationship Id="rId9" Type="http://schemas.'
+             'openxmlformats.org/officeDocument/2006/relationships/image" '
+             'Target="media/image1.png"/></Relationships>',
+             "word/media/image1.png": "PNG"}
+    facts = md_structure(docx_markdown(parts, emit_images=True))
+    assert facts["list_items"] == {0: 1, 1: 1}
+    verdict = structure_fidelity_report(facts, docx_source_structure(parts))
+    assert verdict["gate"] == "pass", verdict["deltas"]
+
+
+def test_a_picture_that_merely_follows_a_list_is_not_pulled_into_it():
+    """The indent exists to keep the items BELOW a picture at their depth. With no
+    item below, it would only claim the picture sits inside the last bullet — which
+    the source does not say — so it settles back to column 0. Measured: without
+    this, `office/kestrel-clock-spec.docx` moved a byte for no gate benefit."""
+    pic = ('<p:pic><p:nvPicPr><p:cNvPr id="9" name="pic"/></p:nvPicPr>'
+           '<p:blipFill><a:blip r:embed="rId9"/></p:blipFill></p:pic>')
+    parts = {"ppt/slides/slide1.xml": _slide(_body((0, "last bullet")) + pic),
+             "ppt/slides/_rels/slide1.xml.rels": _pic_rels(),
+             "ppt/media/image1.png": "PNG"}
+    md = pptx_markdown(parts, emit_images=True)
+    assert "\n<!-- ooxml-image:ppt/media/image1.png -->" in md
+
+
+# ------------------------------- a clamp must be STICKY, or peers become ancestors
+#
+# `_list_indent` used to clamp to the HEIGHT OF THE STACK — "one deeper than the
+# deepest item currently open" — which is right for the FIRST item at a skipped
+# level and wrong for every one after it, because each successive item finds the
+# stack one entry taller. Three PEER bullets at outline level 2 published as a
+# three-deep chain: "release fabric traffic" became a sub-step of "hold PLL bypass",
+# and "run the smoke suite" a sub-step of that. A swept comparison of every level
+# sequence of length 2-4 over levels 0-3 found 199 of 336 misrepresented.
+#
+# The rule that is actually true of markdown is CONTAINMENT: an item's depth is how
+# many STRICTLY SHALLOWER ancestors are still open above it. Two items at the same
+# source level are siblings whatever their level is, and a skipped level costs one
+# step of depth once rather than compounding.
+
+_LEVEL_SEQUENCES = [
+    ([0, 1, 2, 3], [0, 1, 2, 3], "contiguous nesting is untouched"),
+    ([0, 2, 2], [0, 1, 1], "two peers below a skipped level are PEERS"),
+    ([0, 2, 2, 2], [0, 1, 1, 1], "and stay peers however many there are"),
+    ([0, 1, 3, 3], [0, 1, 2, 2], "a skip deeper in the tree behaves the same"),
+    ([2, 2, 2], [0, 0, 0], "a slide that opens deep has no ancestors at all"),
+    ([0, 1, 1, 0], [0, 1, 1, 0], "an ordinary outline"),
+    ([0, 3, 1], [0, 1, 1], "a dedent to a level that was never opened"),
+    ([1, 0, 1], [0, 0, 1], "a shallower item closes the deeper one"),
+]
+
+
+@pytest.mark.parametrize("levels,depths,why", _LEVEL_SEQUENCES,
+                         ids=["-".join(str(l) for l in r[0])
+                              for r in _LEVEL_SEQUENCES])
+def test_a_deck_bullet_sits_at_the_depth_its_containment_implies(levels, depths, why):
+    parts = {"ppt/slides/slide1.xml":
+             _slide(_body(*[(lvl, "item %d" % i)
+                            for i, lvl in enumerate(levels)]))}
+    md, rep = _pptx_graded(parts)
+    assert rep["recall"] == 1.0
+    got = [d for kind, d in md_structure(md)["block_sequence"] if kind == "li"]
+    assert got == depths, "%s: %s -> %s, wanted %s" % (why, levels, got, depths)
+
+
+@pytest.mark.parametrize("levels,depths,why", _LEVEL_SEQUENCES,
+                         ids=["-".join(str(l) for l in r[0])
+                              for r in _LEVEL_SEQUENCES])
+def test_the_deck_ground_truth_reaches_the_same_containment(levels, depths, why):
+    """Independently: the converter by indenting, the truth by counting ancestors,
+    `md_structure` by scanning the columns that came out. The gate is what proves
+    all three met."""
+    from backend.ingest import pptx_source_structure
+    from backend.validate import structure_fidelity_report
+    parts = {"ppt/slides/slide1.xml":
+             _slide(_body(*[(lvl, "item %d" % i)
+                            for i, lvl in enumerate(levels)]))}
+    facts = pptx_source_structure(parts)
+    assert [d for kind, d in facts["block_sequence"] if kind == "li"] == depths, why
+    verdict = structure_fidelity_report(md_structure(pptx_markdown(parts)), facts)
+    assert verdict["gate"] == "pass", verdict["deltas"]
+
+
+def test_a_docx_list_reaches_the_same_containment():
+    """`_list_indent` is shared by both lanes, so the staircase was a docx defect
+    too — and the docx TRUTH read `w:ilvl` raw, which made an ordinary Word runbook
+    with one skipped level fail the gate and refuse to publish."""
+    from backend.ingest import docx_source_structure
+    from backend.validate import structure_fidelity_report
+    body = "".join(_wp("item %d" % i, num="1", ilvl=lvl)
+                   for i, lvl in enumerate([0, 2, 2, 1, 0]))
+    parts = {"word/document.xml": _wdoc(body), "word/numbering.xml": NUMBERING}
+    md = docx_markdown(parts)
+    assert [d for kind, d in md_structure(md)["block_sequence"] if kind == "li"] \
+        == [0, 1, 1, 1, 0]
+    verdict = structure_fidelity_report(md_structure(md),
+                                        docx_source_structure(parts))
+    assert verdict["gate"] == "pass", verdict["deltas"]
+
+
+def test_a_level_below_zero_is_still_a_top_level_item():
+    """`ST_TextIndentLevelType` is 0-8, so a negative level is malformed input —
+    but a ground truth that reported `list_items {-1: 1}` would fail a document no
+    renderer can disagree about."""
+    from backend.ingest import pptx_source_structure
+    parts = {"ppt/slides/slide1.xml": _slide(_body((-1, "alpha"), (0, "beta")))}
+    assert md_structure(pptx_markdown(parts))["list_items"] == {0: 2}
+    assert pptx_source_structure(parts)["list_items"] == {0: 2}
+
+
+# ============================================================ P9.8a: a deck's runs
+#
+# A deck's emphasis and hyperlinks were dropped, and the drop was HONEST — it was
+# counted (`dropped_shape_emphasis`, `dropped_shape_links`) and the structural truth
+# left the facts OUT of its vector rather than stating a zero, because stating
+# `strong: 0` over a deck that draws bold would certify the loss instead of catching
+# it. That is why every deck report carried `unmeasured: [strong, em, strike, links]`.
+#
+# Retiring that list is not a matter of stating the zeros. It is a matter of the
+# converter no longer losing anything, which is what these tests are for. The
+# rendering machinery is the docx lane's — `_render_runs` takes `[(marks, text)]` and
+# already owns CommonMark's flanking rules, the coalescing that stops `**a****b**`,
+# and the `**~~x~~**` delimiter cases. Only the DrawingML READER is new.
+
+def _rsp(runs, ph=None, lvl=None):
+    """A shape whose single paragraph is an explicit list of (rPr, text) runs."""
+    phx = '<p:nvSpPr><p:nvPr>%s</p:nvPr></p:nvSpPr>' % (
+        '<p:ph type="%s"/>' % ph if ph else "")
+    ppr = '<a:pPr lvl="%d"/>' % lvl if lvl else ""
+    body = "".join('<a:r>%s<a:t>%s</a:t></a:r>' % (rpr, t) for rpr, t in runs)
+    return ('<p:sp>%s<p:txBody><a:p>%s%s</a:p></p:txBody></p:sp>'
+            % (phx, ppr, body))
+
+
+@pytest.mark.parametrize("rpr,want", [
+    ('<a:rPr b="1"/>', "**both**"),
+    ('<a:rPr i="1"/>', "*both*"),
+    ('<a:rPr strike="sngStrike"/>', "~~both~~"),
+    ('<a:rPr strike="dblStrike"/>', "~~both~~"),
+    ('<a:rPr b="1" i="1"/>', "***both***"),
+    # The OFF spellings a deck really writes. `b="0"` is not bold, and neither is
+    # `strike="noStrike"` — emitting markers for those would invent emphasis the
+    # slide does not draw, which fails a faithful conversion just as surely as
+    # dropping it.
+    ('<a:rPr b="0"/>', "both"),
+    ('<a:rPr strike="noStrike"/>', "both"),
+    ('<a:rPr/>', "both"),
+])
+def test_a_deck_run_emits_the_emphasis_it_draws(rpr, want):
+    md = pptx_markdown({"ppt/slides/slide1.xml": _slide(
+        _rsp([("", "Sign-off needs "), (rpr, "both"), ("", " now")]))})
+    assert "- Sign-off needs %s now" % want in md
+
+
+def test_adjacent_runs_with_one_mark_coalesce_into_one_span():
+    """Not tidiness. A deck splits a word across runs at any property boundary, so
+    wrapping each run on its own emits `**Dma****Arbiter**`, which the text layer's
+    non-greedy bold pattern mis-pairs into a stray literal `**`. The docx lane
+    already solves this; the deck reader must feed the same solver."""
+    md = pptx_markdown({"ppt/slides/slide1.xml": _slide(
+        _rsp([('<a:rPr b="1"/>', "Dma"), ('<a:rPr b="1"/>', "Arbiter")]))})
+    assert "- **DmaArbiter**" in md
+    assert "****" not in md
+
+
+def test_a_deck_hyperlink_renders_as_a_link_with_its_target():
+    """DrawingML puts the link INSIDE the run's properties (`a:hlinkClick` under
+    `a:rPr`), not around a span of runs the way `w:hyperlink` does — so this is a
+    genuinely different read, not the docx walk with different tag names."""
+    parts = {
+        "ppt/slides/slide1.xml": _slide(_rsp([
+            ("", "Full numbers live in the "),
+            ('<a:rPr><a:hlinkClick xmlns:r="http://schemas.openxmlformats.org/'
+             'officeDocument/2006/relationships" r:id="rId9"/></a:rPr>',
+             "fabric spec"),
+            ("", ", not here")])),
+        "ppt/slides/_rels/slide1.xml.rels":
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/'
+            'relationships"><Relationship Id="rId9" '
+            'Type="http://schemas.openxmlformats.org/officeDocument/2006/'
+            'relationships/hyperlink" Target="https://example.invalid/fabric" '
+            'TargetMode="External"/></Relationships>',
+    }
+    md = pptx_markdown(parts)
+    assert ("- Full numbers live in the [fabric spec](https://example.invalid/fabric)"
+            ", not here") in md
+
+
+def test_an_internal_jump_keeps_its_text_and_emits_no_link():
+    """A slide-to-slide jump has no URL a reader outside the deck can follow, and
+    `[text]()` is a dead link in the stored bytes. The docx lane makes the same call
+    for an internal `w:hyperlink`: keep the text, drop the address."""
+    parts = {
+        "ppt/slides/slide1.xml": _slide(_rsp([
+            ('<a:rPr><a:hlinkClick xmlns:r="http://schemas.openxmlformats.org/'
+             'officeDocument/2006/relationships" r:id="rId5" action="ppaction://hlinksldjump"/>'
+             '</a:rPr>', "see the backup")])),
+        "ppt/slides/_rels/slide1.xml.rels":
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/'
+            'relationships"><Relationship Id="rId5" '
+            'Type="http://schemas.openxmlformats.org/officeDocument/2006/'
+            'relationships/slide" Target="slide4.xml"/></Relationships>',
+    }
+    md = pptx_markdown(parts)
+    assert "- see the backup" in md
+    assert "](" not in md
+
+
+def test_emphasis_markers_in_the_source_text_are_still_escaped():
+    """The marks are the converter's, so the TEXT's own asterisks must stay text.
+    A bullet reading `set *ready* high` that came out as real emphasis was the
+    fabrication the conditional zeros were written to catch; now that the deck emits
+    real emphasis, escaping is the only thing keeping the two apart."""
+    md = pptx_markdown({"ppt/slides/slide1.xml": _slide(
+        _rsp([("", "set *ready* high")]))})
+    assert "- set \\*ready\\* high" in md
+
+
+def test_a_deck_that_draws_nothing_is_byte_identical_to_the_old_walk():
+    """The regression that matters most: eight shipped documents must not move a
+    byte. A run with no `a:rPr` is the overwhelmingly common case, and the new
+    reader has to join those exactly as the flat text walk did — including the
+    whitespace collapse across `a:br` and across run boundaries."""
+    md = pptx_markdown({"ppt/slides/slide1.xml": _slide(
+        _rsp([("", "Reset the "), ("", "clock  tree"), ("", " now")]))})
+    assert "- Reset the clock tree now" in md
+
+
+# ========================================================= P9.8c: a workbook's cells
+#
+# The same move as the deck, one layer down. A workbook states emphasis per CELL, via
+# the style index `@s` into `cellXfs -> fonts`, rather than per run — so a bold header
+# cell is one bold span covering the whole cell, and a struck-through row is one
+# strike span per cell. `dropped_cell_emphasis` counted exactly that and the report
+# carried `unmeasured: [strong, em, strike, links]` on every workbook.
+
+XF = ('<styleSheet %s>'
+      '<fonts count="4"><font/><font><b/></font><font><i/></font>'
+      '<font><strike/></font></fonts>'
+      '<cellXfs count="4"><xf fontId="0"/><xf fontId="1"/><xf fontId="2"/>'
+      '<xf fontId="3"/></cellXfs></styleSheet>' % S)
+
+
+def _styled_book(rows, extra=None):
+    parts = {"xl/workbook.xml": WB, "xl/_rels/workbook.xml.rels": WB_RELS,
+             "xl/styles.xml": XF, "xl/worksheets/sheet1.xml": _sheet(rows)}
+    parts.update(extra or {})
+    return parts
+
+
+@pytest.mark.parametrize("style,want", [
+    ("1", "**Corner**"),
+    ("2", "*Corner*"),
+    ("3", "~~Corner~~"),
+    ("0", "Corner"),
+])
+def test_a_styled_cell_emits_the_emphasis_its_font_carries(style, want):
+    md = xlsx_markdown(_styled_book(
+        '<row r="1"><c r="A1" s="%s" t="inlineStr"><is><t>Corner</t></is></c>'
+        '<c r="B1" t="inlineStr"><is><t>Margin</t></is></c></row>' % style))
+    assert "| %s | Margin |" % want in md, md
+
+
+def test_a_cell_with_no_text_gains_no_markers():
+    """`****` in an empty cell would be literal asterisks the workbook never wrote,
+    and a GFM row of them is a delimiter row waiting to happen."""
+    md = xlsx_markdown(_styled_book(
+        '<row r="1"><c r="A1" s="1" t="inlineStr"><is><t>Corner</t></is></c>'
+        '<c r="B1" s="1"/>'
+        '<c r="C1" s="1" t="inlineStr"><is><t>Margin</t></is></c></row>'))
+    assert "| **Corner** |  | **Margin** |" in md, md
+    assert "****" not in md
+
+
+def test_a_cell_hyperlink_renders_as_a_link():
+    """A workbook attaches the link to the CELL, in a `<hyperlinks>` block keyed by
+    `@ref`, rather than to a run — so this is a third distinct read, not the deck's
+    with different tag names."""
+    sheet = ('<worksheet %s xmlns:r="http://schemas.openxmlformats.org/'
+             'officeDocument/2006/relationships"><sheetData>'
+             '<row r="1"><c r="A1" t="inlineStr"><is><t>the fabric spec</t></is>'
+             '</c><c r="B1" t="inlineStr"><is><t>owner</t></is></c></row>'
+             '</sheetData><hyperlinks><hyperlink ref="A1" r:id="rId9"/>'
+             '</hyperlinks></worksheet>' % S)
+    parts = {"xl/workbook.xml": WB, "xl/_rels/workbook.xml.rels": WB_RELS,
+             "xl/worksheets/sheet1.xml": sheet,
+             "xl/worksheets/_rels/sheet1.xml.rels":
+                 '<Relationships %s><Relationship Id="rId9" '
+                 'Target="https://example.invalid/fabric" TargetMode="External"/>'
+                 '</Relationships>' % RELS}
+    md = xlsx_markdown(parts)
+    assert "[the fabric spec](https://example.invalid/fabric)" in md, md
+
+
+def test_a_workbook_with_no_styles_is_byte_identical_to_the_old_walk():
+    md = xlsx_markdown({"xl/workbook.xml": WB, "xl/_rels/workbook.xml.rels": WB_RELS,
+                        "xl/worksheets/sheet1.xml": _sheet(
+                            '<row r="1"><c r="A1" t="inlineStr"><is><t>Corner</t>'
+                            '</is></c><c r="B1"><v>0.94</v></c></row>')})
+    assert "| Corner | 0.94 |" in md
+
+
+# ============================================== P9.8b: a deck's automatic numbering
+#
+# `a:buAutoNum` makes a paragraph an ORDERED item. Markdown holds that perfectly
+# well, so the deck lane dropping it was a pure loss: `1. 2. 3.` rendered as three
+# identical `-` bullets, and a reader could not tell a SEQUENCE from a set. Token
+# recall could not see it — the ordinal is not a token the deck stores, it is drawn —
+# and the structural truth deliberately OMITTED `ordered_items` rather than state a
+# zero that would certify the drop, so every deck report carried it in `unmeasured`.
+#
+# THE CASCADE is what makes this more than a tag read. A paragraph inherits its
+# bullet from, in order: its own `a:pPr`, the shape's `a:txBody/a:lstStyle`, the
+# slide LAYOUT's placeholder `a:lstStyle`, and finally the slide MASTER's
+# `p:txStyles/p:bodyStyle`. Reading only the first says "no numbering" over a deck
+# whose entire body list is numbered from the master.
+
+def _numbered_shape(paras, ph="body", lst="", idx="1"):
+    """A body shape whose paragraphs carry (level, pPr_inner, text)."""
+    body = "".join('<a:p><a:pPr lvl="%d">%s</a:pPr><a:r><a:t>%s</a:t></a:r></a:p>'
+                   % (lvl, inner, text) for lvl, inner, text in paras)
+    return ('<p:sp><p:nvSpPr><p:nvPr><p:ph type="%s" idx="%s"/></p:nvPr></p:nvSpPr>'
+            '<p:txBody>%s%s</p:txBody></p:sp>' % (ph, idx, lst, body))
+
+
+AUTO = '<a:buAutoNum type="arabicPeriod"/>'
+
+
+def test_an_auto_numbered_paragraph_renders_as_an_ordered_item():
+    md = pptx_markdown({"ppt/slides/slide1.xml": _slide(_numbered_shape([
+        (0, AUTO, "Reset the clock tree"),
+        (0, AUTO, "Release fabric traffic")]))})
+    assert "1. Reset the clock tree" in md, md
+    assert "2. Release fabric traffic" in md, md
+
+
+def test_a_plain_bullet_between_numbered_items_restarts_the_sequence():
+    """What a renderer really shows. An unordered item ends the ordered list, so the
+    next numbered item starts at 1 again — which is exactly the `1, 2, 1, 2` shape
+    `ordered_numbers` exists to make visible."""
+    md = pptx_markdown({"ppt/slides/slide1.xml": _slide(_numbered_shape([
+        (0, AUTO, "one"), (0, AUTO, "two"),
+        (0, "", "an aside"),
+        (0, AUTO, "three")]))})
+    assert "1. one" in md and "2. two" in md
+    assert "- an aside" in md
+    assert "1. three" in md, md
+
+
+def test_a_declared_start_is_honoured():
+    md = pptx_markdown({"ppt/slides/slide1.xml": _slide(_numbered_shape([
+        (0, '<a:buAutoNum type="arabicPeriod" startAt="5"/>', "five"),
+        (0, AUTO, "six")]))})
+    assert "5. five" in md and "6. six" in md, md
+
+
+def test_numbering_inherited_from_the_shapes_own_list_style_still_numbers():
+    """The first cascade step. `a:lstStyle` on the shape sets the default for every
+    paragraph in it, and reading only each paragraph's own `a:pPr` publishes a whole
+    numbered body list as plain bullets."""
+    md = pptx_markdown({"ppt/slides/slide1.xml": _slide(_numbered_shape(
+        [(0, "", "one"), (0, "", "two")],
+        lst='<a:lstStyle><a:lvl1pPr>%s</a:lvl1pPr></a:lstStyle>' % AUTO))})
+    assert "1. one" in md and "2. two" in md, md
+
+
+def test_numbering_inherited_from_the_slide_master_still_numbers():
+    """The last cascade step, and the one the old code called out as the reason it
+    could only answer "could be numbered" rather than counting: layout and master
+    parts were not read at all, so neither side of either gate could see them."""
+    parts = {
+        "ppt/slides/slide1.xml": _slide(_numbered_shape(
+            [(0, "", "one"), (0, "", "two")])),
+        "ppt/slides/_rels/slide1.xml.rels":
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/'
+            'relationships"><Relationship Id="rId1" Type="http://schemas.'
+            'openxmlformats.org/officeDocument/2006/relationships/slideLayout" '
+            'Target="../slideLayouts/slideLayout1.xml"/></Relationships>',
+        "ppt/slideLayouts/slideLayout1.xml":
+            '<p:sldLayout %s><p:cSld><p:spTree/></p:cSld></p:sldLayout>' % P,
+        "ppt/slideLayouts/_rels/slideLayout1.xml.rels":
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/'
+            'relationships"><Relationship Id="rId1" Type="http://schemas.'
+            'openxmlformats.org/officeDocument/2006/relationships/slideMaster" '
+            'Target="../slideMasters/slideMaster1.xml"/></Relationships>',
+        "ppt/slideMasters/slideMaster1.xml":
+            '<p:sldMaster %s><p:cSld><p:spTree/></p:cSld><p:txStyles><p:bodyStyle>'
+            '<a:lvl1pPr>%s</a:lvl1pPr></p:bodyStyle></p:txStyles></p:sldMaster>'
+            % (P, AUTO),
+    }
+    md = pptx_markdown(parts)
+    assert "1. one" in md and "2. two" in md, md
+
+
+def test_bu_none_beats_an_inherited_number():
+    """A paragraph that says `a:buNone` draws NO bullet, whatever the master says.
+    Letting the inherited number win would number a line the slide shows plain."""
+    md = pptx_markdown({"ppt/slides/slide1.xml": _slide(_numbered_shape(
+        [(0, '<a:buNone/>', "a lead-in"), (0, "", "one")],
+        lst='<a:lstStyle><a:lvl1pPr>%s</a:lvl1pPr></a:lstStyle>' % AUTO))})
+    assert "- a lead-in" in md, md
+    assert "1. one" in md, md
+
+
+def test_an_ordered_item_that_opens_a_block_is_still_escaped():
+    md = pptx_markdown({"ppt/slides/slide1.xml": _slide(_numbered_shape([
+        (0, AUTO, "- - -")]))})
+    assert "1. \\- - -" in md, md
+
+
+# =========== P9.9: two adjacent spans CommonMark cannot tell apart without help
+#
+# `***alpha***` immediately followed by `*beta*` emits a delimiter run of FOUR
+# asterisks, and CommonMark reads ONE em span where the document draws two. Measured
+# at HEAD on an ordinary Word paragraph of that shape: `structure_fidelity` fails on
+# `em`, `token_recall` reads 0.0 (the text layer mis-pairs it and leaves a literal
+# `*beta*`), and the document REFUSES TO PUBLISH. A `**~~x~~**` span after a word
+# character is the same family through a different rule — the `**` cannot LEFT-FLANK
+# because its outer neighbour is a letter and its inner neighbour is a `~`.
+#
+# The separator is an EMPTY HTML COMMENT. It renders as nothing, carries no token, and
+# breaks the delimiter run; `markdown_to_text` and `_mdstructure._words` both remove
+# it to NOTHING, because it only ever stands where the two spans are adjacent with no
+# whitespace — between two halves of one word.
+#
+# Inserted only where it is NEEDED. Emphasis with spaces around it, which is almost
+# all emphasis, is untouched — verified below and by every shipped document staying
+# byte-identical.
+
+_SEP = "<!---->"
+
+
+def _runs_md(segments):
+    from backend.ingest._ooxml_md import _render_runs
+    return _render_runs(segments)
+
+
+@pytest.mark.parametrize("segments,want", [
+    # The merge: two asterisk runs written against each other become one.
+    ([(("strong", "em"), "alpha"), (("em",), "beta")],
+     "***alpha***" + _SEP + "*beta*"),
+    ([(("em",), "alpha"), (("strong", "em"), "beta")],
+     "*alpha*" + _SEP + "***beta***"),
+    ([(("strong",), "alpha"), (("strong", "em"), "beta")],
+     "**alpha**" + _SEP + "***beta***"),
+    # The flank block: `**` after a letter, with a `~` just inside it.
+    ([((), "alpha"), (("strong", "strike"), "beta")],
+     "alpha" + _SEP + "**~~beta~~**"),
+    ([(("strike", "em"), "alpha"), ((), "beta")],
+     "*~~alpha~~*" + _SEP + "beta"),
+    # NOT needed: a marker against a letter that is not itself next to punctuation.
+    ([((), "pre"), (("strong",), "fix")], "pre**fix**"),
+    ([(("strong",), "Dma"), ((), "Arbiter")], "**Dma**Arbiter"),
+    # NOT needed: the overwhelmingly common shape, emphasis with spaces around it.
+    ([((), "set "), (("strong",), "ready"), ((), " high")], "set **ready** high"),
+    # NOT needed: different delimiter characters do not merge.
+    ([(("strong",), "alpha"), (("strike",), "beta")], "**alpha**~~beta~~"),
+])
+def test_the_separator_lands_exactly_where_the_delimiters_would_lie(segments, want):
+    assert _runs_md(segments) == want
+
+
+def test_the_separator_is_never_the_first_thing_on_a_line():
+    """A line that STARTS with `<!--` is an HTML block to CommonMark, and nothing in
+    it is parsed as inline markdown at all — measured, marko reads no emphasis in
+    `<!---->**~~x~~**`. It can only ever sit BETWEEN two groups, so the first group
+    always shields it, and this pins that."""
+    for segs in ([(("strong", "strike"), "beta")],
+                 [(("strong", "em"), "a"), (("em",), "b")]):
+        assert not _runs_md(segs).startswith("<!--")
+
+
+def test_a_deck_bullet_with_two_adjacent_spans_publishes_them_both():
+    md = pptx_markdown({"ppt/slides/slide1.xml": _slide(
+        _rsp([('<a:rPr b="1" i="1"/>', "alpha"), ('<a:rPr i="1"/>', "beta")]))})
+    assert "- ***alpha***<!---->*beta*" in md, md

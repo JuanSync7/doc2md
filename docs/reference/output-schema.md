@@ -224,19 +224,22 @@ An operator working an outage from that document would have run the wrong step.
 
 The verdict compares two independently-derived fact vectors: what a CommonMark
 renderer sees in the emitted markdown (`backend.validate.md_structure`) against
-what the source XML says should be there (`backend.ingest.docx_source_structure`,
-which shares no traversal code with the converter — the same rule that makes the
+what the source XML says should be there (`backend.ingest.docx_source_structure` /
+`xlsx_source_structure` / `pptx_source_structure`, none of
+which shares traversal code with the converter — the same rule that makes the
 token gate trustworthy).
 
 | Key | Type | Present | Meaning |
 |---|---|---|---|
 | `method` | str | always | `ooxml-structure-ground-truth` \| `unmeasured`. |
 | `gate` | str | always | `pass` \| `fail` \| `best-effort` \| `unmeasured`. **A hard fail on the office lane**: the markdown and the pixels are withheld, exactly as for a recall miss. Non-office lanes are coerced to `best-effort` for the same reason losslessness is — a PDF has no ground-truth semantic tree, so a match is agreement, not proof. |
-| `compared` | int | always | How many of the facts below **observed something on this document** — evidence, not schema. A fact both sides read as absent-or-zero is not counted, because a number that cannot fall is not a measurement: a one-sentence memo reports `0` and a real office bundle reports around `9` of the fifteen, not `15`. `0` means nothing was graded, which is why the gate then reads `unmeasured` rather than `pass`. |
-| `unmeasured` | list | when a ground truth is present but partial | The names of facts the ground truth did not supply, so they were compared against nothing. Omitted entirely when there is no ground truth at all — `method` and `gate` already read `unmeasured` there. `gate: "pass"` answers only for what was measured, and this list is what makes "everything measured" auditable rather than a claim. |
+| `facts` | int | always | How long the closed list below is, recorded **inline** so `compared` has its denominator in the artifact. Without it an archived report saying `compared: 6` needs the reader to know how long the list was on the day it was written — and the list has now been widened once, so that day matters. |
+| `compared` | int | always | How many of the facts below **observed something on this document** — evidence, not schema. A fact both sides read as absent-or-zero is not counted, because a number that cannot fall is not a measurement: a one-sentence memo reports `3` and a real office bundle reports between `4` and `15` of the sixteen — measured across the corpus: `15` for the adversarial specification, `11` for the clock spec and its legacy siblings, `7` for the adversarial deck, `4` for a workbook and for the diagram-only deck, `3` for the README. Never `16`, because no one document carries every kind of structure. `0` means nothing was graded, which is why the gate then reads `unmeasured` rather than `pass`. |
+| `unmeasured` | list | when a ground truth is present but partial | The names of facts the ground truth did not supply, so they were compared against nothing. Omitted entirely when there is no ground truth at all — `method` and `gate` already read `unmeasured` there. `gate: "pass"` answers only for what was measured, and this list is what makes "everything measured" auditable rather than a claim. **As of P9.8 it is empty on every office bundle in the corpus**: the three deliberate omissions that kept it populated — a deck's and a workbook's emphasis and hyperlinks, and a deck's auto-numbered ordinals — ended by the converter emitting them, never by the ground truth stating a zero it could not justify. A name reappearing here is a NEW fact somebody added to the vector without a truth to supply it, which is the field working. |
+| `blind_to` | list | when the ground truth declares one | Structure this **format** carries that no name in the closed list can express, so a `pass` never claimed it. Read it against `unmeasured`, which is the different and weaker statement: `unmeasured` is a fact the vector HAS that this ground truth did not supply — a gap somebody closes by writing code — while `blind_to` closes only by widening the list, or never, when markdown cannot hold the thing at all. |
 | `deltas` | list | always | Every disagreement, as `{fact, source, markdown}`. Empty on a pass. A gate that reported only pass/fail would teach nobody anything; this names what moved. |
 
-The compared facts are a **closed** list of **fifteen**: `headings` (count by
+The compared facts are a **closed** list of **sixteen**: `headings` (count by
 level), `heading_path` (the tokens of every heading title, with its level, in
 document order), `list_items` (count by nesting depth), `ordered_items`,
 `bullet_items`, `ordered_numbers` (the number a renderer **prints** beside each
@@ -244,9 +247,24 @@ ordered item, in order), `strong`, `em`, `strike`, `code_spans`, `code_blocks`,
 `links`, `tables` (rows × cols **and the content of every cell**),
 `list_item_words` (the text of every list item, in order), and `thematic_breaks`
 (horizontal rules — a docx paragraph can never legitimately render as one, so any
-count above zero on the markdown side is a substitution). Widening it is a
-deliberate edit with a test behind it, never a side effect of adding a field; the
-executable list is `backend.validate._mdcheck._FIDELITY_FACTS`.
+count above zero on the markdown side is a substitution), and `block_sequence`
+(the kind and shape of every graded block, **in document order**:
+`h`/`li`/`table`/`code`/`quote`/`hr` with its heading level, list depth or
+rows × cols). Widening it is a deliberate edit with a test behind it, never a side
+effect of adding a field; the executable list is
+`backend.validate._mdcheck._FIDELITY_FACTS`, and the admission test a new name has
+to pass is written out above it.
+
+`block_sequence` is the only fact that grades *arrangement* rather than content or
+totals, and it exists because every other fact is blind to a block that MOVED.
+Detach every table in a workbook from the sheet heading it belongs under and the
+histogram, the geometry, the cell contents and the token multiset are all
+unchanged: measured `gate: pass, compared: 3, deltas: []` against an otherwise
+fully populated ground truth. It states nothing new — all six kinds are already
+counted elsewhere — it says where what is already counted actually sits. A prose
+paragraph is deliberately **not** a kind: neither side has an opinion on where
+paragraphs land, and predicting them would fail every faithful conversion that
+emits an image sentinel or lifts a text box out of its anchor.
 
 The last three exist because counting is not enough, and that was demonstrated
 rather than assumed. Swap two values between rows of an escalation table, or swap
@@ -275,10 +293,25 @@ Not compared, on purpose: `images`, because at gate time they are HTML-comment
 sentinels rather than links and the `images{}` block already grades them against
 the pixels on disk.
 
-Measured on **docx only** so far. pptx (every paragraph is a bullet) and xlsx
-(every sheet is one table) report `unmeasured`: claiming to grade them without
-writing a second implementation would be the exact dishonesty this gate exists to
-end.
+Measured on **docx, xlsx and pptx**: each has its own converter-blind structural
+ground truth, and each was proved to be a gate by converter-fault injection over the
+shipped corpus rather than by being observed to pass. Every other office input
+reaches one of those three through LibreOffice before either gate runs, so it is
+graded by the sibling it is converted to — measured, an `.odp` reports
+`gate: pass, compared: 7` and an `.ods` `pass, compared: 4`. `.odp` and `.ods` have
+**no corpus fixture**, so their gate is live and unexercised; the eval covers
+`.doc`, `.odt`, `.rtf`, `.xls` and `.ppt`. A lane with no ground truth at all — PDF,
+HTML — reports `unmeasured` or `best-effort` and never `pass`, because claiming to
+grade a format nobody has written a second implementation for is the exact
+dishonesty this gate exists to end.
+
+A `pass` on the **LibreOffice lane** carries one extra caveat, declared in
+`blind_to` as `pre_conversion_structure`: both halves read the package soffice
+produced, so whatever the round trip already destroyed is destroyed in the ground
+truth too and the truth agrees with it. Measured on `legacy/kestrel-overview.ppt`,
+soffice writes no `p:ph` declarations at all, so every slide title is demoted to a
+body bullet and every outline level flattened — and the gate passes over it. `pass`
+there means "faithful from the converted package onward", never "nothing was lost".
 
 ### `run{}` — what this run was
 
@@ -333,16 +366,17 @@ question instead of a grep through prose.
 | `reason` | str | Why, in one human phrase. |
 | `evidence` | map | The numbers that decided it, when there were any. Values are scrubbed of absolute host paths on the way in, like every other published value. |
 
-Codes: `lane_selected`, `preconvert`, `ocr_routed`, `body_source`,
+Codes: `lane_selected`, `preconvert`, `slide_order`, `ocr_routed`, `body_source`,
 `tokenizer_selected`, `cache_hit`, `gate_coerced`, `empty_source`,
 `captions_carried`, `skipped_existing`, `metadata_tier`, `vocabulary_selected`,
 `identity_namespace`, `permalink_base`.
 
-`lane_selected` is the conversion stage's and carries one `evidence` sub-key:
+The first two below are the conversion stage's:
 
 | Code | `chose` | `evidence` | What it decided |
 |---|---|---|---|
 | `lane_selected` | `office` \| `pdf` \| `text` \| `legacy` | `ext` | Which converter read the document, and the lower-cased source extension it routed on (`scripts/build_bundle.py`, `scripts/build_pdf_bundle.py`). The lane decides which gates apply at all — the office lane hard-fails `structure_fidelity`, the PDF lane reports `best-effort` — so a bundle whose lane is unexplained cannot be told from one whose gate was never run. |
+| `slide_order` | `sldIdLst` \| `part-name` | `slides`, `reordered`, `unlisted` | Which order a deck's slides were published in. PowerPoint does not renumber slide parts when a user drags a slide — it rewrites `p:sldIdLst` and leaves `slideN.xml` where it was — so sorting part names reads the order the slides were *drafted* in. `sldIdLst` means the deck's own order was read; `part-name` means it could not be (no presentation part, or none of its entries resolved) and numeric part order was used instead. Emitted for every pptx, because "which order is this?" has an answer for every deck and an absent record cannot be told from a format that has no slides. The **token gate** cannot check this — it compares multisets, so order is invisible to it by construction, and the reordered corpus deck measures `recall: 1.0, n_source: 135` published either way. `structure_fidelity` can and does: since P9.6 the deck has a converter-blind structural ground truth that derives the presentation order **again**, from `p:sldIdLst`, by its own reader. Injecting the exact bug this record exists to make visible (the order read off the unqualified `id` attribute rather than `r:id`) moves `block_sequence`, `heading_path` and `list_item_words` and fails the gate while recall stays at 1.0 — and a ground truth that had imported the converter's reader instead reports `pass`, which is why it does not. This record remains the only thing that can say the deck was *unable* to state an order, which is not a failure and so is not a gate's business. `reordered` says the published order differs from the part-name order; `unlisted` counts slide parts the deck never references, which are published after the ordered ones because their text is still in the package (a dropped slide would fail token recall) but their position is not something the source states. |
 
 The last four are the enrichment stage's, and each moves a field the rubric grades:
 
@@ -437,8 +471,18 @@ fallback and every hygiene event is **named, never silent**.
 | `pdf_text_layer_fallback` | pdf | — | Docling's markdown provably dropped body content the text layer holds, so the layer was used instead. |
 | `pdf_content_loss` | pdf | — | Measured real loss under the explained-gap model; degrades `status`. |
 | `image_inline_bailed` | pdf | — | Placeholder/picture count mismatch: positional binding was unsafe, so no pixels were written. A detected, gated loss — never a mis-bound figure. |
-| `flattened_table_spans` | office | `horizontal`, `vertical` | GFM has no colspan or rowspan. A horizontal span keeps its text in the left-most column and pads the rest; a vertical span is **repeated** down its continuation rows so each row stays self-contained for row-wise chunking. Counted from the source grid, so the number is right even for the formats whose converter does not read the attribute. |
+| `flattened_table_spans` | office | `horizontal`, `vertical` | GFM has no colspan or rowspan. The counts are **cells absorbed** — grid positions that stopped being addressable — not merge operations: one `w:gridSpan w:val="3"` is one merge and two absorbed cells. The two directions partition the loss, so a `w × h` merged rectangle always contributes exactly `w*h - 1`. A horizontal span keeps its text in the left-most column and pads the rest. What happens **vertically depends on the format, and the detail text says which**: Word's converter repeats the value down the continuation rows so each row stays self-contained for row-wise chunking; the workbook converter does not read its merge markup at all and the deck converter reads only the declared grid, so both leave their continuation cells blank, exactly as the source holds them. The deck's `a:tblGrid` **is** read, and has to be: DrawingML writes the full grid, so a span-covered trailing column is present-and-empty and looks exactly like a styled-but-valueless one — inferring the width published a three-column table as two, at `recall: 1.0` with well-formed GFM and no warning. Counted from the source grid — and each markup family spells a merge somewhere different, so all three spellings are read: `w:tcPr` child elements (docx), `a:tc` **attributes** (pptx), and the `<mergeCell ref>` **range** (xlsx), where the ref is the only place the direction is written. |
 | `tracked_changes_resolved` | office | `insertions`, `deletions`, `moves` | The source still carries revision marks. The **final** view is taken: insertions are live text, deletions are dropped, `w:moveFrom` is skipped as a stale copy. Correct, and previously silent — a reader had no way to know the document they were handed was still under revision. |
+| `dropped_cell_formulas` | office (xlsx) | `cells`, `first` | A cell's **cached result** is published and its expression is not, so a reader cannot tell a computed value from a typed one. `first` names one, `sheet!ref = expression`, so the claim is checkable against the source. **On the LibreOffice lane the locators describe the pre-converted package, not the file you supplied** — measured: the same register workbook reports 1 formula as `.xlsx` and 6 as `.xls`, because soffice synthesises `TRUE()`/`FALSE()` for boolean literals that carry no formula at all. Read it beside `libreoffice_preconvert`. This one is the reason the code exists: `=SUM(C3:C5)` in the shipped corpus workbook was absent from the markdown, absent from the recall denominator **and** absent from the warnings — a loss with no receipt at all, which is weaker than every other drop this table lists. Does not degrade `status`. |
+| `empty_cell_formulas` | office (xlsx) | `cells`, `first` | A formula cell carrying **no cached result**, so the cell is published **empty**: the value is gone, not just the expression. Split out from `dropped_cell_formulas` because one sentence for both said the opposite of what happened to half of them — telling a reader "the cached result is published" about a blank cell sends them looking for a number that is not there. This is the class the token gate is structurally unable to see: both halves read the cell as empty, so `token_recall` is a vacuous 1.0 over it and this count is the only record. Does not degrade `status`. |
+| `dropped_cell_links` | office (xlsx) | `cells`, `first` | A cell hyperlink whose destination the render cannot carry — a `location` jump, which stays inside the workbook and has no address a reader outside it could follow. The display text survives and the target does not. An EXTERNAL url is emitted as a real `[text](url)` (P9.8c) and is **not** counted here — it is graded by the `links` fact instead. A target is on NEITHER side of the token gate — markup, never cell text — so nothing else in the report can see this, which is why `first` quotes the sheet, the cell address and the destination rather than merely counting. Does not degrade `status`. |
+| `unformatted_cell_values` | office (xlsx) | `cells`, `formats` | Numeric cells published as the value the workbook **stores** rather than the text it **displays**. A date is stored as a serial and a percentage as a fraction, so `46027` is published where a reader sees `2026-01-05`, and `0.815` where they see `81.50%`. The number is exact; its presentation is not carried, because GFM has no cell format. Fires for every format that changes the **characters** a reader sees: date, time, percent, a thousands separator (`1234567` published where the sheet shows `1,234,567`) and a currency symbol. Fixed-decimal precision alone is deliberately **not** counted — a cell formatted `0.00` showing `1.00` publishes `1`, which is the same number and loses nothing a reader cannot recover, whereas `46027` and `2026-01-05` share not one character. Does not degrade `status`. |
+| `hidden_content_published` | office (xlsx, pptx) | `sheets`, `sheet_names`, `rows`, `slides`, `slide_positions` | Content the document does not **show**, published as an ordinary peer of the content it does — one code for one disclosure, read from two markup families the way `flattened_table_spans` reads three. A deck contributes `slides` and `slide_positions` from `p:sld/@show="0"`, named by **position** so a reader can count to them; measured, the markdown of a deck whose second slide is hidden is byte-identical to the same deck without the attribute, so nothing else in the report can see it. Hidden sheets and hidden rows are converted and published as ordinary content. The text is kept in full; the fact that the workbook does not **show** it is not, so a scratch sheet reads as a peer of the real ones. The sheets are **named** so a reader can find them in the body. `rows` counts hidden rows **outside** an already-counted hidden sheet and only those that actually publish a value: counting a hidden sheet's own forty hidden rows made one concealed region read as forty-one, and counting valueless rows made the "kept in full" claim about rows that publish nothing. Counted rather than suppressed — dropping hidden content would be a losslessness failure, and publishing it unmarked is a disclosure the reader is owed. Does not degrade `status`. |
+| `flattened_list_levels` | office (docx, pptx) | `count` | A list item whose declared level has **nothing above it at the level between** renders one level in from where the source puts it. CommonMark nests a child item only under a parent that EXISTS, so this is what markdown can hold rather than a converter choice — and it is why both structural ground truths state the depth a RENDERER shows rather than the `w:ilvl` / `a:pPr@lvl` the document declares. Reading the declared level instead made an ordinary Word runbook with one skipped level fail the structure gate and refuse to publish, with no fix available to any converter. Every word is kept and the declared depth is not; nothing else in the report can see it, because indentation is not a token and recall reads a clean 1.0 over the whole of it. Does not degrade `status`. |
+| `dropped_slide_chrome` | office (pptx) | `shapes`, `chars`, `footers`, `dates`, `slide_numbers`, `first` | Page-furniture placeholders — a slide's footer, date and slide number — excluded by policy. **Nothing else in the report can see this one**, and the reason is structural rather than an oversight: the converter and the converter-blind token truth exclude the same shapes under the same declared policy, so the text leaves the DENOMINATOR as well, and a symmetric exclusion cannot move a recall metric however much it removes. Measured: 59 characters gone, markdown byte-identical, `n_source` unchanged, `recall` 1.0. `structure_fidelity` is blind too — a shape excluded from both sides contributes to none of the sixteen compared facts. The footer is quoted in `first` and the date and slide-number counts are kept separate, because a footer is something a person **typed** while the other two are values PowerPoint regenerates: one sentence for all three would tell a reader their `Confidential` banner and their page number were the same kind of loss. Does not degrade `status`. |
+| `dropped_shape_links` | office (pptx) | `links`, `first` | An `a:hlinkClick` whose destination the render cannot carry — a slide-to-slide jump, or any target that is not `http`/`https`/`mailto`. The display text survives and the destination does not, because `[text]()` is a dead link in the stored bytes and a jump has no address a reader outside the deck could follow. An EXTERNAL url is emitted as a real `[text](url)` (P9.8a) and is **not** counted here — it is graded by the `links` fact instead, which is the stronger statement. A destination is on NEITHER side of the token gate — markup, never slide text — so nothing else in the report can see this, which is why `first` quotes it rather than merely counting. Does not degrade `status`. |
+| `dropped_shape_alt_text` | office (pptx) | `shapes`, `chars`, `first` | `p:cNvPr/@descr` — the description a screen reader speaks and a sighted reader never sees. Read by **neither** half of the token gate, so it was dropped with no signal of any kind: recall is a clean 1.0 over the whole of it. Does not degrade `status`. |
+| `flattened_bullet_formatting` | office (pptx) | `paragraphs`, `auto_numbered`, `custom_char`, `suppressed` | Every deck paragraph publishes as a plain `-` bullet whatever the deck draws. One code for one converter decision, with the three spellings counted separately: `a:buAutoNum` loses its **ordinal entirely** — strictly worse than the docx case `decimalised_list_numbering` names, which at least keeps `1.` `2.` `3.` — `a:buChar` loses a custom glyph, and `a:buNone` marks a paragraph the deck shows with **no** bullet, which then **gains** one. Counted only where the declaration is a child of the paragraph's own `a:pPr`: the same elements appear in `a:lstStyle` as per-level defaults, and counting those would report a loss on a deck that has none. Does not degrade `status`. |
 | `decimalised_list_numbering` | office | `count`, `formats` | CommonMark has exactly one ordered marker, the decimal digit, so a list Word labels `A.` / `iii.` / `01.` can only be written `1.`, `2.`, `3.`. The **position** survives — prose saying "see step B" still lands on the second item — and the label does not. `formats` names the `w:numFmt` values involved. Does not degrade `status`. |
 | `lifted_text_boxes` | office | `count` | Text boxes anchored inside a **numbered step**. A box is always lifted out of its anchor paragraph (a pipe table cannot live inside a sentence); where the lifted content allows it, the converter re-indents it to the step's content column so the step stays whole, and where it does not — the box holds its own list, or a code paragraph whose fence must sit at column 0 — the box is emitted beside the list instead. Either way the reader is not looking at what Word drew, so the anchors are counted. The step numbering is unaffected: the counters survive a list being closed. |
 | `dropped_embedded_objects` | office | `parts` | Embedded OLE objects (`word/embeddings/*`) are not converted: an embedded document is a document, and this lane converts one file at a time. `--audit-parts` cannot see these either — it inspects only members ending in `.xml`. Counted from the **effective** package, so this fires on the LibreOffice lane too: the member list is taken from the file the reader actually opened (the soffice-produced sibling for a legacy or ODF source), not from the pre-conversion source — which is an ODF package or a CFB binary and could never contain `word/embeddings/*`, so the check was dead on that whole lane. |

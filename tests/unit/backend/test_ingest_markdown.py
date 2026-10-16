@@ -194,3 +194,79 @@ def test_real_furniture_is_still_dropped():
     assert markdown_to_text("* * *") == ""
     assert markdown_to_text("___") == ""
     assert markdown_to_text("| a | b |\n| --- | --- |\n| 1 | 2 |") == "a b\n\n1 2"
+
+
+# ------------------------------------------ a marker only ONE of the readers saw
+
+# Three regexes in this project read an ordered marker, and they have to agree or a
+# document is caught between them: `_ooxml_md._LEAD_LIST_NUM` decides what the
+# converter ESCAPES, `_mdstructure._ORDERED` decides what the STRUCTURE gate sees,
+# and `_markdown._LIST` — here — decides what the TOKEN gate sees. Capping the first
+# two at CommonMark's nine digits and leaving this one unbounded made a faithful
+# document REFUSE TO PUBLISH: the converter correctly left `1234567890. bill of
+# materials` unescaped, this reader stripped the number anyway, and the gate reported
+# `recall: 0.833, missing: [('1234567890', 1)]`. Every expectation below was rendered
+# through marko 2.2.3.
+
+def test_a_ten_digit_opener_is_not_a_list_marker():
+    """CommonMark caps an ordered marker at nine digits. `<p>1234567890. x</p>` is
+    what every parser renders, so every character is text and none of it is syntax."""
+    assert markdown_to_text("1234567890. bill of materials") == "1234567890. bill of materials"
+    assert markdown_to_text("12345678901234567890. serial") == "12345678901234567890. serial"
+
+
+def test_a_nine_digit_opener_still_is_one():
+    """The other side of the cap, so it cannot be widened by accident."""
+    assert markdown_to_text("123456789. nine digits") == "nine digits"
+    assert markdown_to_text("1. ordinary step") == "ordinary step"
+    assert markdown_to_text("10) paren marker") == "paren marker"
+
+
+def test_a_headings_content_is_not_a_list():
+    """A line belongs to exactly ONE block. Running the list stripper over a line
+    already recognised as a heading deleted the number from `## 1. Overview`, so a
+    workbook with a sheet named `1. Overview` — or any numbered heading — published
+    nothing for it and failed the token gate at recall 0.500."""
+    assert markdown_to_text("## 1. Overview") == "1. Overview"
+    assert markdown_to_text("# 10. Registers\n\nbody") == "10. Registers\n\nbody"
+    assert markdown_to_text("### - dash sheet") == "- dash sheet"
+    # A real list under a real heading is still stripped.
+    assert markdown_to_text("## Steps\n\n1. first\n2. second") == "Steps\n\nfirst\nsecond"
+
+
+# ================================== P9.9: the empty comment is a SEPARATOR, not text
+#
+# `_render_runs` emits `<!---->` between two adjacent emphasis spans whose delimiter
+# runs would otherwise merge or fail to flank (`***a***` followed by `*b*` is four
+# asterisks, and CommonMark reads ONE em span where the document draws two). It is an
+# HTML comment because a comment renders as nothing and carries no token.
+#
+# "Carries no token" is only true if THIS reader agrees. A comment was substituted
+# with a SPACE — right for `<!-- ooxml-image:x.png -->`, which stands between blocks
+# and must not weld two words together, and wrong for an empty one inserted between
+# two halves of a single word: the source run pair `alpha` + `beta` is the one token
+# `alphabeta`, and a space there split it in two and took token recall to 0.0.
+
+def test_an_empty_comment_leaves_no_trace_at_all():
+    assert markdown_to_text("alpha<!---->beta") == "alphabeta"
+
+
+def test_a_comment_with_content_still_separates():
+    """The image sentinel stands between BLOCKS. Removing it outright would weld the
+    last word of one to the first word of the next, so only the EMPTY form — the one
+    this converter writes between two halves of a single word — vanishes."""
+    from backend.ingest import tokenize
+    assert tokenize(markdown_to_text("one<!-- ooxml-image:x.png -->Two")) \
+        == ["one", "two"]
+
+
+def test_an_escaped_empty_comment_is_prose_about_a_comment():
+    """Same exemption the content-bearing rule already has: a converter-escaped
+    `\\<!---->` is a document that was TALKING about markup, and its characters are
+    on the source side of the recall gate."""
+    assert "<!---->" in markdown_to_text("the marker \\<!----> is empty")
+
+
+def test_the_separator_is_invisible_to_the_token_stream():
+    from backend.ingest import tokenize
+    assert tokenize(markdown_to_text("***alpha***<!---->*beta*")) == ["alphabeta"]

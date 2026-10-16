@@ -559,3 +559,128 @@ def test_each_soffice_conversion_gets_its_own_user_profile(tmp_path, monkeypatch
     oc.soffice_to_ooxml("soffice", str(src), "docx")
     second = [a for a in seen["argv"] if a.startswith("-env:UserInstallation=")][0]
     assert second != profiles[0], "both conversions reused one profile directory"
+
+
+# --------------------------------------- the slide_order record says what it means
+
+def _deck_zip(path, order, n=3):
+    """A minimal but real .pptx on disk: ``n`` slide parts, ``order`` (1-based part
+    numbers) listed in p:sldIdLst. A part not in ``order`` is unlisted."""
+    import zipfile
+    P = ('xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" '
+         'xmlns:a="urn:a" '
+         'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"')
+    with zipfile.ZipFile(path, "w") as z:
+        for i in range(1, n + 1):
+            z.writestr("ppt/slides/slide%d.xml" % i,
+                       '<p:sld %s><p:cSld><p:spTree><p:sp><p:nvSpPr><p:nvPr/>'
+                       '</p:nvSpPr><p:txBody><a:p><a:r><a:t>body %d</a:t></a:r>'
+                       '</a:p></p:txBody></p:sp></p:spTree></p:cSld></p:sld>' % (P, i))
+        z.writestr("ppt/presentation.xml",
+                   '<p:presentation %s><p:sldIdLst>%s</p:sldIdLst></p:presentation>'
+                   % (P, "".join('<p:sldId id="%d" r:id="rId%d"/>' % (256 + k, 1 + p)
+                                 for k, p in enumerate(order))))
+        z.writestr("ppt/_rels/presentation.xml.rels",
+                   '<Relationships %s>%s</Relationships>'
+                   % (RELS, "".join('<Relationship Id="rId%d" Type="t" '
+                                    'Target="slides/slide%d.xml"/>' % (1 + i, i)
+                                    for i in range(1, n + 1))))
+
+
+def _order_evidence(tmp_path, order, n=3):
+    src = str(tmp_path / "deck.pptx")
+    _deck_zip(src, order, n)
+    info = _mod("office_convert").bundle_inputs(
+        {"id": "d", "src": src, "ext": "pptx", "rel": "d.pptx"}, "")
+    rec = [d for d in (info.get("decisions") or ()) if d["code"] == "slide_order"]
+    assert len(rec) == 1
+    return rec[0]
+
+
+def test_slide_order_reports_reordered_only_when_the_order_really_differs(tmp_path):
+    """`reordered` is the aggregatable question this record exists to answer — "how
+    many decks in this corpus were actually dragged around?" — so it has to compare
+    like with like. Comparing the PUBLISHED order against every slide PART made it
+    true for any deck holding one unlisted part, however faithfully its listed slides
+    were already in order."""
+    assert _order_evidence(tmp_path, [1, 2, 3])["evidence"] == {
+        "reordered": False, "slides": 3, "unlisted": 0}
+    assert _order_evidence(tmp_path, [1, 3, 2])["evidence"] == {
+        "reordered": True, "slides": 3, "unlisted": 0}
+    # In order, but one part the deck never lists: unlisted, NOT reordered.
+    assert _order_evidence(tmp_path, [1, 2])["evidence"] == {
+        "reordered": False, "slides": 3, "unlisted": 1}
+    # Both at once.
+    assert _order_evidence(tmp_path, [2, 1])["evidence"] == {
+        "reordered": True, "slides": 3, "unlisted": 1}
+
+
+def test_slide_order_falls_back_observably_when_the_deck_cannot_say(tmp_path):
+    """A deck with no presentation part still converts — it makes no ordering
+    statement, so numeric part order contradicts nothing — but the record has to say
+    that is what happened, or a guessed order is indistinguishable from a read one."""
+    import zipfile
+    src = str(tmp_path / "nopres.pptx")
+    _deck_zip(src, [1, 2, 3])
+    keep = [(i, zipfile.ZipFile(src).read(i.filename))
+            for i in zipfile.ZipFile(src).infolist()
+            if i.filename != "ppt/presentation.xml"]
+    with zipfile.ZipFile(src, "w") as z:
+        for info, data in keep:
+            z.writestr(info, data)
+    rec = _mod("office_convert").bundle_inputs(
+        {"id": "d", "src": src, "ext": "pptx", "rel": "d.pptx"}, "")
+    got = [d for d in rec["decisions"] if d["code"] == "slide_order"][0]
+    assert got["chose"] == "part-name"
+    assert got["evidence"] == {"reordered": False, "slides": 3, "unlisted": 0}
+
+
+@pytest.mark.parametrize("part", ["ppt/presentation.xml",
+                                  "ppt/_rels/presentation.xml.rels"])
+def test_a_corrupt_ordering_part_fails_the_document(tmp_path, part):
+    """Both parts back the deck's ORDER, and a truncated one degrades through
+    `_root()` to "no order" — so the lane publishes the slides in the order their
+    FILES are named, under headings numbering them 1..n as though that were the deck.
+    Measured on the reordered fixture with either part truncated: `Slide 2 — Open
+    questions` where the deck says `Slide 2 — Rollout plan`, at `recall: 1.0,
+    valid: True, status: ok`. The wrong document, silently.
+
+    That is the `word/styles.xml` lesson one format over, and it is why "text-bearing"
+    was never the real criterion for a content part — neither of these carries a
+    single character of text."""
+    import zipfile
+    src = str(tmp_path / "deck.pptx")
+    _deck_zip(src, [2, 1])
+    keep = [(i, zipfile.ZipFile(src).read(i.filename))
+            for i in zipfile.ZipFile(src).infolist()]
+    with zipfile.ZipFile(src, "w") as z:
+        for info, data in keep:
+            z.writestr(info, b"<broken><unclosed>" if info.filename == part else data)
+    info = _mod("office_convert").bundle_inputs(
+        {"id": "d", "src": src, "ext": "pptx", "rel": "d.pptx"}, "")
+    assert info["error"] == "malformed-content-part:" + part
+    assert not info["body"]
+
+
+@pytest.mark.parametrize("part", ["ppt/presentation.xml",
+                                  "ppt/_rels/presentation.xml.rels"])
+def test_an_absent_ordering_part_still_converts(tmp_path, part):
+    """The other half of the split, and it falls out of the existing mechanism
+    rather than needing a rule of its own: `malformed_content_part` only inspects
+    parts that are PRESENT. A deck with no presentation part makes no ordering
+    statement, so numeric part order contradicts nothing — and the decision record
+    is what stops that from being indistinguishable from an order actually read."""
+    import zipfile
+    src = str(tmp_path / "deck.pptx")
+    _deck_zip(src, [2, 1])
+    keep = [(i, zipfile.ZipFile(src).read(i.filename))
+            for i in zipfile.ZipFile(src).infolist() if i.filename != part]
+    with zipfile.ZipFile(src, "w") as z:
+        for info, data in keep:
+            z.writestr(info, data)
+    info = _mod("office_convert").bundle_inputs(
+        {"id": "d", "src": src, "ext": "pptx", "rel": "d.pptx"}, "")
+    assert info["error"] == ""
+    assert "body 1" in info["body"] and "body 2" in info["body"]
+    got = [d for d in info["decisions"] if d["code"] == "slide_order"][0]
+    assert got["chose"] == "part-name"

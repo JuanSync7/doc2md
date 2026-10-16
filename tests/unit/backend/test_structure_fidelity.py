@@ -18,6 +18,11 @@ import pytest
 from backend.ingest import docx_source_structure, ooxml_markdown, ooxml_source_text
 from backend.validate import (conversion_report, md_structure,
                               structure_fidelity_report)
+# The closed fact list is deliberately not public — widening it is an edit to this
+# module, not a knob for callers. The test reads it privately so `facts` in the
+# report can be pinned against the REAL list rather than against a copy of its
+# length, which is exactly the drift the field exists to prevent.
+from backend.validate._mdcheck import _FIDELITY_FACTS
 import backend.ingest._ooxml_md as ooxml
 
 pytestmark = pytest.mark.unit
@@ -135,7 +140,10 @@ def test_a_flattened_table_is_a_failure():
     verdict = structure_fidelity_report(
         md_structure("Signal Width irq 32\n"), docx_source_structure(parts))
     assert verdict["gate"] == "fail"
-    assert [d["fact"] for d in verdict["deltas"]] == ["tables"]
+    # `block_sequence` is a SECOND, independent witness to the same damage: a
+    # block that changed kind also changed the sequence it sits in. Two facts
+    # failing where one used to is the gate getting sharper, not noisier.
+    assert [d["fact"] for d in verdict["deltas"]] == ["tables", "block_sequence"]
 
 
 def test_a_heading_demoted_to_prose_is_a_failure():
@@ -146,7 +154,8 @@ def test_a_heading_demoted_to_prose_is_a_failure():
     # BOTH heading facts move, and they are meant to: the histogram loses its `1`
     # and the ordered path loses the entry that carried the title's words. A demoted
     # heading that moved only one of them would mean the two had drifted apart.
-    assert [d["fact"] for d in verdict["deltas"]] == ["headings", "heading_path"]
+    assert [d["fact"] for d in verdict["deltas"]] == [
+        "headings", "heading_path", "block_sequence"]
 
 
 # --------------------------------------------------- what it must NOT claim
@@ -246,9 +255,11 @@ def test_a_real_docx_on_disk_agrees_end_to_end(tmp_path):
     # of them could not have failed.
     #
     # It was 13 while `compared` counted names, then 9 while the ground truth still
-    # had no opinion on `heading_path`. It is 10 now that the ground truth supplies
-    # the ordered heading fact, which is the rise the previous revision predicted.
-    assert verdict["compared"] == 10
+    # had no opinion on `heading_path`, then 10 when the ordered heading fact
+    # landed. It is 11 now that `block_sequence` is graded. Unlike the others this
+    # fact has evidence on EVERY document that contains any block at all, so it is
+    # the one addition that raises `compared` even for a one-block memo.
+    assert verdict["compared"] == 11
     # ...and there is nothing left for it to disclaim: every fact in the schema is
     # either evidenced on both sides or symmetrically absent, so the report carries
     # no `unmeasured` list at all.
@@ -471,7 +482,8 @@ def test_a_custom_heading_style_is_a_heading_on_both_sides():
     assert new["gate"] == "fail"
     # Flattening two sections into one blob costs both heading facts: the histogram
     # empties, and the ordered path loses the two entries that named the sections.
-    assert [d["fact"] for d in new["deltas"]] == ["headings", "heading_path"]
+    assert [d["fact"] for d in new["deltas"]] == [
+        "headings", "heading_path", "block_sequence"]
 
 
 def test_a_reordered_procedure_is_a_failure():
@@ -584,7 +596,7 @@ def test_a_listing_really_split_in_two_is_still_seen():
     old, new = _blind(parts, "```\n$ make verify\nThen check the log.\nok\n```\n")
     assert old["recall"] == 1.0
     assert new["gate"] == "fail"
-    assert [d["fact"] for d in new["deltas"]] == ["code_blocks"]
+    assert [d["fact"] for d in new["deltas"]] == ["code_blocks", "block_sequence"]
 
 
 def test_a_smartart_diagram_agrees_end_to_end():
@@ -787,7 +799,8 @@ def test_a_paragraph_that_became_a_horizontal_rule_is_a_failure():
     damaged = faithful.replace("\\-----", "-----")
     verdict = structure_fidelity_report(md_structure(damaged), source)
     assert verdict["gate"] == "fail"
-    assert [d["fact"] for d in verdict["deltas"]] == ["thematic_breaks"]
+    assert [d["fact"] for d in verdict["deltas"]] == [
+        "thematic_breaks", "block_sequence"]
 
 
 def test_a_multi_paragraph_table_cell_is_not_a_gate_failure():
@@ -820,11 +833,12 @@ def test_compared_counts_evidence_not_the_fact_schema():
     verdict = _verdict(parts)
     assert verdict["gate"] == "pass"
     assert verdict["compared"] == 0
-    # A document that exhibits something counts it — here TWO facts, because one
-    # heading is evidence for the level histogram and for the ordered path alike.
+    # A document that exhibits something counts it — here THREE facts, because one
+    # heading is evidence for the level histogram, for the ordered path, and for
+    # the block sequence it now sits in.
     with_heading = _parts(_p("Bring-up", style="Heading1") + _p("Body."),
                           numbering=False)
-    assert _verdict(with_heading)["compared"] == 2
+    assert _verdict(with_heading)["compared"] == 3
 
 
 def test_a_partial_ground_truth_names_what_it_did_not_measure():
@@ -836,3 +850,74 @@ def test_a_partial_ground_truth_names_what_it_did_not_measure():
     # An entirely absent ground truth already says `unmeasured` in `method` and
     # `gate`; listing all fifteen facts there would be noise, not information.
     assert "unmeasured" not in structure_fidelity_report(md_structure("# T\n"), {})
+
+
+# ------------------------------------------------- arrangement, which nothing
+# ------------------------------------------------- else in the vector can see
+
+def test_a_block_that_moved_between_sections_is_a_failure():
+    """THE reason `block_sequence` was admitted to the closed list.
+
+    Every other fact is a total, a histogram or a per-kind list, and none of them
+    records where a block SITS. Move a register table out from under its own heading
+    and file it under the errata instead: the heading histogram is identical, the
+    ordered heading path is identical, the table's geometry and every one of its
+    cells are identical, and the token multiset is identical — so `token_recall`
+    reads 1.0 and, before this fact, so did the structure gate. A reader is then
+    handed a document that says the enable field resets to 0 *in the errata*."""
+    before = ("# Register map\n\n| Field | Reset |\n| --- | --- |\n| enable | 0 |\n"
+              "\n# Errata\n\nNothing outstanding.\n")
+    after = ("# Register map\n\nNothing outstanding.\n"
+             "\n# Errata\n\n| Field | Reset |\n| --- | --- |\n| enable | 0 |\n")
+    source, emitted = md_structure(before), md_structure(after)
+
+    # Everything the vector held BEFORE this fact agrees, which is the point.
+    for fact in ("headings", "heading_path", "tables", "list_items",
+                 "list_item_words", "ordered_numbers", "ordered_items",
+                 "bullet_items", "thematic_breaks", "code_blocks", "code_spans",
+                 "strong", "em", "strike", "links"):
+        assert source[fact] == emitted[fact], fact
+
+    verdict = structure_fidelity_report(emitted, source)
+    assert verdict["gate"] == "fail"
+    assert [d["fact"] for d in verdict["deltas"]] == ["block_sequence"]
+
+
+def test_the_arrangement_fact_does_not_fail_a_faithful_document():
+    """The bound must not become a blindfold. Identical arrangement, identical
+    verdict — including the case where two blocks of the same kind are adjacent,
+    which a naive set-based reading would collapse."""
+    body = ("# A\n\n- one\n- two\n\n| x | y |\n| --- | --- |\n| 1 | 2 |\n"
+            "\n## B\n\n```\ncode\n```\n\n> quoted\n")
+    facts = md_structure(body)
+    verdict = structure_fidelity_report(facts, dict(facts))
+    assert verdict["gate"] == "pass" and verdict["deltas"] == []
+    assert facts["block_sequence"] == [
+        ("h", 1), ("li", 0), ("li", 0), ("table", (2, 2)),
+        ("h", 2), ("code", 0), ("quote", 0)]
+
+
+def test_the_report_states_its_own_denominator_and_its_blind_spots():
+    """`compared` is meaningless without the length of the list it counts against,
+    and an archived report cannot look that up later. `blind_to` is the different
+    claim: structure the FORMAT has that no name in the list can express."""
+    facts = md_structure("# Title\n")
+    verdict = structure_fidelity_report(facts, dict(facts))
+    assert verdict["facts"] == len(_FIDELITY_FACTS) == 16
+    assert "blind_to" not in verdict          # none declared
+
+    declared = dict(facts)
+    declared["_blind_to"] = ["shape_geometry", "z_order"]
+    assert structure_fidelity_report(facts, declared)["blind_to"] == [
+        "shape_geometry", "z_order"]
+
+
+def test_a_ground_truth_that_states_nothing_is_not_a_measurement():
+    """A source dict carrying only a `_blind_to` declaration supplied no graded
+    fact. Reading it as truthy would publish `compared: 0` beside `gate: "pass"` —
+    a clean bill of health from a truth that said nothing at all."""
+    verdict = structure_fidelity_report(md_structure("# T\n"),
+                                        {"_blind_to": ["z_order"]})
+    assert verdict["gate"] == "unmeasured"
+    assert verdict["method"] == "unmeasured"
+    assert verdict["compared"] == 0

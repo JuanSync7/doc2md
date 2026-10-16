@@ -53,8 +53,10 @@ from backend.ingest import (  # noqa: E402
     ROUTE_OOXML, ROUTE_LIBREOFFICE, ROUTE_DOCLING, ROUTE_FENCE, ROUTE_PASSTHROUGH,
     ooxml_markdown, ooxml_source_text, core_properties, front_matter,
     OOXML_MAIN_PARTS, load_source_root, load_ingest_config, furniture_drops,
-    docx_source_structure, policy_drops)
+    docx_source_structure, xlsx_source_structure, pptx_source_structure,
+    policy_drops, pptx_slide_order)
 from backend.validate import conversion_report  # noqa: E402  (the validator layer)
+from backend.provenance import decision  # noqa: E402  (choices are records, not prose)
 
 COV_NAME = "_coverage_ooxml.jsonl"
 # Parts DELIBERATELY not converted; --audit-parts separates these from genuinely
@@ -373,17 +375,82 @@ def read_media(path):
 # SYMMETRICALLY — so a corrupt slide/worksheet/document (or the sharedStrings table, which
 # backs every xlsx string cell) zeroes on both sides and sails through recall==1.0. We
 # therefore parse-check these parts explicitly and FAIL the doc rather than silently
-# converting only its healthy parts. (Structure/furniture parts — styles, _rels, docProps —
-# are excluded: their loss is graceful, not silent text loss.)
+# converting only its healthy parts.
+#
+# `styles.xml` IS one of these, and the reasoning that excluded it is worth recording
+# because it was true when written and quietly stopped being true. The old comment
+# said "structure/furniture parts — styles, _rels, docProps — are excluded: their loss
+# is graceful, not silent text loss". Under a TOKEN-only gate that held: a corrupt
+# style table costs no words, and `n_source_tokens` really does stay put. Then
+# `structure_fidelity` began deriving heading levels FROM that part, and the loss
+# stopped being graceful without anything here changing. Measured on
+# `kestrel-clock-spec.docx` with the part truncated to half its bytes:
+#
+#     pristine              recall=1.0  gate=pass  compared=11  headings=9
+#     styles.xml TRUNCATED  recall=1.0  gate=pass  compared=9   headings=0
+#
+# Nine headings out of the markdown, both gates green, no warning — because both
+# sides read the part through the same `_root()` and both collapsed to "no styles"
+# identically.
+#
+# `ppt/presentation.xml` is here for the same reason and by the same measurement,
+# and it is worth saying that it carries NO TEXT at all — "text-bearing" was never
+# the real criterion, "backs a claim the output makes" is. The deck's slide ORDER
+# lives in its `p:sldIdLst`, so a truncated one degrades through `_root()` to "no
+# order" and the lane publishes the slides in the order their FILES are named,
+# under headings numbering them 1..n as though that were the deck. Measured on
+# `office/kestrel-reordered.pptx` with the part truncated:
+#
+#     pristine              Slide 2 — Rollout plan    recall=1.0  valid=True
+#     presentation TRUNCATED Slide 2 — Open questions  recall=1.0  valid=True
+#
+# The wrong deck, silently, with `status: ok`. A DECISION record does say which
+# order was used, but `decisions[]` carries choices and this is damage.
+#
+# The split this produces is the principled one, and it falls out of the existing
+# mechanism rather than needing new code: `malformed_content_part` only inspects
+# parts that are PRESENT, so a deck with NO presentation part still converts (it
+# makes no ordering statement, so filename order contradicts nothing) while a deck
+# whose ordering statement is unreadable fails loudly.
+#
+# `ppt/_rels/presentation.xml.rels` is here for the same reason and NOT as an
+# exception to the "_rels are excluded" rule — that rule was written when no rels
+# part backed a graded claim, and this one now backs the same claim as the part it
+# serves. `p:sldIdLst` names relationship ids; without the rels they resolve to
+# nothing. Measured, truncating it alone:
+#
+#     pristine        Slide 2 — Rollout plan     Slide 5 — Open questions
+#     rels TRUNCATED  Slide 2 — Open questions   Slide 5 — Rollout plan
+#
+# Excluding it while including the part would have been arbitrary: the same damage,
+# the same silence, one file apart. `docProps` and the OTHER `_rels` stay excluded
+# and the old reasoning still covers them — though `word/_rels/document.xml.rels`
+# backs hyperlink destinations and deserves the same question asked of it one day.
+# Slide parts, for the ORDER decision only. Spelled here rather than imported from
+# the converter because this file must be able to say how many slides a package holds
+# even when the converter's own ordering is what is in question.
+_SLIDE_PART_NAME = re.compile(r"^ppt/slides/slide(\d+)\.xml$")
+
+
+def _by_part_number(names):
+    # type: (list) -> list
+    """``names`` sorted the way the lane orders slides when the deck cannot say."""
+    return [n for _k, n in sorted((int(_SLIDE_PART_NAME.match(n).group(1)), n)
+                                  for n in names)]
+
+
 _CONTENT_PARTS = {
-    "docx": re.compile(r"^word/document\.xml$"
+    "docx": re.compile(r"^word/document\.xml$|^word/styles\.xml$"
                        r"|^word/(footnotes|endnotes|comments)\.xml$"
                        r"|^word/charts/chart(?:Ex)?\d+\.xml$|^word/diagrams/data\d+\.xml$"),
-    "pptx": re.compile(r"^ppt/slides/slide\d+\.xml$"
+    "pptx": re.compile(r"^ppt/presentation\.xml$"
+                       r"|^ppt/_rels/presentation\.xml\.rels$"
+                       r"|^ppt/slides/slide\d+\.xml$"
                        r"|^ppt/notesSlides/notesSlide\d+\.xml$"
                        r"|^ppt/diagrams/data\d+\.xml$|^ppt/charts/chart(?:Ex)?\d+\.xml$"
                        r"|^ppt/comments/[^/]+\.xml$"),
     "xlsx": re.compile(r"^xl/worksheets/[^/]+\.xml$|^xl/workbook\.xml$"
+                       r"|^xl/styles\.xml$"
                        r"|^xl/sharedStrings\.xml$|^xl/comments\d*\.xml$"
                        r"|^xl/charts/chart(?:Ex)?\d+\.xml$"),
 }
@@ -427,7 +494,7 @@ def bundle_inputs(row, soffice="", emit_images=False):
 
     Returns a dict ``{error, body, source_text, meta, warnings, eff_ext, media,
     source_repr_chars, source_structure}``. ``source_structure`` is the
-    converter-blind STRUCTURAL ground truth (docx only today) that the
+    converter-blind STRUCTURAL ground truth (docx, xlsx and pptx today) that the
     ``structure_fidelity`` gate grades the emitted markdown against; ``{}`` means
     unmeasured, and an unmeasured lane can never claim a structural pass. ``error`` is ``""`` on success; ``"empty-source-file"`` is a
     SUCCESS sentinel (a 0-byte upload is vacuously lossless — nothing to lose), while
@@ -489,12 +556,88 @@ def bundle_inputs(row, soffice="", emit_images=False):
     warnings.extend(policy_drops(parts, members))
     body = ooxml_markdown(eff_ext, parts, emit_images)
     src_text = ooxml_source_text(eff_ext, parts)
-    # Only docx has a structural ground truth so far. pptx (every paragraph is a
-    # bullet) and xlsx (every sheet is one table) have far less structure to lose,
-    # and claiming to grade them without a second implementation would be the exact
-    # dishonesty this gate exists to end.
-    src_struct = (docx_source_structure(parts)
-                  if eff_ext.lower().lstrip(".") == "docx" else {})
+    # The structural ground truth, per format. A format with no second
+    # implementation supplies NOTHING and reports `unmeasured` — never a free pass,
+    # because claiming to grade a format nobody wrote a second reader for is the
+    # exact dishonesty this gate exists to end.
+    #
+    # This dispatch used to carry a claim that pptx ("every paragraph is a bullet")
+    # and xlsx ("every sheet is one table") had "far less structure to lose". It was
+    # measured and it was false: a workbook whose tabs are published in the wrong
+    # order, whose cells lose their addresses, or whose registers exchange reset
+    # values keeps `token_recall` at exactly 1.0, and every one of those shipped
+    # `status: ok` for as long as this line read `if ext == "docx"`.
+    #
+    # `emit_images` is passed through and is not cosmetic: under it the converter
+    # adds a real `## Images` heading, so a truth blind to the flag reads one
+    # heading short on every bundled workbook holding a picture.
+    fmt = eff_ext.lower().lstrip(".")
+    # WHICH ORDER THE SLIDES WERE PUBLISHED IN, as a record rather than a guess.
+    #
+    # The TOKEN gate cannot check this. Recall compares MULTISETS, so slide order is
+    # invisible to it by construction — measured on the reordered corpus deck, the
+    # wrong order and the right one both report `recall: 1.0, n_source: 135`.
+    # `structure_fidelity` can and does, since `pptx_source_structure` derives the
+    # presentation order AGAIN with its own reader: injecting the exact bug (the
+    # order read off the unqualified `id` attribute) moves `block_sequence`,
+    # `heading_path` and `list_item_words` and fails the gate at recall 1.0.
+    #
+    # This record answers the question no gate can, because it is not a failure: a
+    # deck whose presentation part cannot supply an order still converts, and SAYS
+    # which rule it fell back to, instead of quietly publishing the filenames' order
+    # as if it were the deck's.
+    decisions = []  # type: list
+    if fmt == "pptx":
+        part_order = sorted(name for name in parts if _SLIDE_PART_NAME.match(name))
+        published = pptx_slide_order(parts)
+        chose = "sldIdLst" if published else "part-name"
+        decisions.append(decision(
+            "slide_order", chose,
+            "read from the presentation's own p:sldIdLst" if published else
+            "no usable p:sldIdLst; fell back to numeric slide part order",
+            {"slides": len(part_order),
+             # Compare like with like: the published order against the SAME parts in
+             # part-name order. Comparing it against every slide part made `reordered`
+             # true for any deck holding one unlisted part, however faithfully its
+             # listed slides were already in order.
+             "reordered": published != _by_part_number(published),
+             "unlisted": len([n for n in part_order if n not in set(published)])
+                         if published else 0}))
+    if fmt == "docx":
+        src_struct = docx_source_structure(parts)
+    elif fmt == "xlsx":
+        src_struct = xlsx_source_structure(parts, emit_images)
+    elif fmt == "pptx":
+        # No `emit_images` here, and the asymmetry is measured rather than an
+        # oversight. A workbook's pictures are grouped under a real trailing
+        # `## Images` heading, so a truth blind to the flag reads one heading short;
+        # a deck's picture renders in place as an HTML-comment sentinel, which is
+        # not a block kind in the fact vector. What the sentinel USED to do was
+        # worse than a heading — at column 0 it closed the list it interrupted and
+        # flattened every bullet below it — and that is fixed in the converter,
+        # where it belongs, rather than predicted here.
+        src_struct = pptx_source_structure(parts)
+    else:
+        src_struct = {}
+    if src_struct and (row.get("ext") or "").lower().lstrip(".") != fmt:
+        # THE LEGACY LANE'S HONEST CAVEAT, and it is declared here because this is
+        # the layer that knows a pre-convert happened.
+        #
+        # A .doc/.xls/.ppt/.odt/.ods/.odp is handed to LibreOffice first, so both
+        # halves of this gate read the package soffice PRODUCED, not the file the
+        # user supplied. Whatever the round-trip already destroyed is destroyed in
+        # the source the ground truth reads, so the truth reads the loss and AGREES
+        # with it. Measured on `legacy/kestrel-overview.ppt`: every slide title has
+        # been demoted to a body bullet and every sub-bullet flattened to depth 0,
+        # and the gate reports `pass` over it.
+        #
+        # Reporting `unmeasured` for the lane would be the opposite error — a real
+        # comparison did run, and it does prove the OOXML-to-markdown step faithful.
+        # So the verdict stands and the reach of it is stated: `pass` here means
+        # "faithful from the converted package onward", never "nothing was lost".
+        src_struct = dict(src_struct)
+        src_struct["_blind_to"] = (list(src_struct.get("_blind_to") or ())
+                                   + ["pre_conversion_structure"])
     if not body.strip() and src_text.strip():
         return {"error": "empty-conversion", "body": "", "source_text": src_text,
                 "meta": OrderedDict(), "warnings": warnings, "eff_ext": eff_ext,
@@ -503,7 +646,8 @@ def bundle_inputs(row, soffice="", emit_images=False):
                            parts.get("docProps/app.xml", ""))
     return {"error": "", "body": body, "source_text": src_text, "meta": meta,
             "warnings": warnings, "eff_ext": eff_ext, "media": media,
-            "source_repr_chars": repr_chars, "source_structure": src_struct}
+            "source_repr_chars": repr_chars, "source_structure": src_struct,
+            "decisions": decisions}
 
 
 def convert_one(row, soffice=""):

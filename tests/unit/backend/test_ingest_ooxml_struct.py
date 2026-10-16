@@ -7,7 +7,8 @@ summary: docx_source_structure reads the source's structure by its own route, mi
 import pytest
 
 from backend.ingest import (docx_source_structure, markdown_to_text,
-                            ooxml_markdown, ooxml_source_text, policy_drops)
+                            merged_cell_spans, ooxml_markdown, ooxml_source_text,
+                            policy_drops)
 from backend.validate import conversion_report, md_structure, structure_fidelity_report
 
 pytestmark = pytest.mark.unit
@@ -159,6 +160,122 @@ def test_every_deliberate_drop_is_counted():
     assert codes["tracked_changes_resolved"]["insertions"] == 1
     assert codes["tracked_changes_resolved"]["deletions"] == 1
     assert codes["dropped_embedded_objects"]["parts"] == 1
+
+
+# ------------------------------------- it counts merges in all three spellings
+#
+# `merged_cell_spans` promised, in its own docstring, that "the number is right
+# whether or not the converter for that format even looks at the attribute". It was
+# not: the function read only WordprocessingML's CHILD-ELEMENT spelling, so a deck
+# (DrawingML, ATTRIBUTES on a:tc) measured a confident 0 and 0, and a workbook
+# (SpreadsheetML, a <mergeCell ref> RANGE) had every merge filed as horizontal
+# because nothing parsed the ref — the only place the direction is written.
+#
+# The unit is CELLS ABSORBED: grid positions that stopped being addressable. That
+# is what Word has always counted (gridSpan w:val="3" is one merge, two absorbed),
+# and the two new branches are held to the same unit so a mixed corpus can be added
+# up. See `test_the_two_directions_partition_the_loss` for the invariant that pins
+# the split.
+
+_A = 'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"'
+_SS = 'xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"'
+
+
+def _tc(text="", **attrs):
+    """One DrawingML table cell. PowerPoint writes the FULL grid: the anchor
+    carries gridSpan/rowSpan and every position it covers is still present as an
+    a:tc carrying hMerge/vMerge."""
+    at = "".join(' %s="%s"' % (k, v) for k, v in sorted(attrs.items()))
+    return ('<a:tc%s><a:txBody><a:p><a:r><a:t>%s</a:t></a:r></a:p></a:txBody>'
+            '</a:tc>' % (at, text))
+
+
+def _deck(rows):
+    return {"ppt/slides/slide1.xml":
+            '<p:sld xmlns:p="p" %s><a:tbl>%s</a:tbl></p:sld>'
+            % (_A, "".join('<a:tr>%s</a:tr>' % r for r in rows))}
+
+
+def _sheet(refs):
+    return {"xl/worksheets/sheet1.xml":
+            '<worksheet %s><sheetData/><mergeCells>%s</mergeCells></worksheet>'
+            % (_SS, "".join('<mergeCell ref="%s"/>' % r for r in refs))}
+
+
+def test_a_deck_no_longer_measures_a_confident_zero():
+    # A 3x2 rectangle merged from its top-left corner, spelled the way PowerPoint
+    # spells it. The old element scan matched none of these and reported 0 and 0.
+    deck = _deck([_tc("Group", gridSpan="3", rowSpan="2")
+                  + _tc(hMerge="1") + _tc(hMerge="1"),
+                  _tc(vMerge="1") + _tc(hMerge="1", vMerge="1")
+                  + _tc(hMerge="1", vMerge="1")])
+    assert merged_cell_spans(deck) == {"horizontal": 4, "vertical": 1}
+
+
+def test_the_anchors_own_span_attributes_are_not_counted_twice():
+    """gridSpan on the anchor and hMerge on the cells it covers are two views of
+    ONE merge. Adding both would double every deck's count."""
+    deck = _deck([_tc("Wide", gridSpan="2") + _tc(hMerge="1")])
+    assert merged_cell_spans(deck) == {"horizontal": 1, "vertical": 0}
+
+
+def test_an_off_valued_merge_attribute_is_not_a_merge():
+    deck = _deck([_tc("A", hMerge="0") + _tc("B", vMerge="false") + _tc("C")])
+    assert merged_cell_spans(deck) == {"horizontal": 0, "vertical": 0}
+
+
+def test_a_workbook_merge_is_read_from_the_ref_not_counted_as_horizontal():
+    # The shipped corpus holds exactly these two and published "2 horizontal and
+    # 0 vertical" for as long as nothing parsed the ref.
+    assert merged_cell_spans(_sheet(["A1:C1", "A3:A4"])) == {"horizontal": 2,
+                                                             "vertical": 1}
+
+
+def test_a_column_letter_past_z_is_not_a_column_index():
+    """Base-26 with no zero digit: AA is 26, not 0. A naive ord() of the last
+    letter would call Z1:AA1 a merge of negative width and silently drop it."""
+    assert merged_cell_spans(_sheet(["Z1:AA1"])) == {"horizontal": 1, "vertical": 0}
+
+
+@pytest.mark.parametrize("ref,w,h", [
+    ("A1:C1", 3, 1), ("A3:A4", 1, 2), ("A1:C2", 3, 2), ("B2:E5", 4, 4),
+])
+def test_the_two_directions_partition_the_loss(ref, w, h):
+    """A w x h merged rectangle shows ONE value where the grid held w*h
+    addressable cells, so exactly w*h - 1 are absorbed. The horizontal and
+    vertical legs must add up to that: no cell counted twice, none missed."""
+    spans = merged_cell_spans(_sheet([ref]))
+    assert spans["horizontal"] + spans["vertical"] == w * h - 1
+
+
+def test_a_degenerate_or_unparseable_ref_is_ignored_rather_than_guessed():
+    assert merged_cell_spans(_sheet(["B2:B2"])) == {"horizontal": 0, "vertical": 0}
+    assert merged_cell_spans(_sheet(["", "junk", "C3:A1"])) == {"horizontal": 0,
+                                                                "vertical": 0}
+
+
+def test_word_still_counts_exactly_what_it_counted_before():
+    """The bound must not become a blindfold: the two new branches are additions,
+    and the WordprocessingML numbers on the shipped corpus must not move."""
+    body = ('<w:tbl><w:tr><w:tc><w:tcPr><w:gridSpan w:val="3"/></w:tcPr>%s</w:tc>'
+            '</w:tr><w:tr><w:tc><w:tcPr><w:vMerge w:val="continue"/></w:tcPr>%s'
+            '</w:tc></w:tr></w:tbl>' % (_p(_run("Group")), _p(_run("more"))))
+    assert merged_cell_spans(_parts(body)) == {"horizontal": 2, "vertical": 1}
+
+
+def test_the_warning_promises_the_fill_only_where_the_fill_happens():
+    """Word's converter forward-fills a vertical merge so each row stays
+    self-contained. Neither the deck nor the workbook converter reads its merge
+    markup at all, so their continuation cells come out BLANK. One sentence for
+    both described a behaviour a spreadsheet reader could not find in the file."""
+    word = dict((w["code"], w["detail"]) for w in policy_drops(_parts(
+        '<w:tbl><w:tr><w:tc><w:tcPr><w:vMerge w:val="continue"/></w:tcPr>%s</w:tc>'
+        '</w:tr></w:tbl>' % _p(_run("x")))))["flattened_table_spans"]
+    sheet = dict((w["code"], w["detail"])
+                 for w in policy_drops(_sheet(["A3:A4"])))["flattened_table_spans"]
+    assert "repeated down its rows" in word
+    assert "continuation rows blank" in sheet
+    assert "repeated" not in sheet
 
 
 def test_a_list_format_markdown_cannot_write_is_counted_not_shrugged_at():

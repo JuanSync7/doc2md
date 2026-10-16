@@ -3,6 +3,9 @@
 #                    constraint: ingest/validate/bundle/sections must import + pass there)
 #   2. tests-modern  same suite on 3.12 (the PDF lane's interpreter generation),
 #                    plus the CommonMark differential, which needs a parser from PyPI
+# Both test rings build the hand-built half of the eval corpus first: `data/` is
+# gitignored, and without it the red-direction suite skips the 30 tests that are the
+# only demonstration this pipeline has that a converter bug is CAUGHT.
 #   3. eval-office   the synthetic-corpus eval (office/text/legacy lanes) with a real
 #                    LibreOffice — the regression gate over the fictional Kestrel docs —
 #                    then the KB linter and the executable rubric over what it built
@@ -40,11 +43,38 @@ jobs:
       # must fail here. The md_structure CommonMark differential therefore SKIPS
       # on this ring for the reason its skip message states (marko needs 3.8+);
       # tests-modern is where that differential is mandatory, and asserts it ran.
+      # THE CORPUS THE RED-DIRECTION SUITE NEEDS. `data/` is gitignored, so a fresh
+      # checkout has none, and `test_office_gate_red_direction.py` skips its fixtures
+      # rather than failing — 30 tests, the entire demonstration that the structure
+      # gate can FAIL, silently not run on either test ring. That is the same shape
+      # as the CommonMark differential below: a suite that skips reads exactly like a
+      # suite that passes.
+      #
+      # `--handbuilt-only` is the whole point: the OOXML sources are written directly
+      # with zipfile + string templates, so this needs no LibreOffice, no poppler and
+      # no Pillow, and takes ~0.2s. The derived legacy/PDF lanes belong to eval-office
+      # and eval-pdf, which install the tools for them.
+      - name: Build the hand-built corpus the gate tests convert
+        run: python3 evals/gen_corpus.py --handbuilt-only
       - name: Run suite on bare Python 3.6
         run: >
           docker run --rm -v "$PWD:/repo" -w /repo python:3.6-slim
           bash -ec "pip install -q 'pytest==6.2.5'
           && python -m pytest tests/unit tests/integration -q"
+      # The corpus really reached the suite. Without it these 30 tests SKIP, and a
+      # skip here means the branch carries no evidence that a converter bug is caught
+      # at all — which is the one property the office lane is built on.
+      - name: The red-direction suite must run, not skip
+        shell: bash
+        run: |
+          docker run --rm -v "$PWD:/repo" -w /repo python:3.6-slim \
+            bash -ec "pip install -q 'pytest==6.2.5' \
+            && python -m pytest tests/integration/test_office_gate_red_direction.py \
+                 -q -rs -p no:cacheprovider" | tee red-direction.txt
+          if grep -qi 'skipped' red-direction.txt; then
+            echo "::error::the red-direction suite SKIPPED — the eval corpus did not reach it"
+            exit 1
+          fi
 
   tests-modern:
     runs-on: ubuntu-latest
@@ -72,6 +102,20 @@ jobs:
             -p no:cacheprovider | tee md-oracle.txt
           if grep -qi 'skipped' md-oracle.txt; then
             echo "::error::the CommonMark differential SKIPPED on the ring that installs the parser"
+            exit 1
+          fi
+      # Same corpus, same reason as the 3.6 ring above: without it the 30
+      # red-direction tests skip and this ring is green over the proof that the
+      # structure gate can fail.
+      - name: Build the hand-built corpus the gate tests convert
+        run: python3 evals/gen_corpus.py --handbuilt-only
+      - name: The red-direction suite must run, not skip
+        shell: bash
+        run: |
+          python -m pytest tests/integration/test_office_gate_red_direction.py \
+            -q -rs -p no:cacheprovider | tee red-direction.txt
+          if grep -qi 'skipped' red-direction.txt; then
+            echo "::error::the red-direction suite SKIPPED — the eval corpus did not reach it"
             exit 1
           fi
       - run: python -m pytest tests/unit tests/integration -q

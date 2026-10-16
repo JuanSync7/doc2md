@@ -149,6 +149,16 @@ def _fenced_lines(body_md):
     return out
 
 
+# An HTML COMMENT contributes no character to the heading a reader sees, and its
+# dashes are `-` — a character this rule KEEPS. `_render_runs` writes `<!---->`
+# between two emphasis spans whose delimiters would fuse (P9.9), so a heading can
+# hold one: `***read***<!---->*only*` slugged `read-only` while the rendered heading
+# is `readonly`, and a reader copying the fragment off the page landed nowhere. All
+# three copies of this rule had the same defect, which is why agreement between them
+# is necessary and not sufficient.
+_ANCHOR_COMMENT = re.compile(r"<!--.*?-->", re.S)
+
+
 def heading_anchor(heading_text):
     # type: (str) -> str
     """The ``#fragment`` a heading is addressable by, WITHOUT the leading ``#``.
@@ -170,6 +180,11 @@ def heading_anchor(heading_text):
     test_anchor_parity.py`` exists to prove.
     """
     s = (heading_text or "").strip().lower()
+    # An HTML comment is markup: it contributes no character to the heading a reader
+    # sees, and its dashes are `-`, which this rule KEEPS. See P9.9 — all three copies
+    # slugged `***read***<!---->*only*` as `read-only` where the render says
+    # `readonly`, and they agreed with each other the whole time.
+    s = _ANCHOR_COMMENT.sub("", s)
     s = _ANCHOR_DROP.sub("", s)
     return _ANCHOR_RUN.sub("-", s).strip("-")
 

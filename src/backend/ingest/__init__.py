@@ -34,10 +34,18 @@ from ._route import (route_format, classify_source, summarize_routes,
                      ROUTE_OOXML, ROUTE_DOCLING, ROUTE_PASSTHROUGH,
                      ROUTE_FENCE, ROUTE_LIBREOFFICE, ROUTE_UNSUPPORTED)
 from ._ooxml_md import (docx_markdown, pptx_markdown, xlsx_markdown,
-                        docx_source_text, pptx_source_text, xlsx_source_text,
                         ooxml_markdown, ooxml_source_text, svg_text, OOXML_MAIN_PARTS,
-                        furniture_drops)
-from ._ooxml_struct import docx_source_structure, policy_drops
+                        furniture_drops, pptx_slide_order)
+# Every TOKEN ground truth comes from the module that OWNS it, not from the converter
+# that re-exports them for its dispatch table. Importing them here from `_ooxml_md`
+# would read as though the converter produced them, which is the arrangement that let
+# all three share its helpers unnoticed.
+from ._pptx_struct import (pptx_source_text, pptx_source_structure,
+                           pptx_policy_drops)
+from ._xlsx_struct import (xlsx_source_structure, xlsx_source_text,
+                           xlsx_policy_drops)
+from ._ooxml_struct import (docx_source_text, docx_source_structure, policy_drops,
+                            merged_cell_spans, tracked_changes, embedded_objects)
 from ._recovery import (classify_failure, recovery_action,
                         plan_admission, order_todo,
                         FAIL_NONE, FAIL_OOM, FAIL_HANG, FAIL_DOCLING, FAIL_TRANSIENT,
@@ -86,15 +94,23 @@ __all__ = [
     "ROUTE_UNSUPPORTED",
     "docx_markdown",
     "pptx_markdown",
+    "pptx_slide_order",
     "xlsx_markdown",
     "docx_source_text",
     "pptx_source_text",
+    "pptx_source_structure",
+    "pptx_policy_drops",
     "xlsx_source_text",
+    "xlsx_source_structure",
+    "xlsx_policy_drops",
     "ooxml_markdown",
     "ooxml_source_text",
     "furniture_drops",
     "docx_source_structure",
     "policy_drops",
+    "merged_cell_spans",
+    "tracked_changes",
+    "embedded_objects",
     "svg_text",
     "OOXML_MAIN_PARTS",
     "doc_id",

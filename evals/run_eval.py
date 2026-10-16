@@ -138,7 +138,8 @@ _KEYS_BY_KIND = {
     "bundle": _KEYS_ROUTE | frozenset((
         "lane", "status",
         "losslessness_gate", "losslessness_method", "token_recall_min",
-        "structure_fidelity_gate",
+        "n_source_tokens_min",
+        "structure_fidelity_gate", "structure_fidelity_compared_min",
         "coverage_gate", "toc_lines_min", "has_toc", "max_depth",
         "savings_ratio_min", "content_links_min",
         "images_gate", "images_referenced",
@@ -190,6 +191,23 @@ def check_bundle(rel, exp, bundles_dir):
         got = loss.get("token_recall")
         c.check(isinstance(got, (int, float)) and got >= exp["token_recall_min"],
                 "token_recall: got %r, want >= %s" % (got, exp["token_recall_min"]))
+    if "n_source_tokens_min" in exp:
+        # A RATCHET ON THE DENOMINATOR, and recall cannot substitute for it.
+        # Recall asks "of the words the source has, how many survived?" — so a bug
+        # that removes words from the GROUND TRUTH shrinks the question instead of
+        # failing it, and the answer stays a clean 1.0 over whatever is left.
+        # Measured: breaking the deck's chrome predicate on the ground-truth side
+        # takes `n_source_tokens` from 108 to 20 with `token_recall` still 1.0 and
+        # `valid` still true. Nothing else in the project sees that — the rubric
+        # gates `n_source_tokens` only at == 0, which catches the total collapse and
+        # nothing short of it. Pinning a floor per document turns the corpus into
+        # the missing net: the number may grow when a fixture gains content, and a
+        # fall means the ground truth stopped looking somewhere it used to.
+        got = loss.get("n_source_tokens")
+        c.check(isinstance(got, int) and got >= exp["n_source_tokens_min"],
+                "n_source_tokens: got %r, want >= %s (a fall means the ground truth "
+                "stopped reading part of the source, which recall cannot see)"
+                % (got, exp["n_source_tokens_min"]))
     if "coverage_gate" in exp:
         cov = rep.get("structure", {}).get("coverage", {})
         c.eq(cov.get("gate"), exp["coverage_gate"], "structure.coverage.gate")
@@ -225,6 +243,19 @@ def check_bundle(rel, exp, bundles_dir):
         c.eq(fid.get("gate"), exp["structure_fidelity_gate"], "structure_fidelity.gate")
         if fid.get("deltas"):
             c.check(False, "structure_fidelity.deltas: %r" % (fid["deltas"],))
+    if "structure_fidelity_compared_min" in exp:
+        # A FLOOR ON THE COVERAGE, because `gate: "pass"` alone is not a
+        # measurement. `compared` counts the facts that observed something on this
+        # document, so a ground truth that quietly stopped supplying half its facts
+        # would still read `pass` with nothing to compare — the same vacuous-verdict
+        # shape `n_source_tokens_min` closes on the losslessness side. Pinning the
+        # measured number per document makes a fall a failure.
+        got = (rep.get("structure_fidelity") or {}).get("compared")
+        want = exp["structure_fidelity_compared_min"]
+        c.check(isinstance(got, int) and got >= want,
+                "structure_fidelity.compared: got %r, want >= %s (a fall means the "
+                "ground truth stopped supplying facts, which `gate` cannot show)"
+                % (got, want))
     if "images_gate" in exp:
         c.eq(rep.get("images", {}).get("gate"), exp["images_gate"], "images.gate")
     if "images_referenced" in exp:

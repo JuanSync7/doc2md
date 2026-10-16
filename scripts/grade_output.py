@@ -62,10 +62,33 @@ def build_corpus(src):
     if not os.path.isdir(src):
         os.makedirs(src)
     built = []
+    # THE DOCUMENTS UNDER GRADE, and the list is a claim about coverage.
+    #
+    # It held three files, all `.docx`, which is how the office lane's largest gap
+    # stayed invisible for so long: row A1 reported `structure_fidelity.gate == pass
+    # on 3 of 3 office bundles (0 unmeasured)` while five real bundles — every deck
+    # and every workbook — were `unmeasured`. The row's own safety valve (FAIL when
+    # EVERY bundle is unmeasured, and always print the count) is honest code that
+    # could never execute, because the only documents able to trip it were never
+    # built. An instrument that cannot see a format cannot report on it.
+    #
+    # A format joins this list when it has a second implementation to grade it
+    # against, so the row's numbers move as the coverage really does. Two decks
+    # joined in P9.6 — an ordinary one and the adversarial one — and row A1 now
+    # reports per FORMAT rather than as one total, because a single count let the
+    # deck lane sit at `unmeasured` for as long as one docx was measured.
     for name, builder in (("kestrel-clock-spec.docx", g.build_spec_docx),
                           ("kestrel-readme.docx", g.build_minimal_docx),
                           ("kestrel-adversarial.docx",
-                           getattr(g, "build_adversarial_docx", None))):
+                           getattr(g, "build_adversarial_docx", None)),
+                          ("kestrel-registers.xlsx",
+                           getattr(g, "build_registers_xlsx", None)),
+                          ("kestrel-adversarial.xlsx",
+                           getattr(g, "build_adversarial_xlsx", None)),
+                          ("kestrel-overview.pptx",
+                           getattr(g, "build_overview_pptx", None)),
+                          ("kestrel-adversarial.pptx",
+                           getattr(g, "build_adversarial_pptx", None))):
         if builder is None:
             print("note: gen_corpus has no build_adversarial_docx yet — the rows "
                   "that need it will report FAIL, which is the truth", file=sys.stderr)
