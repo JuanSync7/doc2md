@@ -50,7 +50,12 @@ FULL_REPLY = [
     ("keywords", ["ddr"]),
     ("topics", ["platform_engineering"]),
     ("audience", ["platform_engineering"]),
-    ("entities", {"hosts": [{"name": "ddr-node-1", "ref": REF}]}),
+    # `arbiter` and `ddr-phy` are DECLARED, because a relation's endpoints must name
+    # entities this same payload declares — an edge to a phrase nobody declared is an
+    # edge to nowhere and is dropped as `endpoint-not-an-entity`.
+    ("entities", {"hosts": [{"name": "ddr-node-1", "ref": REF},
+                            {"name": "ddr-phy", "ref": REF}],
+                  "software": [{"name": "arbiter", "ref": REF}]}),
     ("relations", [{"s": "arbiter", "p": "requires", "o": "ddr-phy",
                     "mode": "silent", "ref": REF}]),
     ("decisions", [{"id": "d1", "status": "accepted", "text": "Round robin.",
@@ -781,6 +786,7 @@ def test_a_v1_bundle_migrates_to_the_two_file_layout_with_no_model_and_no_loss(
         ("schema_version", 1), ("vocab_version", 1),
         ("id", "old-doc"), ("title", "Old Doc"), ("type", "runbook"),
         ("entities", {"software": [{"name": "legacy-agent", "type": "Software"}]}),
+        ("entities", {"hosts": [{"name": "legacy-agent"}, {"name": "host-1"}]}),
         ("relations", [{"s": "legacy-agent", "p": "runs_on", "o": "host-1"}]),
         ("decisions", [{"id": "d1", "status": "accepted", "text": "Keep it."}]),
         ("extraction", OrderedDict([("run_at", "OLD"),

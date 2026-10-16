@@ -6,7 +6,8 @@ summary: Source-text ingestion — doc ids, backend selection (docling/native), 
 """
 # Callers import FROM HERE, never from the private submodules. Keep __all__ tight.
 from ._ids import doc_id
-from ._markdown import markdown_to_text, collapse_table_padding
+from ._markdown import (markdown_to_text, collapse_table_padding,
+                        normalize_pdf_markdown)
 from ._source import SourceText, select_source
 from ._config import (IngestConfig, load_ingest_config, VALID_BACKENDS, recommend_shards,
                       load_source_root)
@@ -18,12 +19,14 @@ from ._figures import (gate_figures, caption_is_useful, caption_type_is_furnitur
                        figure_outcome, figure_coverage, FigureCoverage,
                        FIG_CAPTURED, FIG_NO_CAPTION, FIG_GATED_TINY, FIG_GATED_DENY,
                        FIG_GATED_CHROME, FIG_GATED_DUP, FIG_GATED_OTHER,
-                       FIG_LOST_BADCROP, FIG_LOST_BAIL)
+                       FIG_LOST_BADCROP, FIG_LOST_BAIL, caption_recovery)
 from ._imageprobe import sniff_image_format, image_dimensions, IMAGE_EXTS
 from ._media import resolve_media_refs, is_body_part
-from ._coverage import (tokenize, coverage, CoverageReport, is_lossy, is_lossy_explained,
+from ._coverage import (tokenize, normalize_pdf_text, coverage, CoverageReport,
+                        is_lossy, is_lossy_explained,
                         char_ngram_recall, html_to_text, strip_running_lines, words_in_bbox,
-                        explain_gap, GapReport, merge_boxes)
+                        explain_gap, GapReport, merge_boxes,
+                        intersect_boxes, drawn_image_floor)
 from ._provenance import core_properties, pdf_info_meta, front_matter
 from ._yamlblock import (YamlSubsetError, render_block, render_front_matter,
                          parse_block, split_front_matter)
@@ -55,6 +58,7 @@ from ._recovery import (classify_failure, recovery_action,
 
 __all__ = [
     "tokenize",
+    "normalize_pdf_text",
     "coverage",
     "CoverageReport",
     "is_lossy",
@@ -64,6 +68,8 @@ __all__ = [
     "explain_gap",
     "GapReport",
     "merge_boxes",
+    "intersect_boxes",
+    "drawn_image_floor",
     "strip_running_lines",
     "words_in_bbox",
     "core_properties",
@@ -115,6 +121,7 @@ __all__ = [
     "OOXML_MAIN_PARTS",
     "doc_id",
     "markdown_to_text",
+    "normalize_pdf_markdown",
     "collapse_table_padding",
     "SourceText",
     "select_source",
@@ -125,6 +132,7 @@ __all__ = [
     "recommend_shards",
     "gate_figures",
     "caption_is_useful",
+    "caption_recovery",
     "caption_type_is_furniture",
     "caption_cache_key",
     "cache_last_wins",

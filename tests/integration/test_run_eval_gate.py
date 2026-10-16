@@ -194,3 +194,236 @@ def test_a_document_that_was_never_generated_is_skipped_not_expected_to_fail(
     assert "\nSKIP" in out and "scan-tools-unavailable" in out
     assert "XFAIL" not in out
     assert rc == 0
+
+
+# ============================== the gap block is CHECKED, not merely published
+#
+# `explain_gap` was built, exported from `backend.ingest`, covered by its own unit
+# tests — and called by nothing, for two milestones. A field nobody reads is the same
+# shape: the report would carry `absent: 0` and no expectation would notice the day it
+# stopped being 0. `gap_absent_max` is the probe that makes it a measurement.
+
+def _gap_harness(tmp_path, absent, with_block=True):
+    """A bundle on disk whose report carries (or omits) a gap block."""
+    import os
+    bundles = tmp_path / "bundles"
+    d = bundles / "deadbeefdeadbeef"
+    os.makedirs(str(d))
+    loss = {"method": "pdf-text-coverage", "gate": "best-effort",
+            "token_recall": 0.99}
+    if with_block:
+        loss["gap"] = {"n_source": 100, "covered": 100 - absent, "fused": 0,
+                       "numeric": 0, "image_text": 0, "residual_boiler": 0,
+                       "short": 0, "absent": absent}
+    with open(str(d / "report.json"), "w", encoding="utf-8") as fh:
+        json.dump({"doc_id": "deadbeefdeadbeef", "lane": "pdf",
+                   "source_relpath": "pdf/x.pdf", "status": "ok",
+                   "losslessness": loss, "warnings": []}, fh)
+    return bundles
+
+
+def test_an_unexplained_gap_over_the_ceiling_fails(tmp_path, capsys):
+    from backend.ingest import doc_id
+    rel = "pdf/x.pdf"
+    exp = {rel: {"kind": "bundle", "lane": "pdf", "gap_absent_max": 0}}
+    args = _harness(tmp_path, exp)
+    bundles = _gap_harness(tmp_path, absent=7)
+    os.rename(str(bundles / "deadbeefdeadbeef"), str(bundles / doc_id(rel)))
+    rc = _run_eval().main(args)
+    out = capsys.readouterr().out
+    assert "gap.absent" in out and "1 fail" in out
+    assert rc == 1
+
+
+def test_a_fully_explained_gap_passes(tmp_path, capsys):
+    """Recall below 1.0 with `absent: 0` is a document whose whole shortfall is page
+    numbers and running furniture — nothing for a person to chase."""
+    from backend.ingest import doc_id
+    rel = "pdf/x.pdf"
+    exp = {rel: {"kind": "bundle", "lane": "pdf", "gap_absent_max": 0}}
+    args = _harness(tmp_path, exp)
+    bundles = _gap_harness(tmp_path, absent=0)
+    os.rename(str(bundles / "deadbeefdeadbeef"), str(bundles / doc_id(rel)))
+    rc = _run_eval().main(args)
+    out = capsys.readouterr().out
+    assert "0 fail" in out, out
+    assert rc == 0
+
+
+def test_asking_about_a_gap_a_report_does_not_carry_is_a_failure(tmp_path, capsys):
+    """The vacuity guard. An OCR-path report has no gap block at all — there is no
+    independent text layer to decompose — so an expectation asking about one is
+    mis-set, and answering it with silence would be the passing-over-nothing this
+    harness exists to refuse."""
+    from backend.ingest import doc_id
+    rel = "pdf/x.pdf"
+    exp = {rel: {"kind": "bundle", "lane": "pdf", "gap_absent_max": 0}}
+    args = _harness(tmp_path, exp)
+    bundles = _gap_harness(tmp_path, absent=0, with_block=False)
+    os.rename(str(bundles / "deadbeefdeadbeef"), str(bundles / doc_id(rel)))
+    rc = _run_eval().main(args)
+    out = capsys.readouterr().out
+    assert "gap" in out and "1 fail" in out
+    assert rc == 1
+
+
+# ================================ the figure-text debt, gated (roadmap M1)
+#
+# `figure_text_tokens` is the one loss class the TEXT gates cannot recover: words
+# the PDF holds inside a figure region, excluded from the body ground truth because
+# they are figure content rather than lost body text. It is the number the VLM
+# caption stage exists to burn down — and until `office/kestrel-clocktree.pptx`
+# landed it was 0 on every document in the corpus, because every corpus figure was a
+# decorative colour grid.
+#
+# A debt that is published but never asserted is a debt nobody notices paying off,
+# or quietly growing. So it gets a probe, with the same two-sided argument the gap
+# ceiling uses: a MISSING field is a failure, never a silent pass.
+
+def _figtext_harness(tmp_path, tokens, with_field=True):
+    """A bundle whose report carries (or omits) figure_text_tokens."""
+    import os
+    bundles = tmp_path / "bundles"
+    d = bundles / "deadbeefdeadbeef"
+    os.makedirs(str(d))
+    loss = {"method": "pdf-text-coverage", "gate": "best-effort", "token_recall": 1.0}
+    if with_field:
+        loss["figure_text_tokens"] = tokens
+    with open(str(d / "report.json"), "w", encoding="utf-8") as fh:
+        json.dump({"doc_id": "deadbeefdeadbeef", "lane": "pdf",
+                   "source_relpath": "pdf/x.pdf", "status": "ok",
+                   "losslessness": loss, "warnings": []}, fh)
+    return bundles
+
+
+def _place(tmp_path, bundles, rel):
+    from backend.ingest import doc_id
+    os.rename(str(bundles / "deadbeefdeadbeef"), str(bundles / doc_id(rel)))
+
+
+def test_a_figure_text_debt_at_or_above_the_floor_passes(tmp_path, capsys):
+    rel = "pdf/x.pdf"
+    args = _harness(tmp_path, {rel: {"kind": "bundle", "lane": "pdf",
+                                     "figure_text_tokens_min": 19}})
+    _place(tmp_path, _figtext_harness(tmp_path, 19), rel)
+    assert _run_eval().main(args) == 0
+
+
+def test_a_figure_text_debt_that_fell_below_the_floor_fails(tmp_path, capsys):
+    """A FALL is the interesting direction, which is why this is a floor and not a
+    ceiling. These tokens are recovered by an independent text-layer probe, so the
+    count dropping means the probe stopped seeing a figure it used to see — the
+    exclusion silently narrowed and those words are now being judged as body text
+    the converter lost. Nothing else in the report would say so."""
+    rel = "pdf/x.pdf"
+    args = _harness(tmp_path, {rel: {"kind": "bundle", "lane": "pdf",
+                                     "figure_text_tokens_min": 19}})
+    _place(tmp_path, _figtext_harness(tmp_path, 4), rel)
+    rc = _run_eval().main(args)
+    out = capsys.readouterr().out
+    assert rc != 0 and "figure_text_tokens" in out
+
+
+def test_asking_about_a_figure_debt_the_report_does_not_carry_is_a_failure(
+        tmp_path, capsys):
+    """The OCR path publishes no figure-text count at all — there is no independent
+    text layer to recover one from. An expectation asking about it there is mis-set,
+    and answering a mis-set question with silence is the passing-over-nothing this
+    harness exists to refuse."""
+    rel = "pdf/x.pdf"
+    args = _harness(tmp_path, {rel: {"kind": "bundle", "lane": "pdf",
+                                     "figure_text_tokens_min": 1}})
+    _place(tmp_path, _figtext_harness(tmp_path, 0, with_field=False), rel)
+    rc = _run_eval().main(args)
+    assert rc != 0 and "figure_text_tokens" in capsys.readouterr().out
+
+
+# ================================ a skipped LANE reads like a passing one
+#
+# Reproduced with soffice off the PATH: every derived legacy document is marked
+# `{"kind": "skipped", "reason": "libreoffice-unavailable"}` by the generator,
+# run_eval renders five SKIP rows, the census prints `18 pass, 0 fail, 9 skip`, and
+# the process exits 0. CI's eval-office job installs LibreOffice from an unpinned
+# apt and never asserts it arrived — so the day that install breaks, the entire
+# legacy lane vanishes and the job stays green.
+#
+# It is the same shape this repo already refuses three times over (the CommonMark
+# differential, the red-direction suite, the Pillow-only branches): a skip reads
+# exactly like a pass. The difference is that those are asserted in the WORKFLOW
+# with grep, which only works for a suite whose skip count is known; a lane needs
+# the harness itself to know which lanes were supposed to run.
+
+def _lane_harness(tmp_path, rels, reason="libreoffice-unavailable"):
+    """A corpus manifest that marks every named document as not generated."""
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    files = dict((rel, {"kind": "skipped", "reason": reason}) for rel in rels)
+    with open(str(corpus) + ".manifest.json", "w", encoding="utf-8") as fh:
+        json.dump({"files": files}, fh)
+    # `lane` is the CONVERTER lane and is deliberately NOT what --require keys on:
+    # a legacy/*.doc is converted by the office lane. --require names the corpus AREA.
+    exp = dict((rel, {"kind": "bundle", "lane": "office"}) for rel in rels)
+    exp_path = tmp_path / "expectations.json"
+    with open(str(exp_path), "w", encoding="utf-8") as fh:
+        json.dump(exp, fh)
+    return ["--no-lanes", "--corpus", str(corpus),
+            "--bundles", str(tmp_path / "bundles"),
+            "--expectations", str(exp_path), "--skip-pdf"]
+
+
+def test_a_skipped_lane_still_exits_zero_without_the_guard(tmp_path, capsys):
+    """The behaviour being fixed, pinned so the fix is visibly a change."""
+    args = _lane_harness(tmp_path, ["legacy/a.doc", "legacy/b.rtf"])
+    assert _run_eval().main(args) == 0
+    assert "2 skip" in capsys.readouterr().out
+
+
+def test_a_required_lane_that_did_not_run_fails(tmp_path, capsys):
+    args = _lane_harness(tmp_path, ["legacy/a.doc", "legacy/b.rtf"])
+    rc = _run_eval().main(args + ["--require", "legacy"])
+    out = capsys.readouterr().out
+    assert rc != 0
+    assert "legacy" in out and "required" in out.lower()
+
+
+def test_a_lane_that_is_not_required_may_still_skip(tmp_path, capsys):
+    """The guard must name what it needs, not forbid skipping in general — the PDF
+    lane legitimately does not run on a host with no 3.12 interpreter, and that is
+    the whole reason SKIP exists as a verdict. Here `pdf` is required and healthy
+    while `legacy` skips, and the run passes."""
+    from backend.ingest import doc_id
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    with open(str(corpus) + ".manifest.json", "w", encoding="utf-8") as fh:
+        json.dump({"files": {"legacy/a.doc": {"kind": "skipped",
+                                              "reason": "libreoffice-unavailable"}}}, fh)
+    exp = {"legacy/a.doc": {"kind": "bundle", "lane": "office"},
+           "pdf/x.pdf": {"kind": "bundle", "lane": "pdf", "gap_absent_max": 0}}
+    exp_path = tmp_path / "expectations.json"
+    with open(str(exp_path), "w", encoding="utf-8") as fh:
+        json.dump(exp, fh)
+    bundles = _gap_harness(tmp_path, absent=0)
+    os.rename(str(bundles / "deadbeefdeadbeef"), str(bundles / doc_id("pdf/x.pdf")))
+    args = ["--no-lanes", "--corpus", str(corpus), "--bundles", str(bundles),
+            "--expectations", str(exp_path), "--skip-pdf"]
+    assert _run_eval().main(args + ["--require", "pdf"]) == 0
+
+
+def test_requiring_a_lane_that_ran_is_silent(tmp_path, capsys):
+    """No document skipped in a required lane means nothing to say. A guard that
+    printed on success would train a reader to ignore it."""
+    rel = "pdf/x.pdf"
+    args = _harness(tmp_path, {rel: {"kind": "bundle", "lane": "pdf",
+                                     "gap_absent_max": 0}})
+    _place(tmp_path, _gap_harness(tmp_path, absent=0), rel)
+    rc = _run_eval().main(args + ["--require", "pdf"])
+    assert rc == 0 and "required" not in capsys.readouterr().out.lower()
+
+
+def test_requiring_a_lane_no_expectation_mentions_is_itself_a_failure(tmp_path, capsys):
+    """A typo in --require must not read as "that lane is fine". `--require legcy`
+    would otherwise pass forever over a lane nobody is checking, which is the same
+    class of bug as a typo'd expectation key."""
+    args = _lane_harness(tmp_path, ["legacy/a.doc"])
+    rc = _run_eval().main(args + ["--require", "legcy"])
+    assert rc != 0 and "legcy" in capsys.readouterr().out

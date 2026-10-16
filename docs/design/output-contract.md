@@ -444,9 +444,11 @@ captioning stage runs.
   "vocab_version": 2,
   "markdown_sha256": "…",
 
-  "entities":       { "hosts": [ … ], "software": [ … ] },
+  "entities":       { "hosts": [ { "name": "ddr-phy", "ref": "#system-design" }, … ],
+                      "software": [ { "name": "arbiter", "ref": "#system-design" }, … ] },
   "relations":      [ { "s": "arbiter", "p": "requires", "o": "ddr-phy",
                         "ref": "#system-design" } ],   // `ref` is REQUIRED from v3
+                                                       // `s`/`o` must be DECLARED entities
   "decisions":      [ … ],
   "risks":          [ … ],
   "open_questions": [ … ],
@@ -454,6 +456,16 @@ captioning stage runs.
   "_provenance":    { "relations": { "source": "generated", "value_sha": "…", … } }
 }
 ```
+
+**Every edge connects two declared nodes.** A relation's `s` and `o` must each name
+an entity the same document declares under `entities` — spelling is normalised, so
+casing and separators do not matter. An endpoint naming a phrase rather than a node
+is an edge to nowhere: it reads as a triple and is invisible as a graph, because
+nothing will ever link to it. `accept_model_meta` drops such a record as
+`endpoint-not-an-entity`. Measured before the rule existed, on a real model answer
+over the real bundles, 10 of 54 endpoints (19%) resolved and the rest pointed at
+prose like `"safe default gating state"`. If the thing at the end of an edge
+matters, declare it as an entity too.
 
 **Every record cites the section that asserts it.** From schema v3 a `relations`
 entry requires `s`, `p`, `o` **and** `ref` — a `#fragment` naming a heading anchor

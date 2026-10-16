@@ -286,6 +286,62 @@ _IMG_MD = re.compile(r"!\[[^\]]*\]\([^)\s]+")
 _LINK_MD = re.compile(r"(?<![!\\])\[[^\]]*\]\([^)\s]+")
 
 
+_FRONTMATTER = re.compile(r"\A---\r?\n.*?\r?\n---[ \t]*\r?\n", re.S)
+
+
+def token_split(document_md, token_count=None):
+    # type: (str, object) -> dict
+    """Where a published document's tokens actually GO: front matter, prose, markup.
+
+    The charter's Job 1 is a document that loses nothing "without all the extra
+    values that cause token bloat". Half that sentence had no metric at all — the
+    word "bloat" appeared nowhere in the charter, the roadmap, the quality plan or
+    the rubric — and you cannot ratchet what you do not measure.
+
+    Measured with a real subword tokenizer over the 21-document corpus, the answer
+    was not the markdown syntax anyone would have guessed:
+
+        front matter 39.4%    prose 45.3%    body markup 15.3%
+
+    On `pdf/kestrel-dataflow.pdf`, 241 tokens of front matter wrap 19 tokens of
+    content. Eleven of twenty-one documents are more than half front matter, and the
+    two sha256 hex strings alone are 101 tokens per document. That is the number a
+    consumer embedding `document.md` wholesale pays on every query.
+
+    The parts PARTITION the file, so a reader can subtract:
+        frontmatter + body == total        prose + markup == body
+
+    ``markup`` is a RESIDUAL on purpose — body tokens minus the tokens of the body
+    rendered to text. It therefore counts every syntax character (pipes, hashes,
+    brackets, escapes, sentinels) without anyone maintaining a list of what markup
+    is, which would go stale the moment a converter emitted something new.
+
+    ``method`` names the counter. Without a tokenizer this is a ~4-chars/token
+    estimate, and on this corpus that estimate is wrong by -52.9% to +11.8% against
+    a real subword tokenizer — a number that wrong has to say what it is.
+    """
+    text = document_md or ""
+    count = token_count if token_count is not None else (
+        lambda s: sum((len(ln) + 3) // 4 for ln in s.split("\n")) if s else 0)
+    m = _FRONTMATTER.match(text)
+    head, body = (text[:m.end()], text[m.end():]) if m else ("", text)
+    n_head, n_body = count(head), count(body)
+    n_prose = count(markdown_to_text(body))
+    total = n_head + n_body
+    out = OrderedDict()
+    out["method"] = "supplied" if token_count is not None else "char-estimate/4"
+    out["total"] = total
+    out["frontmatter"] = n_head
+    out["body"] = n_body
+    out["prose"] = n_prose
+    # Clamped at zero: `markdown_to_text` can in principle expand a construct (a
+    # link whose text is longer than its target), and a negative "markup" would be
+    # a number nobody could read.
+    out["markup"] = max(0, n_body - n_prose)
+    out["frontmatter_ratio"] = round(n_head / float(total), 4) if total else 0.0
+    return out
+
+
 def _content_metrics(md, token_count=None):
     # type: (str, object) -> dict
     """Pure structural counts over ``md`` (fenced code excluded from prose rules).
@@ -563,8 +619,8 @@ def build_report(source_text, md, lane="office", losslessness=None,
 
 
 def image_report(referenced, extracted, unique_files, missing, orphans, verified,
-                 orphans_removed=0):
-    # type: (int, int, int, int, int, int, int) -> dict
+                 orphans_removed=0, source_images=None):
+    # type: (int, int, int, int, int, int, int, int) -> dict
     """The deterministic image-extraction integrity block for ``report.json``.
 
     This is the office text gate's twin, for pixels. Body images are HTML-comment
@@ -588,12 +644,34 @@ def image_report(referenced, extracted, unique_files, missing, orphans, verified
       * ``verified``     — files whose on-disk ``sha256[:16]`` matches their filename
         (content-addressed integrity: the bytes actually landed intact)
 
+      * ``source_images`` — how many body pictures the SOURCE is known to hold,
+        counted converter-blind, or ``None`` when this lane has no way to count
+        them. THE DENOMINATOR, and it is the same fix `n_source_tokens` was for the
+        text gate: without it the block can only compare the markdown against
+        itself, so it cannot tell "every image came through" from "nobody looked
+        for one". Found on `pdf/kestrel-dataflow.pdf` — a page that is entirely a
+        vector diagram converted to 19 tokens and zero images, and this block read
+        `gate: pass` because no reference was made, so no reference failed.
+
     ``gate`` is ``pass`` iff nothing is missing, no orphan files remain, every body
-    reference resolved, AND every expected file is present and content-verified;
-    otherwise ``degraded``. A non-pass here DEGRADES the document status but never
-    fails the losslessness gate — the text is still whole."""
+    reference resolved, every expected file is present and content-verified, AND at
+    least as many pictures arrived as the source is known to hold. An EXCESS is not
+    loss — one source picture can be referenced twice and dedupe to one file — so
+    only a shortfall counts.
+
+    With ``source_images`` unknown the gate reads ``unmeasured`` rather than
+    ``pass`` when there is nothing to judge: the same word the fidelity gate uses,
+    for the same reason, and like that one it does not degrade the document — it
+    says nobody could tell. A real defect (missing bytes, a surviving orphan) is
+    still ``degraded`` whether or not the denominator is known, because that part
+    was never about the denominator.
+
+    A non-pass here DEGRADES the document status but never fails the losslessness
+    gate — the text is still whole."""
     intact = (missing == 0 and orphans == 0 and extracted == referenced
               and verified == unique_files)
+    if intact and source_images is not None and referenced < source_images:
+        intact = False
     b = OrderedDict()
     b["referenced"] = referenced
     b["unique_files"] = unique_files
@@ -602,7 +680,15 @@ def image_report(referenced, extracted, unique_files, missing, orphans, verified
     b["orphans"] = orphans
     b["orphans_removed"] = orphans_removed
     b["verified"] = verified
-    b["gate"] = "pass" if intact else "degraded"
+    b["source_images"] = source_images
+    if not intact:
+        b["gate"] = "degraded"
+    elif source_images is None and referenced == 0 and unique_files == 0:
+        # Nothing arrived and nothing counted what should have: there is no claim to
+        # make here, and `pass` would be one.
+        b["gate"] = "unmeasured"
+    else:
+        b["gate"] = "pass"
     return b
 
 
