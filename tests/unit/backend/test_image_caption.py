@@ -7,8 +7,11 @@ summary: Outcome classification, prepare/probe, content-addressed cache, and cap
 import importlib.util
 import os
 import struct
+import zlib
 
 import pytest
+
+from pngsupport import have_pil, real_png
 
 pytestmark = pytest.mark.unit
 
@@ -24,8 +27,22 @@ def _mod():
 
 
 def _png(w=8, h=8):
-    ihdr = struct.pack(">II", w, h) + b"\x08\x06\x00\x00\x00"
-    return b"\x89PNG\r\n\x1a\n" + struct.pack(">I", 13) + b"IHDR" + ihdr + b"\x00" * 4
+    """A REAL, decodable PNG — see tests/pngsupport for why this matters."""
+    return real_png(w, h)
+
+
+def _no_pil(monkeypatch, m):
+    """Force the NO-PIL branch regardless of what is installed here.
+
+    `prepare_png` behaves differently with and without Pillow — deliberately: it
+    cannot truly decode, and it cannot downscale, so it is conservative instead. Both
+    branches are real and shipped, so both are tested explicitly rather than
+    whichever one this machine happens to select."""
+    monkeypatch.setattr(m, "_decodes", lambda b: None)     # "cannot tell"
+    monkeypatch.setattr(m, "_downscale", lambda b, px: None)
+
+
+_have_pil = have_pil
 
 
 class _Client(object):
@@ -90,11 +107,49 @@ def test_prepare_metafile_with_renderer():
     assert err is None and png[:8] == b"\x89PNG\r\n\x1a\n"
 
 
-def test_prepare_too_large_without_pil():
+def test_prepare_too_large_when_it_cannot_downscale():
+    """Without Pillow there is no way to shrink an oversized image, so the honest
+    answer is TOO_LARGE rather than risking a 413 or an OOM on the VLM server. The
+    no-PIL branch is FORCED here — this test used to be named "without_pil" and
+    simply assumed the host had none."""
     m = _mod()
-    big = _png() + b"\x00" * 5000
-    _, err = m.prepare_png(big, "png", max_bytes=1000)   # no PIL on host -> can't downscale
+    with pytest.MonkeyPatch().context() as mp:
+        _no_pil(mp, m)
+        big = _png() + b"\x00" * 5000
+        _, err = m.prepare_png(big, "png", max_bytes=1000)
     assert err == m.TOO_LARGE
+
+
+@pytest.mark.skipif(not _have_pil(), reason="Pillow not installed in this environment")
+def test_prepare_downscales_an_oversized_image_when_pil_is_present():
+    """The OTHER branch, which no test covered: with Pillow the oversized image is
+    downscaled and passes rather than being refused. Untested, this path could have
+    been broken for any length of time on every machine that has Pillow — which is
+    every machine that actually runs captioning."""
+    m = _mod()
+    big = _png(400, 400)
+    png, err = m.prepare_png(big, "png", max_bytes=len(big) - 1, max_pixels=1024)
+    assert err is None and png[:8] == b"\x89PNG\r\n\x1a\n" and len(png) < len(big)
+
+
+@pytest.mark.skipif(not _have_pil(), reason="Pillow not installed in this environment")
+def test_corrupt_bytes_behind_a_valid_header_are_terminal_when_pil_is_present():
+    """The reason `_decodes` exists: a magic-byte sniff alone passes corrupt-but-headed
+    bytes to the VLM, where they fail as a transport error and stick PENDING forever.
+    With Pillow the failure is caught here and made terminal."""
+    m = _mod()
+    _, err = m.prepare_png(b"\x89PNG\r\n\x1a\n" + b"\x00" * 64, "png", max_bytes=10_000_000)
+    assert err == m.UNDECODABLE
+
+
+def test_the_png_helper_builds_bytes_a_real_decoder_accepts():
+    """The guard that keeps this file environment-independent. If `_png` ever goes
+    back to emitting a stub, this fails on any machine with Pillow instead of
+    twenty other tests failing for a reason that looks like a product bug."""
+    if not _have_pil():
+        pytest.skip("Pillow not installed in this environment")
+    m = _mod()
+    assert m._decodes(_png()) is True
 
 
 # --- CaptionCache -----------------------------------------------------------

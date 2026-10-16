@@ -1855,6 +1855,49 @@ def build_adversarial_pptx(path):
                   defaults=(("png", "image/png"), ("svg", "image/svg+xml")))
 
 
+def _clocktree_shapes():
+    # type: () -> list
+    """A DENSE diagram: twelve adjacent labelled boxes forming one block.
+
+    Adjacency is the whole point and it is measured, not guessed. `_pdf_drawn_boxes`
+    merges overlapping drawing objects and keeps a cluster only at
+    ``image_region_min_paths`` (10) or more — correctly, because a two-path cluster
+    must never be allowed to EXCUSE text sitting over it. The dataflow deck's five
+    boxes are far apart, so each stays a two-path cluster and every one is rejected;
+    packed edge to edge, these twelve merge into ONE cluster of twenty-four paths
+    that clears the threshold.
+
+    That is what makes this the first fixture in the corpus with a real
+    ``figure_text_tokens`` debt: the labels live in the PDF's TEXT LAYER, inside a
+    region both detectors agree is a figure, so they are recovered by
+    `_image_region_text`, excluded from the body ground truth as figure content, and
+    counted as the debt the caption stage exists to burn down. Measured end to end:
+    19 tokens, gap.image_text 19, absent 0.
+    """
+    labels = ["clk ref", "pll core", "lock mon", "divider",
+              "gate ctl", "spine", "leaf a", "leaf b",
+              "leaf c", "arbiter", "xbar", "mailbox"]
+    w, h, x0, y0 = 1200000, 500000, 900000, 1200000
+    shapes = []
+    for i, label in enumerate(labels):
+        col, row = i % 4, i // 4
+        shapes.append(_sp(10 + i, "cell%d" % i, [(0, label)],
+                          pos=(x0 + col * w, y0 + row * h, w, h), fill="4F81BD"))
+    return shapes
+
+
+def build_clocktree_pptx(path):
+    # type: (str) -> None
+    """Single slide holding one dense labelled diagram and nothing else.
+
+    The office lane must read all twelve labels as ordinary text (they are shape
+    text, not pixels); the PDF derived from it must read them as FIGURE text. Same
+    words, two lanes, two correct-but-different answers — which is the pair that
+    makes `figure_text_tokens` falsifiable."""
+    _pptx_package(path, [_slide("".join(_clocktree_shapes()))], {},
+                  "Kestrel clock tree diagram", "clock-tree")
+
+
 def build_dataflow_pptx(path):
     # type: (str) -> None
     """Shapes-only single slide: source for the diagram-only PDF edge case."""
@@ -2031,6 +2074,69 @@ def make_scanned_pdf(digital_pdf, dest):
 
 # ------------------------------------------------------------------- generator
 
+def build_ligature_docx(path):
+    # type: (str) -> None
+    """Prose engineered to stress the PDF lane's CHARACTER layer, not its structure.
+
+    Three defects live in this one page, and the office lane must be blind to all
+    of them while the PDF lane measures each:
+
+      * literal LIGATURE glyphs (U+FB01/FB00/FB02). The shared tokenizer is
+        `[a-z0-9]+`, so a ligature is not merely mismatched but INVISIBLE: without
+        `normalize_pdf_text` the source word arrives as two fragments and both are
+        counted as lost. Measured through the real toolchain, the fold turns
+        `con\ufb01dential` and `\ufb02ow` back into matches.
+      * a SOFT HYPHEN inside a word. Poppler renders it as a space, so a word the
+        document holds as one token arrives as two.
+      * long words that a line-breaking engine may hyphenate, so the `fused` bucket
+        has something real to explain rather than being asserted on a synthetic
+        string.
+
+    Deliberately NOT engineered to make the toolchain ligate on its own:
+    LibreOffice does not, measured, so a fixture that relied on that would pin a
+    behaviour this corpus cannot reproduce. The literal glyphs are the part that
+    is deterministic on any host."""
+    p1 = ("The con\ufb01guration \ufb01eld con\ufb01rms the classi\ufb01cation of "
+          "every \ufb01xed o\ufb00set before the \ufb01nal bu\ufb00er \ufb02ushes. "
+          "E\ufb03cient a\ufb03nity pro\ufb01ling \ufb01nds the di\ufb03cult "
+          "o\ufb00sets \ufb01rst.")
+    p2 = ("Nimbus marks the strap con\ufb01dential; the o\ufb00set and the \ufb02ow "
+          "controller share one reset domain. A soft hyphen splits this word: "
+          "hyphen\u00adation, and the reader never sees it.")
+    p3 = ("Interoperability characterisation demonstrates straightforward "
+          "reconfigurability across the Kestrel instrumentation subsystem, "
+          "notwithstanding the counterintuitive misconfiguration described above.")
+    body = (w_text_p("Kestrel character-layer stress notes", style="Heading1")
+            + w_text_p(p1) + w_text_p(p2) + w_text_p(p3))
+    document = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+                '<w:document %s %s><w:body>%s</w:body></w:document>'
+                % (_W, _R, body))
+    rels = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/'
+        'relationships"><Relationship Id="rId1" Type="http://schemas.'
+        'openxmlformats.org/officeDocument/2006/relationships/styles" '
+        'Target="styles.xml"/></Relationships>')
+    wp = "application/vnd.openxmlformats-officedocument.wordprocessingml"
+    ct = content_types(
+        [("/word/document.xml", wp + ".document.main+xml"),
+         ("/word/styles.xml", wp + ".styles+xml"),
+         ("/docProps/core.xml",
+          "application/vnd.openxmlformats-package.core-properties+xml"),
+         ("/docProps/app.xml",
+          "application/vnd.openxmlformats-officedocument.extended-properties+xml")])
+    write_zip(path, [
+        ("[Content_Types].xml", ct),
+        ("_rels/.rels", PKG_RELS % "word/document.xml"),
+        ("word/document.xml", document),
+        ("word/_rels/document.xml.rels", rels),
+        ("word/styles.xml", docx_styles()),
+        ("docProps/core.xml", core_xml("Kestrel character-layer stress notes",
+                                       "character-layer")),
+        ("docProps/app.xml", APP_XML),
+    ])
+
+
 HANDBUILT = [
     ("office/kestrel-clock-spec.docx", build_spec_docx),
     ("office/kestrel-readme.docx", build_minimal_docx),
@@ -2053,6 +2159,8 @@ HANDBUILT = [
     # heading. It has already earned its place — it found a real list-nesting
     # defect at token_recall 1.0 with zero structural errors.
     ("office/kestrel-adversarial.docx", build_adversarial_docx),
+    ("office/kestrel-ligature.docx", build_ligature_docx),
+    ("office/kestrel-clocktree.pptx", build_clocktree_pptx),
 ]
 
 # (source relpath, soffice target ext, dest relpath)
@@ -2064,6 +2172,8 @@ DERIVED_OFFICE = [
     ("office/kestrel-overview.pptx", "ppt", "legacy/kestrel-overview.ppt"),
     ("office/kestrel-clock-spec.docx", "pdf", "pdf/kestrel-clock-spec.pdf"),
     ("office/kestrel-dataflow.pptx", "pdf", "pdf/kestrel-dataflow.pdf"),
+    ("office/kestrel-ligature.docx", "pdf", "pdf/kestrel-ligature.pdf"),
+    ("office/kestrel-clocktree.pptx", "pdf", "pdf/kestrel-clocktree.pdf"),
 ]
 
 SCANNED_PDF = ("pdf/kestrel-clock-spec.pdf", "pdf/kestrel-clock-spec-scan.pdf")

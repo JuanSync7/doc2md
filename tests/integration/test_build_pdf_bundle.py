@@ -40,58 +40,62 @@ def test_plan_rows_have_stable_ids_and_ext(bpb):
     assert again[0]["id"] == rows[0]["id"]
 
 
-def test_losslessness_block_is_measured_and_never_a_pass_gate(bpb):
+def test_the_losslessness_adapter_delegates_to_the_validator(bpb):
+    """The policy itself now lives in `backend.validate.pdf_coverage_report` and is
+    unit-tested there — gate, buckets, denominators and all. What is left in the
+    script is an ADAPTER, so what this file owns is the WIRING: the same inputs must
+    reach the same verdict through it."""
     from backend.ingest import load_ingest_config
+    from backend.validate import pdf_coverage_report
     cfg = load_ingest_config()
-    src = "alpha beta gamma delta epsilon " * 40          # 200 tokens, > min_tokens
+    src = "alpha beta gamma delta epsilon " * 40           # 200 tokens > min_tokens
     md = "# T\n\n" + src
-    loss, real = bpb._pdf_losslessness(src, md, "", "", cfg)
-    assert loss["method"] == "pdf-text-coverage"
-    assert loss["token_recall"] == 1.0
-    assert loss["gate"] == "best-effort"                   # never "pass", even at 1.0
-    assert real is False and loss["missing_tokens"] == []
+    assert bpb._pdf_losslessness(src, md, "", "", cfg) == pdf_coverage_report(
+        src, md, "", "", cfg.header_footer_min_frac, cfg.min_recall,
+        cfg.min_tokens, cfg.content_min_recall)
 
 
-def test_losslessness_flags_real_content_loss(bpb):
+def test_the_adapter_maps_each_config_field_to_the_right_threshold(bpb):
+    """The refactor's own failure mode: four numbers in a row, and a swapped pair
+    would be invisible in every happy-path assertion — the validator cannot catch it
+    because by then the damage is already in the argument order. So each threshold
+    is moved ALONE to a value that changes the answer.
+
+    `min_tokens` is the readable one: the SAME half-lost document is real loss at a
+    50-token floor and too small to judge at a 500-token one."""
     from backend.ingest import load_ingest_config
+    kept, lost = "alpha beta gamma delta epsilon ", "zeta eta theta iota kappa "
+    src, md = (kept + lost) * 40, "# T\n\n" + kept * 40   # 400 tokens, half dropped
     cfg = load_ingest_config()
-    kept = "alpha beta gamma delta epsilon "
-    lost = "zeta eta theta iota kappa "
-    src = (kept + lost) * 40                               # half the content dropped
-    md = "# T\n\n" + kept * 40
-    loss, real = bpb._pdf_losslessness(src, md, "", "", cfg)
-    assert real is True                                     # explained-gap: BOTH low
-    assert loss["token_recall"] < cfg.min_recall
-    assert loss["missing_tokens"]                           # names what went missing
-    assert loss["gate"] == "best-effort"
 
+    class _Cfg(object):
+        def __init__(self, **kw):
+            for f in ("header_footer_min_frac", "min_recall", "min_tokens",
+                      "content_min_recall"):
+                setattr(self, f, kw.get(f, getattr(cfg, f)))
 
-def test_losslessness_excludes_furniture_and_image_text(bpb):
-    # Furniture (running headers) and figure-region text are NOT body loss: with the
-    # excludes supplied, the same "missing" tokens no longer count against recall.
-    from backend.ingest import load_ingest_config
-    cfg = load_ingest_config()
-    body = "alpha beta gamma delta epsilon " * 40
-    furniture = "CONFIDENTIAL page footer " * 10
-    src = body + furniture
-    md = "# T\n\n" + body
-    loss_blind, _ = bpb._pdf_losslessness(src, md, "", "", cfg)
-    loss_fair, real = bpb._pdf_losslessness(src, md, furniture, "", cfg)
-    assert loss_fair["token_recall"] > loss_blind["token_recall"]
-    assert loss_fair["token_recall"] == 1.0 and real is False
-
-
-def test_losslessness_surfaces_figure_text_debt(bpb):
-    # Text living inside figure regions is excluded from the body metric but must be
-    # VISIBLE: it is the one loss class only the VLM caption stage can recover.
-    from backend.ingest import load_ingest_config
-    cfg = load_ingest_config()
-    body = "alpha beta gamma delta epsilon " * 40
-    fig_text = "state machine IDLE ACTIVE RESET arrows"
-    loss, real = bpb._pdf_losslessness(body + fig_text, "# T\n\n" + body,
-                                       "", fig_text, cfg)
-    assert loss["figure_text_tokens"] == len(fig_text.split())
-    assert loss["token_recall"] == 1.0 and real is False   # excluded, not penalized
+    assert bpb._pdf_losslessness(src, md, "", "", cfg)[1] is True
+    # below the token floor -> the ratio means nothing, so no loss is claimed
+    assert bpb._pdf_losslessness(src, md, "", "", _Cfg(min_tokens=500))[1] is False
+    # a recall floor this document clears -> not loss by the token signal
+    assert bpb._pdf_losslessness(src, md, "", "", _Cfg(min_recall=0.4))[1] is False
+    # a content floor this document clears -> not loss by the second signal
+    assert bpb._pdf_losslessness(
+        src, md, "", "", _Cfg(content_min_recall=0.1))[1] is False
+    # The strip threshold reaches the GAP block rather than the verdict, so it needs
+    # a paged document to bite on: a footer on 4 of 10 pages survives the configured
+    # 0.5 and is BUCKETED as residual boilerplate; at 0.01 it is stripped before the
+    # buckets ever see it, and those tokens leave the denominator entirely.
+    paged = "\f".join("bodyline%d alpha beta gamma\n" % i
+                      + ("kestrel confidential footer\n" if i < 4 else "")
+                      for i in range(10))
+    paged_md = "# T\n\n" + "".join("bodyline%d alpha beta gamma\n" % i
+                                    for i in range(10))
+    at_cfg = bpb._pdf_losslessness(paged, paged_md, "", "", cfg)[0]["gap"]
+    aggressive = bpb._pdf_losslessness(
+        paged, paged_md, "", "", _Cfg(header_footer_min_frac=0.01))[0]["gap"]
+    assert at_cfg["residual_boiler"] == 12 and aggressive["residual_boiler"] == 0
+    assert aggressive["n_source"] < at_cfg["n_source"]
 
 
 def test_failure_report_is_lane_honest_and_failed(bpb):
@@ -181,97 +185,3 @@ def test_every_failure_branch_withdraws_the_bundle_the_last_run_published():
     bpb_mod = _mod("build_pdf_bundle")
     for helper in ("_withdraw_published", "_clear_withdrawn", "_announce_withdrawn"):
         assert hasattr(bpb_mod.bb, helper)
-
-
-# ================================ why recall is not 1.0 (roadmap M0, explain_gap)
-#
-# `token_recall: 0.97` is a number nobody can act on. It does not say whether three
-# words were re-hyphenated across a line break, or a running footer survived the
-# strip, or a whole paragraph is gone — and those need three different fixes, one of
-# which is not a fix at all. `explain_gap` decomposes the gap into buckets where each
-# missing occurrence is claimed by the FIRST bucket that can explain it, leaving
-# `absent` as the only one that is real, unexplained content loss.
-#
-# It was built, exported from `backend.ingest`, covered by its own unit tests — and
-# called by nothing. Every PDF report carried the bare number.
-
-def _cfg():
-    from backend.ingest import load_ingest_config
-    return load_ingest_config()
-
-
-def _buckets(loss):
-    g = loss["gap"]
-    return (g["covered"] + g["fused"] + g["numeric"] + g["image_text"]
-            + g["residual_boiler"] + g["short"] + g["absent"])
-
-
-def test_the_gap_block_accounts_for_every_source_token(bpb):
-    """The invariant that makes the buckets readable: they PARTITION the source, so
-    a reader can subtract. If they did not sum, a bucket could quietly absorb loss
-    and the block would be decoration."""
-    src = "alpha beta gamma delta epsilon " * 40
-    loss, _real = bpb._pdf_losslessness(src, "# T\n\n" + src, "", "", _cfg())
-    assert _buckets(loss) == loss["gap"]["n_source"]
-    assert loss["gap"]["absent"] == 0
-
-
-def test_the_gap_block_is_stated_even_when_nothing_is_missing(bpb):
-    """A stated zero is a claim about the document; an absent block is a claim about
-    nobody having looked. `absent: 0` is what makes a later non-zero readable."""
-    src = "alpha beta gamma delta epsilon " * 40
-    loss, _real = bpb._pdf_losslessness(src, "# T\n\n" + src, "", "", _cfg())
-    assert loss["gap"]["absent"] == 0 and loss["absent_top"] == []
-
-
-def test_real_loss_lands_in_absent_and_is_named(bpb):
-    """The bucket that matters. `absent_top` is what turns "0.50" into a sentence a
-    person can act on."""
-    kept, lost = "alpha beta gamma delta epsilon ", "zeta eta theta iota kappa "
-    src = (kept + lost) * 40
-    loss, real = bpb._pdf_losslessness(src, "# T\n\n" + kept * 40, "", "", _cfg())
-    assert real is True
-    # 200 occurrences went missing and they do NOT all land in `absent`: `eta` is
-    # three characters, and a token that short cannot be substring-matched honestly
-    # against the target, so its 40 occurrences are claimed by `short` first. That
-    # split is the whole point of the buckets — 160 is the number a person should
-    # chase, and the other 40 are a measurement artefact nobody can fix.
-    assert (loss["gap"]["absent"], loss["gap"]["short"]) == (160, 40), loss["gap"]
-    assert dict(loss["absent_top"])["zeta"] == 40
-    assert "eta" not in dict(loss["absent_top"])
-
-
-def test_a_running_footer_is_explained_not_counted_as_loss(bpb):
-    """THE ROW THAT DECIDES THE SIGNATURE. `explain_gap` applies the boilerplate
-    strip ITSELF so it can also see sub-threshold repeated lines — so it has to be
-    handed the RAW page-delimited extraction. Hand it text that was already stripped
-    and the repeats are gone, `residual_boiler` reads 0, and every one of those
-    tokens is re-counted as `absent`: the block would overstate loss on exactly the
-    documents it exists to explain."""
-    body = "alpha beta gamma delta epsilon\n"
-    page = "Page %d of 2\n" + body
-    src = (page % 1) + "\f" + (page % 2)
-    loss, _real = bpb._pdf_losslessness(src, "# T\n\n" + body + body, "", "", _cfg())
-    assert loss["gap"]["residual_boiler"] > 0, loss["gap"]
-    assert loss["gap"]["absent"] == 0, loss["gap"]
-
-
-def test_figure_text_is_explained_rather_than_absent(bpb):
-    """Words over vector art are figure CONTENT, not lost body text — the same call
-    the body metric already makes with `exclude`, made visible per bucket."""
-    body = "alpha beta gamma delta epsilon " * 40
-    fig = "statemachine idlestate activestate resetstate"
-    loss, _real = bpb._pdf_losslessness(body + fig, "# T\n\n" + body, "", fig, _cfg())
-    assert loss["gap"]["image_text"] == 4, loss["gap"]
-    assert loss["gap"]["absent"] == 0, loss["gap"]
-
-
-def test_the_gap_denominator_is_named_and_is_not_the_body_one(bpb):
-    """Two denominators, on purpose, and the report must not blur them.
-    `n_source_tokens` is the BODY metric's — furniture and figure text excluded from
-    the ground truth. `gap.n_source` excludes neither: it BUCKETS them, which is the
-    only way a reader can see how much of the gap each explained."""
-    body = "alpha beta gamma delta epsilon " * 40
-    fig = "statemachine idlestate activestate resetstate"
-    loss, _real = bpb._pdf_losslessness(body + fig, "# T\n\n" + body, "", fig, _cfg())
-    assert loss["gap"]["n_source"] > loss["n_source_tokens"]

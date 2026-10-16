@@ -210,7 +210,8 @@ appears here, only the *gate* over it.
 | `content_recall` | float | office, pdf-text | Char-n-gram recall. Binding only when the source carries at least 3 non-ASCII alphanumeric characters. |
 | `missing_tokens` | list | when recall < 1 | The tokens that did not survive. |
 | `n_source_tokens` | int | pdf-text | The denominator. (`quality-plan.md` P2.6 adds it to the office lane.) |
-| `figure_text_tokens` | int | pdf-text | Text buried in figure regions — excluded from the body metric and surfaced as **debt**, the one loss class only the VLM caption stage can recover. |
+| `figure_text_tokens` | int | pdf-text | How many words are buried in figure regions — excluded from the body metric and surfaced as **debt**, the one loss class only the VLM caption stage can recover. |
+| `figure_text` | list | pdf-text | **The words themselves**, deduplicated, sorted and capped at 200. Counting them was not enough: measured on `pdf/kestrel-clocktree.pdf`, 19 figure-text tokens were reported and not one of those 19 words appeared anywhere in the bundle — not in `document.md`, not in `structure.json`, not here. They are that document's only content, excluded from the body ground truth because they are figure content rather than lost body text, and so they existed in no artifact at all. Publishing them is a **losslessness gain** before it is tooling. It is also the pool `backend.ingest.caption_recovery` grades a caption against, so nothing needs a second notion of what a figure's words are. A stated `[]` is a claim about the document; an absent key would be a claim about nobody having looked. |
 | `gap` | object | pdf-text | **Why the recall is not 1.0.** A bare `token_recall: 0.97` is a number nobody can act on: it does not say whether three words were re-hyphenated across a line break, a running footer survived the strip, or a paragraph is gone — and those need three different fixes, one of which is not a fix at all. Every missing occurrence is claimed by the FIRST bucket that can explain it: `numeric` (pure digits, where substring-matching is noise), `fused` (≥4-char tokens whose characters appear among the target's SURPLUS tokens — re-hyphenations and run-ons), `image_text` (backed by text independently located inside figure regions), `residual_boiler` (lines whose digit-masked form repeats on ≥2 pages, so per-page-varying furniture like `Page 3 of 120` is recognised as one recurring line), `short` (1–3 chars, too short to substring-match honestly), and finally `absent` — **the only bucket that is real, unexplained content loss**. The buckets PARTITION the source, so a reader can subtract: `covered + fused + numeric + image_text + residual_boiler + short + absent == gap.n_source`. `gap.n_source` is deliberately **not** `n_source_tokens`: the body metric excludes furniture and figure text from its ground truth, this one buckets them, which is the only way to see how much of the gap each explained. Stated on every text-lane document including the clean ones, because `absent: 0` is a claim about the document while an absent block is a claim about nobody having looked. Absent on the OCR path — there is no independent text layer to decompose. |
 | `absent_top` | list | pdf-text | `[[token, count], ...]` for the largest truly-absent tokens (top 20). What turns `0.50` into a sentence somebody can act on. Empty when `gap.absent` is 0. |
 | `ocr_used` | bool | pdf | Whether OCR produced the text. |
@@ -370,8 +371,17 @@ question instead of a grep through prose.
 
 Codes: `lane_selected`, `preconvert`, `slide_order`, `ocr_routed`, `body_source`,
 `tokenizer_selected`, `cache_hit`, `gate_coerced`, `empty_source`,
-`captions_carried`, `skipped_existing`, `metadata_tier`, `vocabulary_selected`,
-`identity_namespace`, `permalink_base`.
+`captions_carried`, `skipped_existing`, `source_changed`, `metadata_tier`,
+`vocabulary_selected`, `identity_namespace`, `permalink_base`.
+
+`source_changed` is the one a downstream holder subscribes to. It says the source at
+this path no longer hashes to the bytes this bundle was built from, so the existing
+bundle was **superseded** rather than skipped — a new *version* of a document the
+holder already has, under the same `doc_id`, because `doc_id` is the path and a new
+version must never mint a second bundle. Its `evidence` carries `was` and `now` (the
+12-character `source_sha256` prefixes), which is what makes "did the document change,
+or did the converter?" answerable from the report alone. Its absence on a rebuilt
+bundle means the source was unchanged and the rebuild was forced.
 
 The first two below are the conversion stage's:
 
@@ -389,10 +399,59 @@ The last four are the enrichment stage's, and each moves a field the rubric grad
 | `identity_namespace` | the namespace, or `(none)` | `namespace` | The prefix `meta.id` and its `uid` alias were derived under. Changing it rewrites every id in the corpus. |
 | `permalink_base` | `absolute` \| `relative` | `base` | Whether `meta.source.url` is a clickable permalink or a relative URI reference. |
 
+**Entity and escape parity across lanes.** The PDF lane's markdown is normalised so
+it says what the office lane says for the same text
+(`backend.ingest.normalize_pdf_markdown`). docling emits HTML entities and escapes
+intraword underscores — `R&amp;D`, `&lt;rst\_n&gt;`, `clk\_ref\_sel` — where the
+office lane writes `R&D`, `\<rst_n>`, `clk_ref_sel` for the identical source
+sentence. That is not a cosmetic difference: `markdown_to_text` does not decode
+entities, so the text layer the knowledge linker and every plain-text consumer read
+literally contained `R&amp;D`, a search for `R&D` returned nothing, and the
+tokenizer saw junk words (`lt`, `gt`). Decoding `&lt;` yields an **escaped** `\<`
+rather than a bare one, because a bare `<` would look like an HTML tag where the
+entity was at least inert. Code spans and fenced blocks are left verbatim, since
+inside them a backslash is a literal backslash and an entity is literal text.
+
 ### `content{}` — what the markdown contains
 
 `chars`, `tokens`, `headings`, `tables`, `images`, `links`, `lists`,
-`code_blocks`, `formulas`. Counts, no gate.
+`code_blocks`, `formulas`. Counts, no gate. These are over the **body**, not the
+published file — `document.md` also carries front matter, which `token_split`
+below is the only thing that sees.
+
+#### `content.token_split{}` — where the tokens actually go
+
+`method`, `total`, `frontmatter`, `body`, `prose`, `markup`, `frontmatter_ratio`.
+
+The charter's Job 1 asks for a replica of the source **"without all the extra
+values that cause token bloat"**, and that half of the sentence had no number at
+all. This is it. The parts partition the published file so a reader can subtract:
+
+    frontmatter + body == total          prose + markup == body
+
+`markup` is a **residual** — body tokens minus the tokens of the body rendered to
+text. It counts every syntax character (pipes, hashes, brackets, escapes,
+sentinels) without anyone maintaining a list of what "markup" is, which would go
+stale the moment a converter emitted something new.
+
+`frontmatter_ratio` is the number a retrieval system should care about: a consumer
+that embeds `document.md` **wholesale** pays it on every query. Measured with a
+real subword tokenizer over the 21-document corpus: front matter **39.4%**, prose
+45.3%, body markup 15.3% — and eleven of twenty-one documents are more than half
+front matter, with `pdf/kestrel-dataflow.pdf` at 92.7% (241 front-matter tokens
+around 19 tokens of content). The two sha256 hex strings alone cost 101 tokens per
+document.
+
+**The body is the retrieval unit.** `markdown_sha256` covers the body only —
+everything after the closing `---` — which is exactly the slice a chunker should
+embed. Front matter is metadata *about* the document and is duplicated in
+`report.json`; a consumer that wants it should read it from there rather than pay
+for it in every embedding.
+
+`method` names the counter: `supplied` when a real tokenizer was threaded in,
+`char-estimate/4` otherwise. Take the estimate as an estimate — measured against a
+real subword tokenizer on this corpus it is wrong by −52.9% to +11.8%, worst on
+spreadsheet-heavy documents.
 
 ### `savings{}` — the exchange rate
 
@@ -419,10 +478,31 @@ markup*, which is not a "before" any consumer would have shipped downstream.
 
 ### `images{}` — the pixel-side gate
 
-`referenced` (body `![](images/…)` links, the ground truth), `unique_files`,
-`extracted`, `missing`, `orphans`, `orphans_removed`, `verified` (files re-hashed
-from disk whose `sha16` matches their own name), `gate` (`pass` \| `degraded`). A
-degraded gate degrades `status` but never fails losslessness.
+`referenced` (body `![](images/…)` links), `unique_files`, `extracted`, `missing`,
+`orphans`, `orphans_removed`, `verified` (files re-hashed from disk whose `sha16`
+matches their own name), `source_images`, `gate` (`pass` \| `degraded` \|
+`unmeasured`). A `degraded` gate degrades `status` but never fails losslessness;
+`unmeasured` degrades nothing, because it is a statement about the measurement and
+not about the document.
+
+`source_images` is **the denominator**, and it is the same fix `n_source_tokens` was
+for the text gate: how many body pictures the source is *known* to hold, counted
+converter-blind, or `null` when this lane cannot count them. Without it the block
+could only compare the markdown with itself — so on a PDF page that is entirely a
+vector diagram and converted to zero images, no reference was made, therefore no
+reference failed, therefore `gate: pass` and `status: ok` over a figure nobody
+extracted. With `source_images` unknown *and* nothing referenced, the gate reads
+`unmeasured` rather than claiming a pass over nothing. An **excess** is never loss
+(one source picture can be referenced twice and dedupe to one file), so only a
+shortfall degrades.
+
+Today the PDF lane supplies it on the digital path, from a lower bound over the
+PDF's own drawing objects (`drawn_image_floor`): at most one per page, because five
+boxes of one diagram are one figure and a floor that counted parts would accuse a
+correct conversion. The OCR path and the office lane supply `null` — the office
+lane's only available count comes from the converter's own sentinels, which would
+be circular, so `unmeasured` is the honest reading until a converter-blind picture
+count exists (see `docs/roadmap.md`).
 
 `orphans` is what **remains** after the per-build sweep, so a non-zero value means
 the GC itself failed and the gate says so; `orphans_removed` is how many it took
