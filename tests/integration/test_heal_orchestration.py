@@ -24,6 +24,23 @@ def _load(name):
     return m
 
 
+def _bare_supervisor(m, tmp_path):
+    """A Supervisor with only the state `_pump_escalations` reads.
+
+    Constructed without `__init__` on purpose: the real constructor walks a corpus,
+    resolves a config and probes the host, none of which this behaviour depends on.
+    """
+    sup = m.Supervisor.__new__(m.Supervisor)
+    sup.out = str(tmp_path)
+    sup.by_id = {"doc0": {"rel": "office/doc0.docx"}}
+    sup.pending_esc = []
+    sup.workers = {}
+    sup.lanes = {}
+    sup.events = []
+    sup.esc_runs = {}
+    return sup
+
+
 # --- claim protocol ----------------------------------------------------------
 
 def test_claim_is_exclusive_and_reclaim_never_steals_live_owner(tmp_path):
@@ -140,3 +157,77 @@ def test_log_tail_reads_last_bytes(tmp_path):
     assert "THE END MARKER" in tail
     assert len(tail) <= 64
     assert hs._log_tail(str(tmp_path / "missing.log")) == ""
+
+
+# ================================ an escalation that can never run (roadmap M1)
+#
+# Found by the `tests-with-tools` CI job on its FIRST run — a job added because 22
+# tests were executed by nothing. `test_supervisor_escalates_oom_victim_and_recovers`
+# had been failing at HEAD, invisibly, for as long as no job ran tests/e2e/.
+#
+# The failure is a real supervisor deadlock, not a flaky test. An OOM victim is
+# escalated to a solo lane that reserves `big_doc_mem_gb` (24GB by default). The
+# spawn gate is `if mem_gb >= need`, where `mem_gb` is MemAvailable — so on a
+# machine with 16GB of TOTAL memory the condition can never become true. The
+# supervisor drains every worker to free memory, runs out of workers to drain, and
+# then waits forever on a threshold the host cannot reach. It passes on a big host
+# and hangs on a small one, which is why nobody saw it.
+#
+# Waiting for memory that exists is a queue. Waiting for memory that cannot exist is
+# a deadlock, and the honest answer is to fail the document and say why.
+
+def test_an_escalation_larger_than_the_machine_is_refused_not_queued(tmp_path,
+                                                                     monkeypatch):
+    m = _load("heal_supervisor")
+    sup = _bare_supervisor(m, tmp_path)
+    monkeypatch.setattr(m, "_mem_total_gb", lambda: 16.0)
+    sup.pending_esc = [("doc0", 24.0)]
+
+    sup._pump_escalations(8.0)
+
+    assert sup.pending_esc == [], "an unsatisfiable escalation must leave the queue"
+    with open(os.path.join(sup.out, "_crashed.supervisor.txt")) as fh:
+        assert "doc0" in fh.read()
+
+
+def test_the_refusal_names_the_two_numbers(tmp_path, monkeypatch):
+    """A blacklist with no numbers sends someone to look for a bug in the document.
+    Naming "needs 24GB, this machine has 16GB total" sends them to the right place —
+    either a bigger machine or a lower `big_doc_mem_gb`."""
+    m = _load("heal_supervisor")
+    sup = _bare_supervisor(m, tmp_path)
+    monkeypatch.setattr(m, "_mem_total_gb", lambda: 16.0)
+    sup.pending_esc = [("doc0", 24.0)]
+
+    sup._pump_escalations(8.0)
+
+    text = "\n".join(sup.events)
+    assert "24" in text and "16" in text, text
+
+
+def test_an_escalation_the_machine_could_satisfy_still_waits(tmp_path, monkeypatch):
+    """The fix must not turn a legitimate WAIT into a refusal. 24GB on a 64GB
+    machine is exactly what the queue is for — memory is busy now, not absent."""
+    m = _load("heal_supervisor")
+    sup = _bare_supervisor(m, tmp_path)
+    monkeypatch.setattr(m, "_mem_total_gb", lambda: 64.0)
+    sup.pending_esc = [("doc0", 24.0)]
+
+    sup._pump_escalations(8.0)
+
+    assert sup.pending_esc == [("doc0", 24.0)], "it must still be waiting"
+
+
+def test_an_unreadable_meminfo_does_not_refuse_anything(tmp_path, monkeypatch):
+    """`_mem_total_gb` returns 0.0 when /proc/meminfo cannot be read. Treating "we
+    could not tell" as "the machine is too small" would blacklist every escalation
+    on any host with no procfs — the same no-evidence-is-not-evidence-of-absence
+    rule the OCR probe follows."""
+    m = _load("heal_supervisor")
+    sup = _bare_supervisor(m, tmp_path)
+    monkeypatch.setattr(m, "_mem_total_gb", lambda: 0.0)
+    sup.pending_esc = [("doc0", 24.0)]
+
+    sup._pump_escalations(8.0)
+
+    assert sup.pending_esc == [("doc0", 24.0)]

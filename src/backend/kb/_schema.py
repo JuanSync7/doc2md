@@ -29,6 +29,7 @@ summary: Which metadata field belongs to which tier, which vocabulary governs it
 # AUTHORED ALWAYS WINS. A generated value fills a gap; it never overwrites a value
 # a person wrote. Every field records which it was in ``_provenance`` so the
 # distinction survives in the file rather than in someone's memory.
+import unicodedata
 from collections import namedtuple, OrderedDict
 
 __all__ = ["Field", "FIELDS", "META_KEY", "PROVENANCE_KEY", "SCHEMA_VERSION",
@@ -233,6 +234,34 @@ _GROUP_REQUIRED = {
 }
 
 # Governed by referential integrity rather than by a term list (vocab.yaml `refs`).
+def norm_key(value):
+    # type: (object) -> str
+    """Identity key: casing, separators and punctuation are not distinctions.
+
+    ``RHEL-8``, ``rhel_8`` and ``rhel 8`` are one concept spelled three ways, and a
+    knowledge base that keeps all three has three nodes where it needs one. NFKD
+    folding means an accent is not an identity either (``Café`` == ``cafe``): a
+    corpus that disagrees with itself about a diacritic is the same defect.
+    """
+    text = ("%s" % (value,)).strip().lower()
+    folded = unicodedata.normalize("NFKD", text)
+    return "".join(ch for ch in folded if ch.isalnum())
+
+
+# Which sub-keys of a record NAME ANOTHER NODE rather than describe one. An edge
+# whose endpoint names nothing declared is an edge to nowhere: it reads as a triple
+# and is invisible as a graph, because nothing will ever link to it. Measured on a
+# real answer over the real bundles before this existed — 10 of 54 endpoints (19%)
+# resolved, and the other 81% pointed at prose like "safe default gating state".
+ENDPOINT_KEYS = OrderedDict([("relations", ("s", "o"))])
+
+
+def endpoint_keys(name):
+    # type: (str) -> tuple
+    """The sub-keys of ``name`` that must resolve to a declared entity, if any."""
+    return ENDPOINT_KEYS.get(name, ())
+
+
 REF_FIELDS = ("ref", "backs", "see_also", "control", "protects")
 
 # ONE IDENTITY, and which one it is.

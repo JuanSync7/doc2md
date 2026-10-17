@@ -18,6 +18,7 @@ from collections import OrderedDict
 from backend.ingest import front_matter
 from backend.sections import document_outline, outline_coverage
 from backend.validate import (build_report, image_report, caption_report,
+                              token_split,
                               outline_report, savings_report)
 
 __all__ = ["assemble_bundle"]
@@ -96,7 +97,14 @@ def _images_block(body_md, extras):
     missing = int(ex.get("images_missing", 0))
     orphans = int(ex.get("image_orphans", 0))
     verified = int(ex.get("image_verified", unique_files))
-    return image_report(referenced, extracted, unique_files, missing, orphans, verified)
+    # THE DENOMINATOR, when the writer could count it converter-blind. Absent, the
+    # block says `unmeasured` rather than claiming a pass over nothing — see
+    # `validate.image_report`.
+    source_images = ex.get("source_images")
+    if source_images is not None:
+        source_images = int(source_images)
+    return image_report(referenced, extracted, unique_files, missing, orphans,
+                        verified, source_images=source_images)
 
 
 def _captions_block(images_block, extras):
@@ -249,7 +257,7 @@ def assemble_bundle(doc_id, source_relpath, source_format, lane,
     # A degraded image gate (missing/corrupt/orphaned pixels) is a real loss the
     # token-recall gate cannot see, so it DEGRADES a document that would otherwise be
     # ``ok`` — but it never promotes a ``failed`` doc, and never touches losslessness.
-    if images["gate"] != "pass" and report["status"] == "ok":
+    if images["gate"] == "degraded" and report["status"] == "ok":
         report["status"] = "degraded"
 
     # Same for outline coverage: content lines outside every outline node are a
@@ -271,4 +279,12 @@ def assemble_bundle(doc_id, source_relpath, source_format, lane,
                       verdict["markdown_sha256"], report["converter"], lossless,
                       generated_run, source_meta)
     document_md = front_matter(fm) + "\n" + body_md
+    # WHERE THIS DOCUMENT'S TOKENS GO. Measured only now, because it is the only
+    # point that holds the WHOLE published file — every other count in the report is
+    # over the body alone. The charter asks for a replica "without all the extra
+    # values that cause token bloat", and this is the half of that sentence that had
+    # no number: a consumer embedding `document.md` wholesale pays `frontmatter` on
+    # every query, and on this corpus that is 39% of all tokens.
+    report["content"]["token_split"] = token_split(document_md,
+                                                   token_count=token_count)
     return {"document_md": document_md, "structure": structure, "report": report}

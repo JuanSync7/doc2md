@@ -307,16 +307,21 @@ def test_a_value_of_the_wrong_kind_is_rejected_and_the_expected_kind_is_named(vo
 # ------------------------------------------------------- canonicalisation
 
 
-def test_aliases_are_canonicalised_on_the_way_in(vocab):
+def test_aliases_are_canonicalised_on_the_way_in(gvocab):
     # Normalising at acceptance is what stops synonym pollution: `threatens` and
     # `targets` must not become two edges, and MADR's status collapse has to happen
     # once, here, rather than at each call site that later reads the field.
+    # The entities are declared because an edge must connect two NODES: `s` and `o`
+    # resolve against them, so a test about PREDICATE canonicalisation has to supply
+    # the endpoints it is not testing.
     out = accept_model_meta({
         "type": "playbook",
+        "entities": {"hosts": [{"name": "malware", "ref": "#scope"},
+                               {"name": "host", "ref": "#scope"}]},
         "relations": [{"s": "malware", "p": "threatens", "o": "host",
                        "ref": "#scope"}],
         "decisions": [{"id": "d-1", "status": "assumed", "ref": "#scope"}],
-    }, vocab)
+    }, gvocab)
 
     assert out["rejected"] == []
     assert out["accepted"]["type"] == "runbook"
@@ -329,16 +334,18 @@ def test_aliases_are_canonicalised_on_the_way_in(vocab):
         "id": "d-1", "status": "accepted", "ref": "#scope", "assumption": True}
 
 
-def test_one_invalid_record_is_dropped_while_the_valid_ones_survive(vocab):
+def test_one_invalid_record_is_dropped_while_the_valid_ones_survive(gvocab):
     # A record list is not all-or-nothing. Discarding twelve good relations because
     # the thirteenth invented a predicate would make the whole extraction hostage to
     # its worst line — but the drop is reported, keyed by the offending subfield, so
     # the invented term is visible rather than merely absent.
-    out = accept_model_meta({"relations": [
-        {"s": "a", "p": "runs_on", "o": "b", "ref": "#scope"},
-        {"s": "c", "p": "helps_mitigate", "o": "d", "ref": "#scope"},
-        {"s": "e", "p": "mitigates", "o": "f", "mode": "silent", "ref": "#scope"},
-    ]}, vocab)
+    out = accept_model_meta({
+        "entities": {"hosts": [{"name": n, "ref": "#scope"} for n in "abcdef"]},
+        "relations": [
+            {"s": "a", "p": "runs_on", "o": "b", "ref": "#scope"},
+            {"s": "c", "p": "helps_mitigate", "o": "d", "ref": "#scope"},
+            {"s": "e", "p": "mitigates", "o": "f", "mode": "silent", "ref": "#scope"},
+        ]}, gvocab)
 
     assert out["accepted"]["relations"] == [
         {"s": "a", "p": "runs_on", "o": "b", "ref": "#scope"},
@@ -759,12 +766,15 @@ def test_a_model_adds_links_beside_the_harvested_ones_and_cannot_replace_them(gv
 def test_a_record_that_cannot_say_which_section_asserts_it_is_refused(gvocab):
     # "Which section says this?" has to be answerable or the claim cannot be
     # checked, quoted or repaired. `{"p": "runs_on"}` used to be schema-valid.
-    out = accept_model_meta({"relations": [
-        {"p": "runs_on"},                                   # no s, no o, no ref
-        {"s": "a", "p": "runs_on", "o": "b"},               # no ref
-        {"s": "a", "p": "runs_on", "o": "b", "ref": "#nowhere"},
-        {"s": "a", "p": "runs_on", "o": "b", "ref": "#1-scope"},
-    ]}, gvocab, anchors=ANCHORS)
+    out = accept_model_meta({
+        "entities": {"hosts": [{"name": "a", "ref": "#1-scope"},
+                               {"name": "b", "ref": "#1-scope"}]},
+        "relations": [
+            {"p": "runs_on"},                               # no s, no o, no ref
+            {"s": "a", "p": "runs_on", "o": "b"},           # no ref
+            {"s": "a", "p": "runs_on", "o": "b", "ref": "#nowhere"},
+            {"s": "a", "p": "runs_on", "o": "b", "ref": "#1-scope"},
+        ]}, gvocab, anchors=ANCHORS)
 
     assert out["accepted"]["relations"] == [
         {"s": "a", "p": "runs_on", "o": "b", "ref": "#1-scope"}]
@@ -777,8 +787,11 @@ def test_an_unverifiable_ref_is_skipped_rather_than_passed(gvocab):
     # No anchors supplied means the caller could not resolve them. A pointer nobody
     # checked must not be reported as checked — but it must not be rejected either,
     # or a caller with no body would lose every record.
-    out = accept_model_meta({"relations": [
-        {"s": "a", "p": "runs_on", "o": "b", "ref": "#anything"}]}, gvocab)
+    out = accept_model_meta({
+        "entities": {"hosts": [{"name": "a", "ref": "#x"},
+                               {"name": "b", "ref": "#x"}]},
+        "relations": [
+            {"s": "a", "p": "runs_on", "o": "b", "ref": "#anything"}]}, gvocab)
     assert len(out["accepted"]["relations"]) == 1
 
 
@@ -1298,3 +1311,138 @@ def test_a_published_title_is_prose_and_not_markdown():
     out, _src = title_floor(
         "", "", "x.docx", [{"title": "**Bold** heading here", "children": []}])
     assert out == "Bold heading here"
+
+
+def test_a_grouped_field_tells_the_model_what_the_group_keys_are():
+    """Found by running the real enricher against a real bundle with Claude as the
+    model, and reading what came back: EVERY entity was rejected as
+    `untyped-member-of-unknown-group`.
+
+    The spec for `entities` said `kind: groups` and listed the entity TYPES under
+    `values`, so the obvious compliant reading is to key the groups by type —
+    `{"Identifier": [...]}`. But acceptance takes a member's type from
+    `vocab.group_type(group_name)`, which only knows the registry's own group names
+    (`identifiers`, `metrics`, `organisations`, ...). A model keying by type loses
+    every record, and nothing in the prompt could have told it otherwise.
+
+    That is the repo's own rule 1 — constrain at GENERATION, not only at validation
+    — being broken by the one field that carries the knowledge graph. The stub-client
+    tests could not catch it: a canned reply is shaped to pass by construction."""
+    from backend.kb import request_spec, load_vocab
+    spec = request_spec(load_vocab())["entities"]
+    assert spec["kind"] == "groups"
+    assert "identifiers" in spec["group_keys"]
+    assert "organisations" in spec["group_keys"]
+    # and the entry must say what a key MEANS, or a model reads it as a second
+    # closed list with no stated relationship to the types beside it
+    assert "type" in spec["group_keys_note"].lower()
+
+
+def test_a_group_key_the_registry_declares_is_actually_accepted():
+    """The other half of the same contract: the keys the prompt now names must be
+    the keys acceptance honours. Proven end to end rather than by reading both
+    lists, because a spec that names the wrong keys is the bug it just replaced."""
+    from backend.kb import request_spec, load_vocab, accept_model_meta
+    vocab = load_vocab()
+    key = request_spec(vocab)["entities"]["group_keys"][0]
+    out = accept_model_meta(
+        {"entities": {key: [{"name": "thing", "ref": "#s"}]}},
+        vocab, existing={}, model="probe", prompt_sha="x", anchors={"s"})
+    assert out["rejected"] == [], out["rejected"]
+    assert out["accepted"].get("entities", {}).get(key), out["accepted"]
+
+
+# ================================ a relation must connect two NODES
+#
+# Measured by the repo's own corpus gate, on a real Claude answer over the real
+# bundles: `relation-endpoints: 10/54 (19%) name an entity declared in the corpus`.
+# Four fifths of the edges pointed at prose — "safe default gating state",
+# "reference source selection", "quality-of-service accounting for every initiator
+# port". As triples they read fine; as a GRAPH they are dangling, because nothing
+# will ever link to them.
+#
+# And it was a PROMPT defect, not a model one. `required_keys: [s, p, o, ref]` never
+# said an endpoint has to name something declared, so prose is the compliant answer.
+# Same root cause as the entity-group keys and the markdown keyword candidates: a
+# constraint that lived only in the corpus gate, never at generation. So it is fixed
+# in both places — stated in the request spec, enforced on accept.
+
+def _rel(vocab, reply, existing=None, anchors=("s",)):
+    from backend.kb import accept_model_meta
+    return accept_model_meta(reply, vocab, existing=existing or {}, model="m",
+                             prompt_sha="x", anchors=set(anchors))
+
+
+def test_an_edge_whose_object_is_prose_is_refused(gvocab):
+    """The measured failure, as a test. `clk_ref_sel` is declared; the phrase it
+    points at is not, and never will be."""
+    out = _rel(gvocab, {
+        "entities": {"hosts": [{"name": "clk_ref_sel", "ref": "#s"}]},
+        "relations": [{"s": "clk_ref_sel", "p": "targets",
+                       "o": "reference source selection", "ref": "#s"}]})
+    assert "relations" not in out["accepted"]
+    assert any(r[2] == "endpoint-not-an-entity" for r in out["rejected"]), out["rejected"]
+
+
+def test_an_edge_between_two_declared_entities_is_kept(gvocab):
+    out = _rel(gvocab, {
+        "entities": {"hosts": [{"name": "clk_ref_sel", "ref": "#s"},
+                                     {"name": "PllLockMon_status_q", "ref": "#s"}]},
+        "relations": [{"s": "clk_ref_sel", "p": "targets",
+                       "o": "PllLockMon_status_q", "ref": "#s"}]})
+    assert out["rejected"] == [], out["rejected"]
+    assert len(out["accepted"]["relations"]) == 1
+
+
+def test_an_entity_the_same_reply_declares_can_anchor_an_edge(gvocab):
+    """Order in the reply must not decide the verdict. A model that writes its
+    relations before its entities is answering the same question, and JSON object
+    order is not a claim about anything."""
+    out = _rel(gvocab, OrderedDict([
+        ("relations", [{"s": "a_one", "p": "runs_on", "o": "b_two", "ref": "#s"}]),
+        ("entities", {"hosts": [{"name": "a_one", "ref": "#s"},
+                                      {"name": "b_two", "ref": "#s"}]}),
+    ]))
+    assert out["accepted"].get("relations"), out["rejected"]
+
+
+def test_an_entity_only_the_stored_metadata_holds_still_anchors_an_edge(gvocab):
+    """A later run that adds relations to a document whose entities were accepted
+    earlier must not have to re-send them."""
+    existing = {"entities": {"hosts": [{"name": "clk_ref_sel", "ref": "#s"},
+                                             {"name": "rst_n", "ref": "#s"}]}}
+    out = _rel(gvocab, {"relations": [{"s": "rst_n", "p": "mitigates",
+                                      "o": "clk_ref_sel", "ref": "#s"}]},
+               existing=existing)
+    assert out["accepted"].get("relations"), out["rejected"]
+
+
+def test_an_entity_that_was_itself_rejected_cannot_anchor_an_edge(gvocab):
+    """Resolution is against what was ACCEPTED, not against what was offered.
+    Otherwise a rejected entity would still buy its edges a place in the graph, and
+    the edge would outlive the node it names."""
+    out = _rel(gvocab, {
+        "entities": {"not_a_group": [{"name": "ghost", "ref": "#s"}]},
+        "relations": [{"s": "ghost", "p": "runs_on", "o": "ghost", "ref": "#s"}]})
+    assert "relations" not in out["accepted"]
+
+
+def test_a_spelling_difference_is_not_a_different_node(gvocab):
+    """The corpus already refuses to treat `RHEL-8`, `rhel_8` and `rhel 8` as three
+    concepts. Endpoint resolution uses that same identity rule, or the generation
+    layer and the corpus gate would disagree about what a node is."""
+    out = _rel(gvocab, {
+        "entities": {"hosts": [{"name": "Dma Arbiter Unit", "ref": "#s"},
+                                     {"name": "clk_ref_sel", "ref": "#s"}]},
+        "relations": [{"s": "dma-arbiter-unit", "p": "targets",
+                       "o": "CLK_REF_SEL", "ref": "#s"}]})
+    assert out["accepted"].get("relations"), out["rejected"]
+
+
+def test_the_request_spec_states_the_endpoint_rule(vocab):
+    """Constrain at GENERATION, not only at validation — the third time this
+    session. A rule enforced only on accept shows up as a silent 81% drop."""
+    from backend.kb import request_spec
+    entry = request_spec(vocab)["relations"]
+    assert "s" in entry["endpoint_keys"] and "o" in entry["endpoint_keys"]
+    assert "entities" in entry["endpoints"].lower()

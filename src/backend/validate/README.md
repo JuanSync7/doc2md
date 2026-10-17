@@ -21,6 +21,7 @@ The run path *produces* markdown; this package *checks and gates* it.
 |--------|--------------|
 | `validate_markdown(md)` | Structural check of a markdown string — consistent pipe-table columns, closed fences/front-matter, no leaked OOXML tags, no control/replacement chars. Returns a sorted list of `MdIssue(line, code, severity, message)`. |
 | `conversion_report(source_text, md[, content_min])` | The lossless **gate**: does every source token survive into the markdown? Multiset token recall (must be exactly `1.0` for the OOXML lane) + structural validation, with a unicode char-3gram fallback for CJK/Cyrillic text where the ASCII token metric is blind. Returns a dict with `valid`, `recall`, `content_recall`, missing-token detail, and the structural issues. |
+| `pdf_coverage_report(src_raw, md, furniture, image_text, frac, min_recall, min_tokens, content_min)` | The **off-lane** losslessness block: the one losslessness statement a PDF or HTML document gets. Token recall + char-n-gram content recall of an independent text layer (poppler, sharing no code with docling) against the markdown, the gap explained bucket by bucket, and a `gate` that reads `best-effort` at every recall including a perfect one — no ground-truth semantic tree exists for this lane, so a pass is not claimable. Takes the RAW page-delimited extraction; the thresholds are undefaulted so they cannot drift from `ingest.toml`. |
 | `MdIssue` | The named tuple a structural finding is reported as. |
 
 ## Layering

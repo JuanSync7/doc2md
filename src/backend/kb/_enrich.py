@@ -34,7 +34,8 @@ from urllib.parse import quote, urlsplit, urlunsplit
 from backend.ingest import markdown_to_text
 
 from ._derive import derive_uid, heading_anchor, slugify
-from ._schema import (FIELDS, PROVENANCE_KEY, SCHEMA_VERSION, field, field_names,
+from ._schema import (FIELDS, PROVENANCE_KEY, SCHEMA_VERSION, endpoint_keys,
+                      field, field_names, norm_key,
                       group_required, group_vocab, model_writable, proposed_key,
                       record_required, record_vocab,
                       SOURCE_AUTHORED, SOURCE_DERIVED, SOURCE_EXTRACTED,
@@ -230,11 +231,37 @@ def request_spec(vocab, wanted=None):
                 entry["new_values_allowed"] = True
                 entry["new_values_note"] = (
                     "a term not listed is recorded as a proposal, not used directly")
+        # A GROUPED field is keyed by a registry GROUP NAME, not by the type list
+        # sitting beside it in `values`. Acceptance takes an untyped member's type
+        # from `vocab.group_type(group_name)`, so a model that keys by type — the
+        # only reading the spec used to support — loses EVERY record to
+        # `untyped-member-of-unknown-group`. Naming the keys here is rule 1 again:
+        # constrain at generation, not only at validation.
+        gv = group_vocab(name)
+        if gv.get("member_type"):
+            keys = vocab.group_names() if hasattr(vocab, "group_names") else []
+            if keys:
+                entry["group_keys"] = list(keys)
+                entry["group_keys_note"] = (
+                    "the JSON object's keys MUST come from `group_keys`; each key "
+                    "implies the `type` of every member under it, so a member needs "
+                    "no `type` of its own. Never key this object by a value from "
+                    "`values` — that is the type vocabulary, not the group names.")
         sub = record_vocab(name)
         if sub:
             entry["record_fields"] = OrderedDict(
                 (k, list(vocab.values(v)) + [UNKNOWN]) for k, v in sub.items()
                 if vocab.has(v))
+        ends = endpoint_keys(name)
+        if ends:
+            entry["endpoint_keys"] = list(ends)
+            entry["endpoints"] = (
+                "%s must each NAME AN ENTITY you also declare under `entities` "
+                "(spelling is normalised, so casing and separators do not matter). "
+                "A relation is an edge, not a sentence: an end that names a phrase "
+                "rather than a node is an edge to nowhere and is discarded. If the "
+                "thing at the end of an edge matters, declare it as an entity too."
+                % (" and ".join("`%s`" % k for k in ends)))
         required = record_required(name) or group_required(name)
         if required:
             entry["required_keys"] = list(required)
@@ -331,6 +358,35 @@ def _bad_ref(rec, anchors):
     return "" if ref[1:] in anchors else "ref-not-an-anchor"
 
 
+def _entity_names(block):
+    # type: (object) -> set
+    """Every entity name a grouped `entities` block declares, as identity keys."""
+    out = set()
+    for members in (block or {}).values():
+        for member in members or []:
+            if isinstance(member, dict):
+                key = norm_key(member.get("name"))
+                if key:
+                    out.add(key)
+    return out
+
+
+def _bad_endpoints(name, rec, nodes):
+    # type: (str, dict, set) -> list
+    """The endpoint sub-keys of ``rec`` that name nothing declared.
+
+    A relation is not a sentence, it is an EDGE, and an edge whose end names nothing
+    is an edge to nowhere: it reads as a triple and is invisible as a graph, because
+    nothing will ever link to it. Measured on a real answer over the real bundles
+    before this check existed — 10 of 54 endpoints (19%) resolved and the rest
+    pointed at prose like "safe default gating state".
+
+    Resolution uses `norm_key`, the corpus's own identity rule, so the generation
+    layer and the corpus gate cannot disagree about what counts as one node.
+    """
+    return [k for k in endpoint_keys(name) if norm_key(rec.get(k)) not in nodes]
+
+
 def _accept_records(name, records, rejected, anchors=None):
     # type: (str, list, list, set) -> list
     """Every member of a record LIST, validated: shape, then required keys, then ref."""
@@ -399,7 +455,14 @@ def _accept_groups(name, groups, vocab, rejected, anchors=None):
         # walked in untyped and got stamped `generated`. A new group is fine; a new
         # group whose members are also untyped is a whole ungoverned namespace, and
         # the type vocabulary is the only governance a group name has.
-        implied = vocab.group_type(gname) if gv.get("member_type") else ""
+        # `group_type` RAISES when the vocabulary declares no entity types at all —
+        # `_lint` relies on that to report `vocab-missing` rather than blaming the
+        # document. This path must not abort a corpus walk over it, and it must not
+        # wave the members through either: a type vocabulary that cannot be consulted
+        # is a type that cannot be checked, so the members fall to the untyped
+        # rejection below exactly as an unregistered group's would.
+        typed = bool(gv.get("member_type")) and vocab.has(gv["member_type"])
+        implied = vocab.group_type(gname) if typed else ""
         keep = []
         for member in members:
             if not isinstance(member, dict):
@@ -426,7 +489,7 @@ def _accept_groups(name, groups, vocab, rejected, anchors=None):
                 # is dropped, so the value survives as what it is: a proposal.
                 member = OrderedDict(member)
                 member.pop(EVIDENCE_KEY, None)
-            if gv.get("member_type"):
+            if typed:
                 etype = member.get("type") or implied
                 if not etype:
                     rejected.append(("%s.%s.type" % (name, gname), gname,
@@ -479,7 +542,13 @@ def accept_model_meta(proposed, vocab, existing=None, model="", prompt_sha="",
         rejected.append(("<reply>", proposed, "wrong-kind-expected-mapping"))
         proposed = {}
 
-    for name, value in (proposed or {}).items():
+    # `entities` is accepted FIRST, whatever order the reply happened to use, so an
+    # edge can resolve against the nodes this same answer declares. JSON object order
+    # is not a claim about anything, and a model that writes its relations before its
+    # entities is answering the same question.
+    items = sorted((proposed or {}).items(),
+                   key=lambda kv: 0 if kv[0] == "entities" else 1)
+    for name, value in items:
         if name not in field_names():
             rejected.append((name, value, "not-in-schema"))
             continue
@@ -544,9 +613,23 @@ def accept_model_meta(proposed, vocab, existing=None, model="", prompt_sha="",
         elif f.kind == "records":
             kept = []
             rv = record_vocab(name)
+            # Nodes an edge may point at: what this answer just declared, plus what
+            # the document already holds — a later run adding relations must not have
+            # to re-send entities that were accepted earlier. Deliberately the
+            # ACCEPTED entities and not the offered ones: an entity that was itself
+            # refused must not still buy its edges a place in the graph, or the edge
+            # outlives the node it names.
+            nodes = (_entity_names(accepted.get("entities"))
+                     | _entity_names((existing or {}).get("entities")))
             for rec in _accept_records(name, value, rejected, anchors):
                 bad = False
                 new = OrderedDict(rec)
+                missing_ends = _bad_endpoints(name, rec, nodes)
+                if missing_ends:
+                    for key in missing_ends:
+                        rejected.append(("%s.%s" % (name, key), rec.get(key),
+                                         "endpoint-not-an-entity"))
+                    continue
                 for sub, vname in rv.items():
                     if sub not in new or not vocab.has(vname):
                         continue

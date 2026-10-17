@@ -385,3 +385,202 @@ def test_explain_gap_image_text_bucket_claims_figure_labels():
     assert counts == [1, 3]
     big = [c for c, n in clusters if n == 3][0]
     assert big == (0.1, 0.1, 0.4, 0.2)
+
+
+# ================================ the PDF lane's normalization (roadmap M1)
+#
+# A PDF's text layer and a converter's markdown disagree about characters in ways
+# that have nothing to do with content: poppler hands back the ligature glyph the
+# font actually contains (`conﬁdential`), docling hands back the two letters a
+# reader sees (`confidential`), and the shared ASCII tokenizer — `[a-z0-9]+` — can
+# match NEITHER of them to the other. `ﬁ` is outside the class, so the source word
+# arrives as `con` + `dential` and both halves are counted as LOST.
+#
+# That is measurement noise reported as content loss, and it is exactly the class
+# `token_recall` must not manufacture. The fold is deliberately NOT inside
+# `tokenize`: the office lane gates at exactly 1.0 against a ground truth built from
+# the same OOXML the converter read, and nothing there needs this.
+
+def test_a_ligature_and_its_letters_tokenize_the_same_after_the_fold():
+    """The row the whole entry point exists for. Untouched, the ASCII tokenizer
+    cannot see a ligature at all, so a word containing one is read as two fragments
+    and reported as loss on a document where nothing was lost."""
+    from backend.ingest import normalize_pdf_text, tokenize
+    assert tokenize("conﬁdential oﬀset ﬂow") == \
+        ["con", "dential", "o", "set", "ow"]              # the damage, unfolded
+    assert tokenize(normalize_pdf_text("conﬁdential oﬀset ﬂow")) == \
+        tokenize("confidential offset flow")
+
+
+def test_invisible_characters_a_pdf_injects_are_removed():
+    """NFKC leaves these in place — they are not compatibility equivalents, they are
+    formatting marks. A soft hyphen at a line break splits a word for the tokenizer
+    exactly as a ligature does, and the reader never sees either."""
+    from backend.ingest import normalize_pdf_text, tokenize
+    for invisible in ("­", "​", "‌", "‍", "⁠", "﻿"):
+        assert tokenize(normalize_pdf_text("hyphen" + invisible + "ated")) == \
+            ["hyphenated"], repr(invisible)
+
+
+def test_the_fold_is_idempotent_and_safe_on_nothing():
+    from backend.ingest import normalize_pdf_text
+    once = normalize_pdf_text("conﬁdential­ text")
+    assert normalize_pdf_text(once) == once
+    assert normalize_pdf_text("") == "" and normalize_pdf_text(None) == ""
+
+
+def test_ordinary_text_is_returned_unchanged():
+    """The fold must be a no-op on the overwhelming majority of documents, or its
+    blast radius is every PDF rather than the ones with a ligature in them."""
+    from backend.ingest import normalize_pdf_text
+    plain = "The clk_ref_sel field selects between the crystal oscillator (0x1f).\n"
+    assert normalize_pdf_text(plain) == plain
+
+
+def test_an_accent_is_not_flattened_into_ascii():
+    """NFKC is a COMPATIBILITY fold, not a transliteration. `naïve` stays `naïve`:
+    both sides see the same non-ASCII word, the ASCII tokenizer reads it as two
+    fragments on both sides, and the measurement stays symmetric. Stripping the
+    accent would be a different claim — that the document said `naive` — and this
+    function is not entitled to make it."""
+    from backend.ingest import normalize_pdf_text
+    assert normalize_pdf_text("naïve café") == "naïve café"
+
+
+def test_the_shared_tokenizer_is_untouched_so_the_office_gate_cannot_move():
+    """The roadmap's constraint, as a test. The office lane gates at EXACTLY 1.0
+    against a ground truth read from the same OOXML; a fold inside `tokenize` would
+    silently change what that 1.0 means on 14 documents that currently pass."""
+    from backend.ingest import tokenize
+    assert tokenize("conﬁdential") == ["con", "dential"]
+
+
+# ================================ figure regions, agreed by two detectors (M1)
+#
+# Text inside a figure is excluded from the ground truth, because it is figure
+# content rather than lost body text. That exclusion is the most dangerous line in
+# the measurement: whatever decides "this region is a figure" can delete evidence
+# of real loss, so the DECIDER must not be the converter being graded.
+#
+# Neither available detector can own the decision alone. Measured on
+# `pdf/kestrel-clock-spec.pdf`:
+#
+#   * docling's own picture bboxes are self-grading — a body block it misclassified
+#     as a picture would excuse exactly the text it dropped;
+#   * the PDF's own drawing objects are independent but naive: the register map's
+#     ruling lines are a cluster of vector paths, so the detector claims the whole
+#     table and 55 tokens of real body text leave the ground truth with it.
+#
+# So a region is a figure only where BOTH agree, and only over the overlap. Each
+# detector can then merely SHRINK the exclusion, never widen it, and any
+# disagreement leaves the text counting against the converter.
+
+def test_a_region_both_detectors_claim_survives_as_their_overlap():
+    from backend.ingest import intersect_boxes
+    claimed = [(2, 0.10, 0.20, 0.50, 0.60)]
+    evidence = [(2, 0.15, 0.25, 0.60, 0.70)]
+    assert intersect_boxes(claimed, evidence) == [(2, 0.15, 0.25, 0.50, 0.60)]
+
+
+def test_a_region_only_the_converter_claims_is_not_excused():
+    """The circularity this closes. Docling calling a paragraph a picture is not
+    evidence of a picture, and on its own it must buy no exclusion at all."""
+    from backend.ingest import intersect_boxes
+    assert intersect_boxes([(1, 0.1, 0.1, 0.9, 0.9)], []) == []
+    assert intersect_boxes([(1, 0.1, 0.1, 0.4, 0.4)],
+                           [(1, 0.5, 0.5, 0.9, 0.9)]) == []
+
+
+def test_a_table_the_drawing_detector_claims_alone_is_not_excused():
+    """The other half, and the reason this is not just a stricter docling filter:
+    the register map's rules make a path cluster that the independent detector
+    reports as a figure. With nothing from docling agreeing, the table's text stays
+    in the ground truth where it belongs."""
+    from backend.ingest import intersect_boxes
+    table = [(2, 0.085, 0.434, 0.860, 0.634)]       # measured, kestrel-clock-spec
+    assert intersect_boxes([], table) == []
+
+
+def test_pages_are_never_crossed():
+    from backend.ingest import intersect_boxes
+    assert intersect_boxes([(1, 0.1, 0.1, 0.9, 0.9)],
+                           [(2, 0.1, 0.1, 0.9, 0.9)]) == []
+
+
+def test_a_touching_edge_is_not_an_overlap():
+    """A zero-area intersection excuses nothing, and returning it would put an empty
+    rectangle into the exclusion set for every box that merely abuts another."""
+    from backend.ingest import intersect_boxes
+    assert intersect_boxes([(1, 0.1, 0.1, 0.5, 0.5)],
+                           [(1, 0.5, 0.1, 0.9, 0.5)]) == []
+
+
+def test_every_agreeing_pair_is_kept_and_the_result_is_ordered():
+    """One claimed region may overlap several drawing clusters (a figure with a
+    raster and a caption rule), and one cluster may sit under several claims. Every
+    agreeing pair contributes, deterministically ordered so the artifact diffs."""
+    from backend.ingest import intersect_boxes
+    got = intersect_boxes([(1, 0.0, 0.0, 1.0, 1.0)],
+                          [(1, 0.6, 0.6, 0.8, 0.8), (1, 0.1, 0.1, 0.2, 0.2)])
+    assert got == [(1, 0.1, 0.1, 0.2, 0.2), (1, 0.6, 0.6, 0.8, 0.8)]
+
+
+def test_it_is_symmetric_and_empty_on_nothing():
+    from backend.ingest import intersect_boxes
+    a, b = [(1, 0.1, 0.1, 0.5, 0.5)], [(1, 0.2, 0.2, 0.6, 0.6)]
+    assert intersect_boxes(a, b) == intersect_boxes(b, a)
+    assert intersect_boxes([], []) == []
+
+
+# ================================ a floor for "the source held a picture" (M1)
+#
+# `images.gate` read `pass` over ZERO images on `pdf/kestrel-dataflow.pdf`, a page
+# that is entirely a vector diagram. The block had no denominator, so it could only
+# compare the markdown with itself: no reference was made, so no reference failed.
+#
+# The exclusion detector cannot supply that denominator. Measured on that page, the
+# diagram is five separate rounded rectangles of two paths each, so every cluster
+# falls under `image_region_min_paths` (10) — correctly, because a two-path cluster
+# must not be allowed to EXCUSE text sitting over it. Counting figures is a weaker
+# question than excusing text, and it deserves a weaker threshold.
+#
+# So this answers "does this page hold drawn content the conversion should have
+# represented?" by AREA, and returns a LOWER BOUND — at most one per page, because
+# five boxes of one diagram are one figure, not five, and over-counting would report
+# loss on a document that lost nothing.
+
+def test_a_page_of_vector_art_with_no_image_is_a_floor_of_one():
+    """The measured dataflow page: five clusters of ~0.039 each, ~19% of the page."""
+    from backend.ingest import drawn_image_floor
+    assert drawn_image_floor({1: 0.19}, min_frac=0.05) == 1
+
+
+def test_a_page_with_a_stray_rule_is_not_a_figure():
+    """A table's ruling line or an underline covers almost nothing. Counting it would
+    report a missing image on every document with a horizontal rule in it."""
+    from backend.ingest import drawn_image_floor
+    assert drawn_image_floor({1: 0.004}, min_frac=0.05) == 0
+
+
+def test_each_page_contributes_at_most_one():
+    """A LOWER bound, deliberately. One diagram drawn as five boxes is one figure;
+    a floor that counted parts would degrade a document that emitted the figure
+    correctly, which is the opposite of the failure this exists to catch."""
+    from backend.ingest import drawn_image_floor
+    assert drawn_image_floor({1: 0.9, 2: 0.42, 3: 0.0}, min_frac=0.05) == 2
+
+
+def test_nothing_drawn_is_a_stated_zero_not_an_absence():
+    """`0` here is a claim — "this source holds no drawn content" — and it is what
+    lets `images.gate` say `pass` honestly instead of `unmeasured`."""
+    from backend.ingest import drawn_image_floor
+    assert drawn_image_floor({1: 0.0, 2: 0.0}, min_frac=0.05) == 0
+    assert drawn_image_floor({}, min_frac=0.05) == 0
+
+
+def test_a_page_covering_background_has_already_been_excluded_by_the_caller():
+    """The caller drops page-frame objects before summing, so a fraction at or above
+    1.0 can only mean genuinely drawn content and is clamped rather than treated as
+    an error — this function never sees the object list and must not pretend to."""
+    from backend.ingest import drawn_image_floor
+    assert drawn_image_floor({1: 1.4}, min_frac=0.05) == 1

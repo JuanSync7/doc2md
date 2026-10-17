@@ -15,6 +15,8 @@ import hashlib
 import re
 from collections import Counter, OrderedDict, namedtuple
 
+from ._coverage import tokenize
+
 __all__ = ["DENY_CLASSES", "gate_figures", "caption_is_useful",
            "caption_type_is_furniture", "caption_cache_key", "cache_last_wins",
            "figure_sentinel", "inline_figures",
@@ -108,6 +110,39 @@ def caption_is_useful(caption):
         if uniq <= 0.3 * len(words):         # heavy repetition => degenerate loop
             return False
     return True
+
+
+def caption_recovery(caption, region_text):
+    # type: (str, str) -> object
+    """What FRACTION of a figure's own words the caption brought back, or ``None``.
+
+    ``region_text`` is the text the PDF holds INSIDE the figure region, recovered by
+    an independent poppler probe — not by anything the converter or the model said.
+    So "did the caption recover the figure's words?" has an evidence-backed answer,
+    and this is the check `end-goal.md` section 4 names: captions precision-checked
+    against the text layer's region words, burning down ``figure_text_tokens``.
+
+    It exists because `caption_is_useful` cannot see this at all. That function is a
+    SHAPE check — length, letter ratio, runaway repetition — built against a CPU
+    VLM's degenerate output, and honest about being one. But the caption gate reads
+    as "the figure was recovered", and measured with a real model over the real
+    corpus it reported 100% useful on captions that said the image had "no labels,
+    axes, connectors or text of any kind". Well-formed prose about nothing scores
+    exactly like a faithful transcription.
+
+    ``None`` when the figure holds no words: that figure cannot be graded this way,
+    and scoring a decorative image a perfect 1.0 would be the same vacuity again. An
+    EMPTY CAPTION over a figure that does hold words is 0.0, not None — there was
+    something to recover and none of it came back.
+
+    Set-based, so it is blind to case, order and repetition: a caption is prose, not
+    a transcript, and the same word twice is not twice recovered.
+    """
+    want = set(tokenize(region_text or ""))
+    if not want:
+        return None
+    got = set(tokenize(caption or ""))
+    return len(want & got) / float(len(want))
 
 
 # Informative visual TYPES the caption prompt asks the model to name first. If the leading
